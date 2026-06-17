@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { width: 320px; padding: 15px; font-family: Arial, sans-serif; }
+    button { padding: 10px; margin: 5px 0; width: 100%; border: none; border-radius: 999px; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    #startBtn { background: #111; color: #fff; }
+    #stopBtn { background: #536471; color: #fff; }
+    #exportBtn { background: #1d9bf0; color: #fff; display: block; }
+    #account { font-size: 13px; color: #444; margin-bottom: 8px; }
+    #method { font-size: 11px; color: #666; margin-bottom: 8px; }
+    #progress {
+      font-size: 22px;
+      font-weight: bold;
+      color: #111;
+      margin: 8px 0 12px;
+    }
+    #status { font-size: 13px; line-height: 1.4; color: #222; }
+    .hint { margin-top: 12px; font-size: 12px; color: #666; }
+  </style>
+</head>
+<body>
+  <h2>X Cleaner v0.62</h2>
+  <div id="account">@—</div>
+  <div id="method">Captures X native Following responses + scroll</div>
+  <div id="progress">0 / —</div>
+  <button id="startBtn">Start Collection</button>
+  <button id="stopBtn" style="display:none;">Stop</button>
+  <button id="exportBtn">Export CSV</button>
+  <div id="status">Opens your profile, then Following. Progress updates live on the X page.</div>
+  <div class="hint">Requires an open, logged-in x.com tab.</div>
+  <script src="popup.js"></script>
+</body>
+</html>
