@@ -18,18 +18,105 @@
       margin: 8px 0 12px;
     }
     #status { font-size: 13px; line-height: 1.4; color: #222; }
+    .filter-box {
+      margin: 10px 0;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      background: #fafafa;
+    }
+    .filter-box legend {
+      font-size: 12px;
+      font-weight: 700;
+      color: #444;
+      padding: 0 4px;
+    }
+    .filter-box label {
+      display: block;
+      font-size: 12px;
+      margin: 6px 0;
+      color: #333;
+    }
+    #filterBtn { background: #536471; color: #fff; }
     .hint { margin-top: 12px; font-size: 12px; color: #666; }
+    .list-toggle {
+      display: flex;
+      gap: 6px;
+      margin: 8px 0 10px;
+    }
+    .list-toggle label {
+      flex: 1;
+      text-align: center;
+      padding: 8px 6px;
+      border: 1px solid #ccc;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      color: #444;
+      background: #fff;
+    }
+    .list-toggle input { display: none; }
+    .list-toggle input:checked + span {
+      display: block;
+    }
+    .list-toggle label:has(input:checked) {
+      background: #111;
+      color: #fff;
+      border-color: #111;
+    }
+    #mutuals { font-size: 12px; color: #555; margin-bottom: 8px; min-height: 16px; }
+    .sub-box {
+      margin: 8px 0 10px;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      background: #fafafa;
+      font-size: 12px;
+      line-height: 1.4;
+      color: #333;
+    }
+    #subStatus { margin-bottom: 8px; min-height: 32px; }
+    .sub-actions { display: flex; gap: 6px; margin-bottom: 6px; }
+    .sub-actions button {
+      flex: 1;
+      margin: 0;
+      padding: 8px 6px;
+      font-size: 11px;
+    }
+    #checkSubBtn { background: #536471; color: #fff; }
+    #upgradeBtn { background: #1d9bf0; color: #fff; }
+    #exportBtn.export-locked { background: #aab8c2; }
   </style>
 </head>
 <body>
-  <h2>X Cleaner v0.62</h2>
+  <h2>X Cleaner v0.63</h2>
   <div id="account">@—</div>
-  <div id="method">Captures X native Following responses + scroll</div>
+  <div class="list-toggle">
+    <label><input type="radio" name="listType" id="modeFollowing" value="following" checked><span>Following</span></label>
+    <label><input type="radio" name="listType" id="modeFollowers" value="followers"><span>Followers</span></label>
+  </div>
+  <div id="method">Collect Following via native X responses + scroll</div>
   <div id="progress">0 / —</div>
+  <div id="mutuals"></div>
+  <div class="sub-box">
+    <div id="subStatus">Checking subscription...</div>
+    <div class="sub-actions">
+      <button id="checkSubBtn" type="button">Refresh status</button>
+      <button id="upgradeBtn" type="button">Subscribe @d2fl for unlimited</button>
+    </div>
+  </div>
   <button id="startBtn">Start Collection</button>
   <button id="stopBtn" style="display:none;">Stop</button>
-  <button id="exportBtn">Export CSV</button>
-  <div id="status">Opens your profile, then Following. Progress updates live on the X page.</div>
+  <fieldset class="filter-box">
+    <legend>Pre-export filter</legend>
+    <label><input type="checkbox" id="removeBlue"> Remove blue</label>
+    <label><input type="checkbox" id="removeNew"> Remove new (&lt; 6 months)</label>
+    <label><input type="checkbox" id="removeInactive"> Remove inactive (no tweet &gt; 6 months)</label>
+    <button id="filterBtn" type="button">Filter</button>
+  </fieldset>
+  <button id="exportBtn" title="Requires @d2fl subscription">Export CSV</button>
+  <div id="status">Opens your profile, then the selected list. Progress updates live on the X page.</div>
   <div class="hint">Requires an open, logged-in x.com tab.</div>
   <script src="popup.js"></script>
 </body>

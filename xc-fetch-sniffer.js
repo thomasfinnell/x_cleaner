@@ -6,6 +6,8 @@
   window.__xcListSeq = window.__xcListSeq || 0;
 
   const OP_ALIASES = { BlueVerifiedFollowers: 'Followers' };
+  const LIST_OPS = new Set(['Following', 'Followers']);
+  const CREATOR_SUBS_OPS = new Set(['UserCreatorSubscriptions']);
 
   const NON_LIST_ENTRY_ID = /who-to-follow|who_to_follow|whotofollow|suggest|promoted|connect|grok|messageprompt|subscribed|ranked|trend|explore|advertiser|recap|listheader|divider|label|cursor-top/i;
   const BLOCKED_HANDLES = new Set(['grok', 'x', 'twitter', 'support', 'safety', 'premium', 'verified', 'explore', 'help', 'ads', 'business', 'developers', 'xai', 'create', 'search']);
@@ -101,6 +103,90 @@
     return { users, nextCursor };
   };
 
+  const parseCreatorSubscriptionsBody = (body) => {
+    const handles = new Set();
+
+    const addHandle = (userResult) => {
+      if (!userResult || userResult.__typename === 'UserUnavailable') return;
+      const legacy = userResult.legacy || {};
+      const core = userResult.core || {};
+      const sn = legacy.screen_name || core.screen_name || userResult.screen_name;
+      if (!sn) return;
+      const key = String(sn).toLowerCase();
+      if (BLOCKED_HANDLES.has(key)) return;
+      handles.add(key);
+    };
+
+    const walkEntries = (entries) => {
+      if (!Array.isArray(entries)) return;
+      for (const entry of entries) {
+        const content = entry?.content || entry?.item || {};
+        const userRes = content?.itemContent?.user_results?.result;
+        if (userRes) addHandle(userRes);
+      }
+    };
+
+    const walkInstructions = (instructions) => {
+      if (!Array.isArray(instructions)) return;
+      for (const inst of instructions) {
+        if (inst.type === 'TimelineAddEntries') walkEntries(inst.entries);
+        if (inst.type === 'TimelineReplaceEntry' && inst.entry) walkEntries([inst.entry]);
+      }
+    };
+
+    const result =
+      body?.data?.viewer?.user_results?.result
+      || body?.data?.user?.result
+      || body?.data?.user_result_by_rest_id?.result
+      || {};
+
+    const timelines = [
+      result.creator_subscriptions_timeline?.timeline,
+      result.creator_subscriptions?.timeline,
+      result.subscriptions_timeline?.timeline,
+      result.timeline?.timeline,
+      result.timeline_v2?.timeline
+    ];
+
+    for (const tl of timelines) {
+      if (tl) walkInstructions(tl.instructions);
+    }
+
+    if (!handles.size) {
+      const walk = (node, depth) => {
+        if (!node || typeof node !== 'object' || depth > 14) return;
+        if (Array.isArray(node)) {
+          for (const item of node) walk(item, depth + 1);
+          return;
+        }
+        if (node.itemContent?.user_results?.result) {
+          addHandle(node.itemContent.user_results.result);
+        }
+        for (const value of Object.values(node)) walk(value, depth + 1);
+      };
+      walk(body, 0);
+    }
+
+    return Array.from(handles);
+  };
+
+  const storeCreatorSubsResponse = (opName, url, body) => {
+    if (!body || body?.errors?.length) return;
+    if (!body?.data) return;
+
+    const payload = {
+      opName,
+      url,
+      handles: parseCreatorSubscriptionsBody(body),
+      capturedAt: Date.now(),
+      ok: true
+    };
+
+    try {
+      sessionStorage.setItem('xc_creator_subs_latest', JSON.stringify(payload));
+    } catch (error) {}
+  };
+
   const storeListResponse = (canonical, opName, url, body) => {
     const parsed = parseListBody(body);
     if (!parsed.users.length && !parsed.nextCursor) return;
@@ -135,11 +221,15 @@
       if (!m) return null;
       const opName = decodeURIComponent(m[2]);
       const canonical = OP_ALIASES[opName] || opName;
-      if (canonical !== 'Followers' && canonical !== 'Following') return null;
+      let kind = null;
+      if (LIST_OPS.has(canonical)) kind = 'list';
+      else if (CREATOR_SUBS_OPS.has(canonical)) kind = 'creatorSubs';
+      else return null;
+
       const payload = { url: u, method: method || 'GET', capturedAt: Date.now(), operationName: opName };
       window.__xcCapturedGql[canonical] = payload;
       window.__xcCapturedGql[opName] = payload;
-      return { canonical, opName, url: u };
+      return { canonical, opName, url: u, kind };
     } catch (error) {}
     return null;
   };
@@ -154,7 +244,11 @@
     return chain.then((resp) => {
       try {
         resp.clone().json().then((body) => {
-          storeListResponse(meta.canonical, meta.opName, meta.url, body);
+          if (meta.kind === 'creatorSubs') {
+            storeCreatorSubsResponse(meta.opName, meta.url, body);
+          } else {
+            storeListResponse(meta.canonical, meta.opName, meta.url, body);
+          }
         }).catch(() => {});
       } catch (error) {}
       return resp;
@@ -174,7 +268,11 @@
       this.addEventListener('load', function () {
         try {
           const body = JSON.parse(this.responseText);
-          storeListResponse(meta.canonical, meta.opName, meta.url, body);
+          if (meta.kind === 'creatorSubs') {
+            storeCreatorSubsResponse(meta.opName, meta.url, body);
+          } else {
+            storeListResponse(meta.canonical, meta.opName, meta.url, body);
+          }
         } catch (error) {}
       });
     }

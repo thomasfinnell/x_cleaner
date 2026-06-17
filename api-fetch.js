@@ -4,7 +4,8 @@ const XC_BEARER_TOKEN =
 
 const XC_QUERY_FALLBACKS = {
   Following: 'OLm4oHZBfqWx8jbcEhWoFw',
-  UserByScreenName: '681MIj51w00Aj6dY0GXnHw'
+  UserByScreenName: '681MIj51w00Aj6dY0GXnHw',
+  SearchTimeline: 'gkP4jsxb7JNUVrNh8Xz_RQ'
 };
 
 const XC_LIST_FEATURES = {
@@ -195,7 +196,7 @@ async function prefetchQueryCatalog(force = false) {
   }
 
   const catalog = {};
-  const ops = ['Following', 'UserByScreenName'];
+  const ops = ['Following', 'UserByScreenName', 'SearchTimeline'];
 
   try {
     const homeRes = await fetch('https://x.com/', {
@@ -324,11 +325,14 @@ async function fetchFollowingPageWorker(params) {
   };
 }
 
-function readNativeFollowingList(minSeq) {
+function readNativeList(opName, minSeq) {
   const min = minSeq || 0;
+  const op = opName || 'Following';
 
   try {
-    const queueRaw = sessionStorage.getItem('xc_list_queue_Following');
+    const queueKey = `xc_list_queue_${op}`;
+    const latestKey = `xc_list_latest_${op}`;
+    const queueRaw = sessionStorage.getItem(queueKey);
     if (queueRaw) {
       const queue = JSON.parse(queueRaw);
       const pending = queue.filter((batch) => (batch.seq || 0) > min);
@@ -342,7 +346,7 @@ function readNativeFollowingList(minSeq) {
           }
         }
         const kept = queue.filter((batch) => (batch.seq || 0) <= min);
-        sessionStorage.setItem('xc_list_queue_Following', JSON.stringify(kept));
+        sessionStorage.setItem(queueKey, JSON.stringify(kept));
         if (users.length > 0) {
           return { users, seq: maxSeq };
         }
@@ -350,7 +354,7 @@ function readNativeFollowingList(minSeq) {
       }
     }
 
-    const raw = sessionStorage.getItem('xc_list_latest_Following');
+    const raw = sessionStorage.getItem(latestKey);
     if (!raw) return null;
     const data = JSON.parse(raw);
     if ((data.seq || 0) > min && (data.users || []).length > 0) {
@@ -358,6 +362,10 @@ function readNativeFollowingList(minSeq) {
     }
   } catch (error) {}
   return null;
+}
+
+function readNativeFollowingList(minSeq) {
+  return readNativeList('Following', minSeq);
 }
 
 function injectedScrollListToLoad() {
@@ -376,16 +384,52 @@ function injectedScrollListToLoad() {
   } catch (error) {}
 }
 
-async function waitForNativeFollowingList(tabId, minSeq, timeoutMs = 10000) {
+async function waitForNativeList(tabId, opName, minSeq, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const data = await executeOnTab(tabId, readNativeFollowingList, [minSeq]);
+    const data = await executeOnTab(tabId, readNativeList, [opName, minSeq]);
     if (data) return data;
     await new Promise((resolve) => setTimeout(resolve, 350));
   }
 
   return null;
+}
+
+async function waitForNativeFollowingList(tabId, minSeq, timeoutMs = 10000) {
+  return waitForNativeList(tabId, 'Following', minSeq, timeoutMs);
+}
+
+function readCreatorSubscriptionsCapture() {
+  try {
+    const raw = sessionStorage.getItem('xc_creator_subs_latest');
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data?.ok) return null;
+    return data;
+  } catch (error) {}
+  return null;
+}
+
+async function waitForCreatorSubscriptionsCapture(tabId, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const data = await executeOnTab(tabId, readCreatorSubscriptionsCapture);
+    if (data) return data;
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
+
+  return null;
+}
+
+async function searchLastActiveBatch(tabId, query, count, catalog) {
+  return executeOnTab(tabId, injectedXCleanerApiCall, [{
+    action: 'searchLastActive',
+    query,
+    count,
+    queryCatalog: catalog
+  }]);
 }
 
 async function fetchFollowingPageFromTab(tabId, params) {
@@ -403,7 +447,8 @@ async function fetchFollowingPageFromTab(tabId, params) {
 async function injectedXCleanerApiCall(request) {
   const FALLBACK_QID = {
     Following: 'OLm4oHZBfqWx8jbcEhWoFw',
-    UserByScreenName: '681MIj51w00Aj6dY0GXnHw'
+    UserByScreenName: '681MIj51w00Aj6dY0GXnHw',
+    SearchTimeline: 'gkP4jsxb7JNUVrNh8Xz_RQ'
   };
 
   const FEATURES = {
@@ -597,6 +642,63 @@ async function injectedXCleanerApiCall(request) {
     });
     const body = await resp.json().catch(() => ({}));
     return finishFollowPage({ ok: resp.ok, status: resp.status, body });
+  }
+
+  if (action === 'searchLastActive') {
+    const q = request.query || '';
+    const count = request.count || 20;
+    const catalog = request.queryCatalog || {};
+    const meta = catalog.SearchTimeline || {};
+    const qid = meta.queryId || FALLBACK_QID.SearchTimeline;
+    const variables = {
+      rawQuery: q,
+      count,
+      querySource: 'typed_query',
+      product: 'Latest'
+    };
+    const url =
+      `https://x.com/i/api/graphql/${qid}/SearchTimeline` +
+      `?variables=${encodeURIComponent(JSON.stringify(variables))}` +
+      `&features=${encodeURIComponent(JSON.stringify(FEATURES))}`;
+
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: buildHeaders('https://x.com/explore'),
+      credentials: 'include'
+    });
+    const body = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      return {
+        ok: false,
+        status: resp.status,
+        error: body?.errors?.[0]?.message || `Search failed (HTTP ${resp.status})`,
+        lastActive: {}
+      };
+    }
+
+    const lastActive = {};
+    const instructions =
+      body?.data?.search_by_raw_query?.search_timeline?.timeline?.instructions || [];
+
+    for (const instr of instructions) {
+      if (instr.type !== 'TimelineAddEntries' || !instr.entries) continue;
+      for (const entry of instr.entries) {
+        const tweetRes = entry?.content?.itemContent?.tweet_results?.result;
+        if (!tweetRes?.legacy) continue;
+        const legacy = tweetRes.legacy;
+        const userLegacy = tweetRes.core?.user_results?.result?.legacy || {};
+        const sn = (userLegacy.screen_name || '').toLowerCase();
+        if (!sn || !legacy.created_at) continue;
+        const ts = Date.parse(legacy.created_at);
+        if (Number.isNaN(ts)) continue;
+        if (!lastActive[sn] || ts > lastActive[sn]) {
+          lastActive[sn] = ts;
+        }
+      }
+    }
+
+    return { ok: true, status: resp.status, lastActive };
   }
 
   if (action === 'downloadCsv') {
