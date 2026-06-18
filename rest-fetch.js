@@ -7,6 +7,8 @@ const XC_REST_BEARER_STORAGE_KEY = 'xc_rest_bearer_token';
 const XC_REST_CSRF_STORAGE_KEY = 'xc_rest_csrf_token';
 const XC_REST_PAGE_SIZE = 200;
 const XC_REST_PAGE_DELAY_MS = 350;
+const XC_REST_LOOKUP_BATCH_SIZE = 100;
+const XC_REST_LOOKUP_DELAY_MS = 350;
 const XC_REST_RATE_LIMIT_BACKOFF_MS = 60000;
 const XC_REST_MAX_PAGES = 500;
 
@@ -170,6 +172,7 @@ function xcRestUsesListStyleHeaders(url) {
     url.includes('account/verify_credentials.json')
     || url.includes('friends/list.json')
     || url.includes('followers/list.json')
+    || url.includes('users/lookup.json')
   );
 }
 
@@ -383,6 +386,245 @@ function xcRestMapUsersShow(response) {
     verified: !!response.verified,
     protected: !!response.protected
   };
+}
+
+function xcRestParseUsersLookupLastActive(body) {
+  const lastActive = {};
+  const users = Array.isArray(body) ? body : [];
+  for (const raw of users) {
+    const sn = String(raw?.screen_name || '').toLowerCase().replace(/^@+/, '');
+    const createdAt = raw?.status?.created_at;
+    if (!sn || !createdAt) continue;
+    const ts = Date.parse(createdAt);
+    if (Number.isNaN(ts)) continue;
+    lastActive[sn] = ts;
+  }
+  return lastActive;
+}
+
+function injectedRestUsersLookup(request) {
+  const screenNames = Array.isArray(request.screenNames) ? request.screenNames : [];
+  const handles = screenNames
+    .map((name) => String(name || '').replace(/^@+/, '').trim())
+    .filter(Boolean);
+  if (!handles.length) {
+    return { ok: false, error: 'No screen names for users/lookup' };
+  }
+
+  const cookieHeader = request.cookieHeader || '';
+  let bearer = request.bearer || '';
+
+  try {
+    const captured = sessionStorage.getItem('xc_captured_bearer')
+      || localStorage.getItem('xc_captured_bearer');
+    if (captured && captured.length > 20) bearer = captured;
+  } catch (error) {}
+
+  if (!bearer) {
+    return { ok: false, error: 'No captured bearer in tab — open x.com/home and wait for feed to load' };
+  }
+
+  const ct0Match = cookieHeader.match(/(?:^|;\s*)ct0=([^;]+)/);
+  const ct0 = ct0Match ? decodeURIComponent(ct0Match[1]) : '';
+  let endpoints = [
+    'https://api.twitter.com/1.1/users/lookup.json',
+    'https://api.x.com/1.1/users/lookup.json'
+  ];
+
+  if (request.preferredTabHost === 'x.com') {
+    endpoints = endpoints.slice().sort((a) => (a.includes('api.x.com') ? -1 : 1));
+  } else if (request.preferredTabHost === 'twitter.com') {
+    endpoints = endpoints.slice().sort((a) => (a.includes('api.twitter.com') ? -1 : 1));
+  }
+
+  const query = new URLSearchParams({
+    screen_name: handles.join(','),
+    include_entities: 'false'
+  });
+
+  const headers = {
+    Authorization: `Bearer ${bearer}`,
+    'x-csrf-token': ct0,
+    'x-twitter-auth-type': 'OAuth2Session',
+    Accept: '*/*',
+    Cookie: cookieHeader,
+    'x-twitter-client-language': 'en',
+    'x-twitter-active-user': 'yes'
+  };
+
+  const attempts = [];
+
+  const fetchOne = async (base) => {
+    const label = base.includes('twitter.com') ? 'tab@twitter.com' : 'tab@x.com';
+    const resp = await fetch(`${base}?${query.toString()}`, {
+      method: 'GET',
+      headers,
+      credentials: 'include'
+    });
+    const text = await resp.text();
+    let body = [];
+    try {
+      body = text ? JSON.parse(text) : [];
+    } catch (error) {}
+    if (!resp.ok) {
+      const message = body?.errors?.[0]?.message || body?.error || text.slice(0, 160);
+      attempts.push(`${label}: ${message}`);
+      return null;
+    }
+    return { body, label, url: `${base}?${query.toString()}` };
+  };
+
+  return (async () => {
+    for (const base of endpoints) {
+      try {
+        const result = await fetchOne(base);
+        if (result) {
+          return {
+            ok: true,
+            body: result.body,
+            strategy: result.label,
+            url: result.url,
+            attempts,
+            lastActive: xcRestParseUsersLookupLastActive(result.body)
+          };
+        }
+      } catch (error) {
+        attempts.push(`${base.includes('twitter.com') ? 'tab@twitter.com' : 'tab@x.com'}: ${error.message}`);
+      }
+    }
+    return {
+      ok: false,
+      error: attempts[attempts.length - 1] || 'Tab REST users/lookup failed',
+      attempts,
+      lastActive: {}
+    };
+  })();
+}
+
+async function xcRestUsersLookupFromTab(tabId, screenNames, options = {}) {
+  if (!tabId) return null;
+
+  const handles = (Array.isArray(screenNames) ? screenNames : [])
+    .map((name) => String(name || '').replace(/^@+/, '').trim())
+    .filter(Boolean);
+  if (!handles.length) {
+    return { ok: true, lastActive: {}, attempts: [] };
+  }
+
+  const cookies = options.cookies || (await xcRestCollectAllCookies());
+  const bearer = options.bearer || (await xcRestResolveBearer(tabId, { requireCaptured: true }));
+
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: injectedRestUsersLookup,
+      args: [{
+        screenNames: handles,
+        cookieHeader: xcRestCookieHeader(cookies),
+        bearer,
+        preferredTabHost: options.preferredTabHost || null
+      }]
+    });
+    const payload = results?.[0]?.result;
+    if (!payload?.ok) {
+      return {
+        ok: false,
+        error: payload?.error || 'Tab REST users/lookup failed',
+        attempts: payload?.attempts || [],
+        lastActive: {}
+      };
+    }
+
+    const lastActive = payload.lastActive || xcRestParseUsersLookupLastActive(payload.body);
+    return {
+      ok: true,
+      lastActive,
+      strategy: payload.strategy,
+      attempts: payload.attempts || [],
+      matched: Object.keys(lastActive).length
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message,
+      lastActive: {},
+      attempts: []
+    };
+  }
+}
+
+async function xcRestUsersLookupBatch(screenNames, options = {}) {
+  const handles = (Array.isArray(screenNames) ? screenNames : [])
+    .map((name) => String(name || '').replace(/^@+/, '').trim())
+    .filter(Boolean);
+  if (!handles.length) {
+    return { ok: true, lastActive: {}, attempts: [] };
+  }
+
+  const tabId = options.tabId || null;
+  const attempts = [];
+
+  if (tabId && options.preferTabContext !== false) {
+    await xcRestSyncSessionFromTab(tabId);
+    const tabRetries = options.tabRetries ?? 2;
+    let lastTabFail = null;
+    for (let retry = 0; retry < tabRetries; retry += 1) {
+      if (retry > 0) {
+        await xcRestSleep(400 * retry);
+      }
+      const tabResult = await xcRestUsersLookupFromTab(tabId, handles, options);
+      if (tabResult?.attempts?.length) attempts.push(...tabResult.attempts);
+      if (tabResult?.ok) {
+        return { ...tabResult, attempts };
+      }
+      lastTabFail = tabResult;
+      if (tabResult?.error) {
+        attempts.push(`tab: ${tabResult.error}`);
+      }
+    }
+    if (options.tabOnly) {
+      const err = new Error(lastTabFail?.error || 'Tab REST users/lookup failed');
+      err.attempts = attempts;
+      throw err;
+    }
+  }
+
+  const query = new URLSearchParams({
+    screen_name: handles.join(','),
+    include_entities: 'false'
+  });
+  const urls = [
+    `https://api.twitter.com/1.1/users/lookup.json?${query.toString()}`,
+    `https://api.x.com/1.1/users/lookup.json?${query.toString()}`
+  ];
+
+  let lastError = null;
+  for (const url of urls) {
+    const label = url.includes('twitter.com') ? 'worker@twitter.com' : 'worker@x.com';
+    try {
+      const body = await xcRestMakeApiRequest(url, 'GET', null, options);
+      const lastActive = xcRestParseUsersLookupLastActive(body);
+      attempts.push({
+        strategy: label,
+        users: handles.length,
+        matched: Object.keys(lastActive).length
+      });
+      return { ok: true, lastActive, attempts, strategy: label };
+    } catch (error) {
+      attempts.push(`${label}: ${error.message}`);
+      lastError = error;
+      if (error.status === 429) {
+        error.attempts = attempts;
+        throw error;
+      }
+    }
+  }
+
+  const err = new Error(lastError?.message || 'users/lookup failed for all API hosts');
+  err.status = lastError?.status;
+  err.attempts = attempts;
+  throw err;
 }
 
 async function xcRestUsersShow(screenName, options = {}) {

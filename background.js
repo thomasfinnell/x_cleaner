@@ -41,8 +41,8 @@ const DEFAULT_NEW_ACCOUNT_MONTHS = 6;
 const DEFAULT_INACTIVE_MONTHS = 6;
 const MIN_FILTER_MONTHS = 1;
 const MAX_FILTER_MONTHS = 24;
-const ENRICH_BATCH_SIZE = 8;
-const ENRICH_BATCH_DELAY_MS = 4500;
+const ENRICH_BATCH_SIZE = XC_REST_LOOKUP_BATCH_SIZE;
+const ENRICH_BATCH_DELAY_MS = XC_REST_LOOKUP_DELAY_MS;
 const XC_ACTIVITY_CACHE_KEY = 'xc_activity_cache';
 const XC_ACTIVITY_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const XC_LIST_TYPE_PREF_KEY = 'xc_list_type_pref';
@@ -586,7 +586,6 @@ async function saveActivityCache(cache) {
 }
 
 async function enrichLastActiveForUsers(tabId, users, onProgress) {
-  const catalog = await prefetchQueryCatalog(false);
   const cache = await loadActivityCache();
   const now = Date.now();
   const enriched = users.map((user) => ({ ...user }));
@@ -606,19 +605,25 @@ async function enrichLastActiveForUsers(tabId, users, onProgress) {
   const total = enriched.length;
   if (onProgress) onProgress({ processed, total });
 
+  if (tabId) {
+    await xcRestPrepareSession(tabId);
+  }
+
   for (let i = 0; i < needsLookup.length; i += ENRICH_BATCH_SIZE) {
     if (activeEnrich?.cancelled) break;
 
     const batch = needsLookup.slice(i, i + ENRICH_BATCH_SIZE);
-    const q = batch.map((user) => `from:${user.username}`).join(' OR ');
+    const handles = batch
+      .map((user) => String(user.username || '').replace(/^@+/, '').trim())
+      .filter(Boolean);
 
     try {
-      const res = await searchLastActiveBatch(
+      const res = await xcRestUsersLookupBatch(handles, {
         tabId,
-        q,
-        Math.max(20, batch.length * 3),
-        catalog
-      );
+        preferTabContext: true,
+        tabRetries: 2,
+        requireCaptured: true
+      });
 
       if (res?.ok && res.lastActive) {
         for (const [sn, ts] of Object.entries(res.lastActive)) {
@@ -626,7 +631,14 @@ async function enrichLastActiveForUsers(tabId, users, onProgress) {
         }
       }
     } catch (error) {
-      console.warn('[X Cleaner] activity batch failed', error);
+      console.warn('[X Cleaner] REST users/lookup batch failed', error);
+      if (error.status === 429) {
+        if (onProgress) onProgress({ processed, total, waiting: true });
+        await sleep(XC_REST_RATE_LIMIT_BACKOFF_MS);
+        if (activeEnrich?.cancelled) break;
+        i -= ENRICH_BATCH_SIZE;
+        continue;
+      }
     }
 
     for (const user of batch) {
@@ -3251,7 +3263,7 @@ async function filterList(options = {}) {
       isEnriching: true,
       enrichProcessed: 0,
       enrichTotal: working.length,
-      status: `Enriching ${working.length.toLocaleString()} accounts (inactive if no tweet in ${inactiveMonths} months)...`
+      status: `REST lookup: last tweet for ${working.length.toLocaleString()} accounts (${inactiveMonths} mo inactive)...`
     });
 
     let enrichCancelled = false;
@@ -3259,7 +3271,7 @@ async function filterList(options = {}) {
       working = await enrichLastActiveForUsers(jobTabId, working, (progress) => {
         const status = progress.waiting
           ? `Waiting… checked ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`
-          : `Checking last tweet ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
+          : `REST last-tweet lookup ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
         notifyProgress({
           reason: 'enriching',
           isEnriching: true,
