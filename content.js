@@ -4,8 +4,29 @@ const HUD_DISMISSED_KEY = 'xc_hud_dismissed';
 const FILTER_MONTHS_MIN = 1;
 const FILTER_MONTHS_MAX = 24;
 const FILTER_MONTHS_DEFAULT = 6;
-const NEW_ACCOUNT_MONTHS_PREF_KEY = 'xc_new_account_months_pref';
 const INACTIVE_MONTHS_PREF_KEY = 'xc_inactive_months_pref';
+
+function isExtensionContextValid() {
+  try {
+    return Boolean(chrome?.runtime?.id);
+  } catch (error) {
+    return false;
+  }
+}
+
+function sendToBackground(payload) {
+  if (!isExtensionContextValid()) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(payload, (response) => {
+        void chrome.runtime.lastError;
+        resolve(response ?? null);
+      });
+    } catch (error) {
+      resolve(null);
+    }
+  });
+}
 
 function clampFilterMonths(value) {
   const months = Math.round(Number(value));
@@ -25,6 +46,7 @@ function setHudFilterMonths(hud, inputId, value) {
 }
 
 function persistFilterMonths(prefKey, value) {
+  if (!isExtensionContextValid()) return;
   try {
     chrome.storage.local.set({ [prefKey]: clampFilterMonths(value) });
   } catch (error) {}
@@ -53,6 +75,7 @@ function wireHudFilterMonthsStepper(hud, {
     persistFilterMonths(prefKey, readHudFilterMonths(hud, inputId));
   });
 
+  if (!isExtensionContextValid()) return;
   chrome.storage.local.get(prefKey, (res) => {
     if (chrome.runtime.lastError) return;
     if (res[prefKey] != null) {
@@ -62,12 +85,6 @@ function wireHudFilterMonthsStepper(hud, {
 }
 
 function wireHudFilterMonthSteppers(hud) {
-  wireHudFilterMonthsStepper(hud, {
-    inputId: '#xcleaner-new-account-months',
-    decId: '#xcleaner-new-account-months-dec',
-    incId: '#xcleaner-new-account-months-inc',
-    prefKey: NEW_ACCOUNT_MONTHS_PREF_KEY
-  });
   wireHudFilterMonthsStepper(hud, {
     inputId: '#xcleaner-inactive-months',
     decId: '#xcleaner-inactive-months-dec',
@@ -219,6 +236,12 @@ function ensureHud() {
         margin-bottom: 4px;
       }
       #${HUD_ID} .xc-status-log-label.is-visible { display: block; }
+      #${HUD_ID} .xc-mutuals-filter {
+        display: block;
+        font-size: 12px;
+        margin: 6px 0 4px;
+        color: #cfd9de;
+      }
       #${HUD_ID} .xc-filter {
         margin: 8px 0;
         padding: 8px;
@@ -341,28 +364,24 @@ function ensureHud() {
     </div>
     <button class="xc-start" id="xcleaner-start" type="button">Start Collection</button>
     <button class="xc-stop" id="xcleaner-stop" style="display:none;">Stop</button>
+    <label class="xc-mutuals-filter" title="Uses the other list (Following/Followers) when relationship flags are missing">
+      <input type="checkbox" id="xcleaner-remove-mutuals"> Remove mutuals
+    </label>
     <div class="xc-filter">
       <div class="xc-filter-title">Pre-export filter</div>
-      <label><input type="checkbox" id="xcleaner-remove-blue"> Remove blue</label>
-      <label class="xc-months-filter">
-        <input type="checkbox" id="xcleaner-remove-new">
-        <span>Remove new (&lt;</span>
-        <span class="xc-months-stepper">
-          <button type="button" id="xcleaner-new-account-months-dec" aria-label="Decrease months">−</button>
-          <input type="number" id="xcleaner-new-account-months" value="6" min="1" max="24" step="1" aria-label="New account months">
-          <button type="button" id="xcleaner-new-account-months-inc" aria-label="Increase months">+</button>
-        </span>
-        <span>months)</span>
-      </label>
+      <label><input type="checkbox" id="xcleaner-remove-blue"> Remove Verified</label>
       <label class="xc-months-filter">
         <input type="checkbox" id="xcleaner-remove-inactive">
-        <span>Remove inactive (no tweet &gt;</span>
+        <span>Last post &gt;</span>
         <span class="xc-months-stepper">
           <button type="button" id="xcleaner-inactive-months-dec" aria-label="Decrease months">−</button>
-          <input type="number" id="xcleaner-inactive-months" value="6" min="1" max="24" step="1" aria-label="Inactive months">
+          <input type="number" id="xcleaner-inactive-months" value="6" min="1" max="24" step="1" aria-label="Last post months">
           <button type="button" id="xcleaner-inactive-months-inc" aria-label="Increase months">+</button>
         </span>
-        <span>months)</span>
+        <span>months</span>
+      </label>
+      <label title="Followers only: keep potential bots (&lt;10 tweets, default avatar, no bio, account &lt;30 days)">
+        <input type="checkbox" id="xcleaner-bot-check"> Bot check
       </label>
       <button class="xc-filter-btn" id="xcleaner-filter" type="button">Filter</button>
     </div>
@@ -380,7 +399,6 @@ function ensureHud() {
   wireHudFilterMonthSteppers(hud);
 
   hud.querySelector('#xcleaner-close').addEventListener('click', () => {
-    chrome.runtime.sendMessage({ action: 'stopScrape' }).catch(() => {});
     hideHud();
   });
 
@@ -391,61 +409,68 @@ function ensureHud() {
     statusEl.textContent = forceRefresh
       ? `Fresh start — clearing cached ${listLabel(listType).toLowerCase()}...`
       : `Starting ${listLabel(listType).toLowerCase()} collection...`;
-    chrome.runtime.sendMessage({ action: 'runExportFlow', listType, forceRefresh }).catch(() => {});
+    sendToBackground({ action: 'runExportFlow', listType, forceRefresh });
   });
 
   hud.querySelector('#xcleaner-stop').addEventListener('click', () => {
-    chrome.runtime.sendMessage({ action: 'stopScrape' }).catch(() => {});
+    sendToBackground({ action: 'stopScrape' });
   });
 
   hud.querySelector('#xcleaner-export').addEventListener('click', () => {
-    chrome.runtime.sendMessage({ action: 'exportCSV' }).catch(() => {});
+    sendToBackground({ action: 'exportCSV' });
   });
 
-  hud.querySelector('#xcleaner-sub-refresh').addEventListener('click', () => {
+  hud.querySelector('#xcleaner-sub-refresh').addEventListener('click', async () => {
     const statusEl = hud.querySelector('#xcleaner-status');
     const refreshBtn = hud.querySelector('#xcleaner-sub-refresh');
     refreshBtn.disabled = true;
     statusEl.textContent = 'Refreshing subscription status...';
-    chrome.runtime.sendMessage({ action: 'checkSubscription', syncFromTab: true, force: true }, (result) => {
-      refreshBtn.disabled = false;
-      if (chrome.runtime.lastError) {
-        statusEl.textContent = chrome.runtime.lastError.message || 'Refresh failed.';
-        return;
-      }
-      if (result) updateHud(result);
-      statusEl.textContent = result?.subscriptionStatus || 'Subscription status updated.';
+    const result = await sendToBackground({
+      action: 'checkSubscription',
+      syncFromTab: true,
+      force: true
     });
+    refreshBtn.disabled = false;
+    if (!result) {
+      statusEl.textContent = isExtensionContextValid()
+        ? 'Refresh failed.'
+        : 'Extension reloaded — refresh this X tab, then try again.';
+      return;
+    }
+    updateHud(result);
+    statusEl.textContent = result.subscriptionStatus || 'Subscription status updated.';
   });
 
   hud.querySelector('#xcleaner-subscribe').addEventListener('click', () => {
-    chrome.runtime.sendMessage({ action: 'openSubscribe' }).catch(() => {});
+    sendToBackground({ action: 'openSubscribe' });
   });
 
   hud.querySelector('#xcleaner-filter').addEventListener('click', () => {
+    const removeMutuals = hud.querySelector('#xcleaner-remove-mutuals').checked;
     const removeBlue = hud.querySelector('#xcleaner-remove-blue').checked;
-    const removeNew = hud.querySelector('#xcleaner-remove-new').checked;
     const removeInactive = hud.querySelector('#xcleaner-remove-inactive').checked;
-    chrome.runtime.sendMessage({
+    const botCheck = hud.querySelector('#xcleaner-bot-check').checked;
+    sendToBackground({
       action: 'filterList',
+      listType: selectedHudListType(),
+      removeMutuals,
       removeBlue,
-      removeNew,
       removeInactive,
-      newAccountMonths: readHudFilterMonths(hud, '#xcleaner-new-account-months'),
+      botCheck,
       inactiveMonths: readHudFilterMonths(hud, '#xcleaner-inactive-months')
-    }).catch(() => {});
+    });
   });
 
   const modeFollowing = hud.querySelector('#xcleaner-mode-following');
   const modeFollowers = hud.querySelector('#xcleaner-mode-followers');
   modeFollowing.addEventListener('change', () => {
     if (modeFollowing.checked) {
-      chrome.runtime.sendMessage({ action: 'setListType', listType: 'following' }).catch(() => {});
+      sendToBackground({ action: 'setListType', listType: 'following' });
     }
   });
   modeFollowers.addEventListener('change', () => {
     if (modeFollowers.checked) {
-      chrome.runtime.sendMessage({ action: 'setListType', listType: 'followers' }).catch(() => {});
+      sendToBackground({ action: 'setListType', listType: 'followers' });
     }
   });
 
@@ -642,6 +667,14 @@ function updateHud(state = {}) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.action === 'ping') {
+    sendResponse({
+      ok: true,
+      hudPresent: !!document.getElementById(HUD_ID)
+    });
+    return true;
+  }
+
   if (message.action === 'showHud') {
     setHudDismissed(false);
     updateHud(message);
@@ -667,8 +700,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 function syncHudFromBackground() {
   if (isHudDismissed()) return;
 
-  chrome.runtime.sendMessage({ action: 'getStatus' }, (state) => {
-    if (chrome.runtime.lastError || !state) return;
+  sendToBackground({ action: 'getStatus' }).then((state) => {
+    if (!state) return;
     if (isHudDismissed() && !state.isScraping && !(state.debugStatusLog || []).length) return;
     if (
       state.isScraping ||
@@ -686,7 +719,7 @@ function syncHudFromBackground() {
     ) {
       updateHud(state);
     }
-  });
+  }).catch(() => {});
 }
 
 if (document.readyState === 'loading') {

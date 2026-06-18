@@ -77,6 +77,7 @@
         followers_count: legacy.followers_count ?? null,
         tweet_count: legacy.statuses_count ?? null,
         created_at: legacy.created_at || core.created_at || '',
+        bio: String(legacy.description || core.description || '').trim(),
         is_blue: !!userResult.is_blue_verified,
         default_avatar: !!legacy.default_profile_image,
         rest_id: id,

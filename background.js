@@ -37,12 +37,16 @@ const listStore = {
   followers: { list: [], raw: [] }
 };
 
-const DEFAULT_NEW_ACCOUNT_MONTHS = 6;
 const DEFAULT_INACTIVE_MONTHS = 6;
+const BOT_CHECK_TWEET_MAX = 10;
+const BOT_CHECK_ACCOUNT_MAX_DAYS = 30;
 const MIN_FILTER_MONTHS = 1;
 const MAX_FILTER_MONTHS = 24;
 const ENRICH_BATCH_SIZE = XC_REST_LOOKUP_BATCH_SIZE;
 const ENRICH_BATCH_DELAY_MS = XC_REST_LOOKUP_DELAY_MS;
+const SNIFFER_ENRICH_PASSES = 4;
+const SNIFFER_ENRICH_SCROLL = 1100;
+const SNIFFER_ENRICH_DELAY_MS = 450;
 const XC_ACTIVITY_CACHE_KEY = 'xc_activity_cache';
 const XC_ACTIVITY_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const XC_LIST_TYPE_PREF_KEY = 'xc_list_type_pref';
@@ -189,10 +193,25 @@ async function hydrateSubscriptionFromStorage(handle) {
   return subscriptionInfo;
 }
 
+async function subscriptionCacheIsFresh(handle) {
+  const resolvedHandle = await resolveActiveUsername(handle);
+  if (!resolvedHandle) return false;
+  return xcSubscriptionCacheIsFreshForHandle(resolvedHandle);
+}
+
 async function refreshSubscription(handle, forceCheck = false) {
   const resolvedHandle = await resolveActiveUsername(handle);
   if (!forceCheck) {
     await hydrateSubscriptionFromStorage(resolvedHandle);
+    const state = await xcLoadSubscriptionState();
+    const normalized = xcNormalizeHandle(resolvedHandle);
+    const cached = xcReadCachedAuthorization(state.subscriptionCache, normalized);
+    if (cached) {
+      subscriptionInfo = xcBuildInfoFromCachedAuth(normalized, cached, {
+        subsTxtHandleCount: state.subscriptionCache?.subsTxtHandles?.length ?? 0
+      });
+      return subscriptionInfo;
+    }
   }
 
   const tabId = await ensureJobTabId();
@@ -285,6 +304,25 @@ function subscriptionPayload() {
   };
 }
 
+function buildHudState(extra = {}) {
+  return {
+    ...jobState,
+    listType,
+    count: curList().length,
+    rawCount: curRaw().length || curList().length,
+    totalList: totalForType(),
+    storedCounts: {
+      following: listStore.following.list.length,
+      followers: listStore.followers.list.length
+    },
+    mutuals: computeMutuals(),
+    fetchMode: jobState.fetchMode || XC_FETCH_MODE_DEFAULT,
+    ...subscriptionPayload(),
+    ...debugStatusPayload(),
+    ...extra
+  };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -332,7 +370,190 @@ function mergeUserFields(existing, incoming) {
   if (!existing || !incoming) return existing;
   mergeRelationshipFields(existing, incoming);
   if (!existing.is_blue && incoming.is_blue) existing.is_blue = true;
+  const incomingBio = accountBio(incoming);
+  if (incomingBio) existing.bio = incomingBio;
+  if (incoming.tweet_count != null && incoming.tweet_count !== '') {
+    if (existing.tweet_count == null || existing.tweet_count === '') {
+      existing.tweet_count = incoming.tweet_count;
+    }
+  }
+  if (incoming.created_at && !existing.created_at) {
+    existing.created_at = incoming.created_at;
+  }
+  if (incoming.default_avatar) existing.default_avatar = true;
+  if (incoming.followers_count != null && incoming.followers_count !== '') {
+    if (existing.followers_count == null || existing.followers_count === '') {
+      existing.followers_count = incoming.followers_count;
+    }
+  }
+  if (incoming.friends_count != null && incoming.friends_count !== '') {
+    if (existing.friends_count == null || existing.friends_count === '') {
+      existing.friends_count = incoming.friends_count;
+    }
+  }
+  if (incoming.display_name && !existing.display_name) {
+    existing.display_name = incoming.display_name;
+  }
   return existing;
+}
+
+function findListUserByHandle(type, username) {
+  const key = (username || '').toLowerCase();
+  if (!key) return null;
+  return curList(type).find((row) => (row.username || '').toLowerCase() === key) || null;
+}
+
+function findRawUserByHandle(type, username) {
+  const key = (username || '').toLowerCase();
+  if (!key) return null;
+  return curRaw(type).find((row) => (row.username || '').toLowerCase() === key) || null;
+}
+
+function mergeSnifferFieldsIntoList(users, type, ownerUsername) {
+  let blueUpgraded = 0;
+  const owner = (ownerUsername || '').toLowerCase();
+  for (const incoming of users || []) {
+    const key = (incoming.username || '').toLowerCase();
+    if (!key || key === owner) continue;
+    const existing = findListUserByHandle(type, key);
+    if (!existing) continue;
+    const wasBlue = !!existing.is_blue;
+    mergeUserFields(existing, incoming);
+    if (!wasBlue && existing.is_blue) blueUpgraded += 1;
+    const rawRow = findRawUserByHandle(type, key);
+    if (rawRow) mergeUserFields(rawRow, incoming);
+  }
+  return blueUpgraded;
+}
+
+async function upgradeListFromSnifferDrain(tabId, type, ownerUsername) {
+  if (!tabId) return 0;
+  const cfg = listCfg(type);
+  try {
+    const drain = await readNativeListQueueDrainFromTab(tabId, cfg.opName);
+    if (!drain?.users?.length) return 0;
+    return mergeSnifferFieldsIntoList(drain.users, type, ownerUsername);
+  } catch (error) {
+    return 0;
+  }
+}
+
+async function passiveSnifferEnrichPass(tabId, type, ownerUsername) {
+  if (!tabId) return 0;
+  let totalMerged = 0;
+  for (let pass = 0; pass < SNIFFER_ENRICH_PASSES; pass += 1) {
+    await nudgeTabListScroll(tabId, SNIFFER_ENRICH_SCROLL);
+    await sleep(SNIFFER_ENRICH_DELAY_MS);
+    totalMerged += await upgradeListFromSnifferDrain(tabId, type, ownerUsername);
+  }
+  return totalMerged;
+}
+
+function syncWorkingFromRaw(working, type) {
+  for (const user of working) {
+    const rawRow = findRawUserByHandle(type, user.username);
+    if (rawRow) mergeUserFields(user, rawRow);
+  }
+  return working;
+}
+
+async function enrichSparseProfilesViaLookup(tabId, users, type, onProgress) {
+  const enriched = users.map((user) => ({ ...user }));
+  const needsLookup = enriched.filter((user) => !hasReliableProfileForBotCheck(user));
+  if (!needsLookup.length) {
+    return { users: enriched, lookedUp: 0, upgraded: 0 };
+  }
+
+  let upgraded = 0;
+  let processed = 0;
+  const total = needsLookup.length;
+
+  if (tabId) {
+    await xcRestPrepareSession(tabId);
+  }
+
+  for (let i = 0; i < needsLookup.length; i += ENRICH_BATCH_SIZE) {
+    if (activeEnrich?.cancelled) break;
+
+    const batch = needsLookup.slice(i, i + ENRICH_BATCH_SIZE);
+    const handles = batch
+      .map((user) => String(user.username || '').replace(/^@+/, '').trim())
+      .filter(Boolean);
+
+    try {
+      const res = await xcRestUsersLookupBatch(handles, {
+        tabId,
+        listType: type,
+        preferTabContext: true,
+        tabRetries: 2,
+        requireCaptured: true
+      });
+
+      if (res?.ok && res.profilesByName) {
+        for (const user of batch) {
+          const key = (user.username || '').toLowerCase();
+          const profile = res.profilesByName[key];
+          if (!profile) continue;
+          const wasReliable = hasReliableProfileForBotCheck(user);
+          mergeUserFields(user, profile);
+          const rawRow = findRawUserByHandle(type, key);
+          if (rawRow) mergeUserFields(rawRow, profile);
+          if (!wasReliable && hasReliableProfileForBotCheck(user)) upgraded += 1;
+        }
+      }
+    } catch (error) {
+      console.warn('[X Cleaner] REST profile lookup batch failed', error);
+      if (error.status === 429) {
+        if (onProgress) onProgress({ processed, total, waiting: true });
+        await sleep(XC_REST_RATE_LIMIT_BACKOFF_MS);
+        if (activeEnrich?.cancelled) break;
+        i -= ENRICH_BATCH_SIZE;
+        continue;
+      }
+    }
+
+    processed = Math.min(total, processed + batch.length);
+    if (onProgress) onProgress({ processed, total, waiting: false });
+
+    if (i + ENRICH_BATCH_SIZE < needsLookup.length) {
+      if (onProgress) onProgress({ processed, total, waiting: true });
+      await sleep(ENRICH_BATCH_DELAY_MS);
+      if (activeEnrich?.cancelled) break;
+    }
+  }
+
+  return { users: enriched, lookedUp: needsLookup.length, upgraded };
+}
+
+async function ensureReliableProfilesForBotCheck(tabId, type, working, onProgress) {
+  const stats = {
+    sparseBefore: working.filter((user) => !hasReliableProfileForBotCheck(user)).length,
+    snifferMerged: 0,
+    lookupUpgraded: 0,
+    lookedUp: 0
+  };
+
+  if (tabId && stats.sparseBefore > 0) {
+    stats.snifferMerged = await passiveSnifferEnrichPass(tabId, type, jobState.username);
+    syncWorkingFromRaw(working, type);
+  }
+
+  const sparseAfterSniffer = working.filter((user) => !hasReliableProfileForBotCheck(user)).length;
+  if (sparseAfterSniffer > 0 && tabId) {
+    const result = await enrichSparseProfilesViaLookup(tabId, working, type, onProgress);
+    stats.lookupUpgraded = result.upgraded;
+    stats.lookedUp = result.lookedUp;
+    return { users: result.users, stats };
+  }
+
+  return { users: working, stats };
+}
+
+async function nudgeTabListScroll(tabId, amount = 900) {
+  if (!tabId) return;
+  try {
+    await executeOnTab(tabId, () => window.scrollBy(0, amount));
+  } catch (error) {}
 }
 
 function buildSeenFromCurList(type, ownerUsername) {
@@ -546,21 +767,8 @@ function normalizeFilterMonths(value, fallback = DEFAULT_INACTIVE_MONTHS) {
   return Math.min(MAX_FILTER_MONTHS, Math.max(MIN_FILTER_MONTHS, months));
 }
 
-function normalizeNewAccountMonths(value) {
-  return normalizeFilterMonths(value, DEFAULT_NEW_ACCOUNT_MONTHS);
-}
-
 function normalizeInactiveMonths(value) {
   return normalizeFilterMonths(value, DEFAULT_INACTIVE_MONTHS);
-}
-
-function isNewAccount(createdAt, months = DEFAULT_NEW_ACCOUNT_MONTHS) {
-  const ts = parseAccountCreatedAt(createdAt);
-  if (ts == null) return false;
-
-  const cutoff = new Date();
-  cutoff.setMonth(cutoff.getMonth() - months);
-  return ts > cutoff.getTime();
 }
 
 function isInactiveAccount(lastActiveMs, months = DEFAULT_INACTIVE_MONTHS) {
@@ -569,6 +777,130 @@ function isInactiveAccount(lastActiveMs, months = DEFAULT_INACTIVE_MONTHS) {
   const cutoff = new Date();
   cutoff.setMonth(cutoff.getMonth() - months);
   return lastActiveMs < cutoff.getTime();
+}
+
+function accountBio(user) {
+  return String(user?.bio ?? user?.description ?? '').trim();
+}
+
+function hasReliableProfileForBotCheck(user) {
+  const bio = accountBio(user);
+  if (bio) return true;
+  const hasTweetCount = user?.tweet_count != null && user.tweet_count !== '';
+  const hasFollowers = user?.followers_count != null && user.followers_count !== '';
+  const hasCreated = !!user?.created_at;
+  if (hasTweetCount && hasCreated) return true;
+  if (hasFollowers && hasCreated && (user?.display_name || user?.friends_count != null)) {
+    return true;
+  }
+  return false;
+}
+
+function hasNoBio(user) {
+  // REST friends/followers list rows omit description — empty bio there is not a bot signal.
+  if (!hasReliableProfileForBotCheck(user)) return false;
+  return !accountBio(user);
+}
+
+function isLowTweetAccount(user, maxTweets = BOT_CHECK_TWEET_MAX) {
+  const count = user?.tweet_count;
+  if (count == null || count === '') return false;
+  const n = Number(count);
+  return Number.isFinite(n) && n < maxTweets;
+}
+
+function isYoungAccount(createdAt, days = BOT_CHECK_ACCOUNT_MAX_DAYS) {
+  const ts = parseAccountCreatedAt(createdAt);
+  if (ts == null) return false;
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  return ts > cutoff;
+}
+
+function isPotentialBot(user) {
+  if (!user) return false;
+  if (user.default_avatar) return true;
+  if (hasNoBio(user)) return true;
+  if (isLowTweetAccount(user)) return true;
+  if (isYoungAccount(user.created_at)) return true;
+  return false;
+}
+
+function mutualOtherListType(type) {
+  return type === 'followers' ? 'following' : 'followers';
+}
+
+function buildHandleSetForList(type) {
+  const users = usersForMutuals(type);
+  return new Set(
+    users.map((user) => (user.username || '').toLowerCase()).filter(Boolean)
+  );
+}
+
+function buildMutualFilterContext(type) {
+  const otherType = mutualOtherListType(type);
+  return {
+    type,
+    otherType,
+    followingSet: buildHandleSetForList('following'),
+    followersSet: buildHandleSetForList('followers'),
+    otherListCount: usersForMutuals(otherType).length
+  };
+}
+
+function mutualDetectionAvailable(type, ctx) {
+  if (type === 'followers') {
+    if (ctx.followingSet.size > 0) return true;
+    return usersForMutuals('followers').some(
+      (user) => user.you_follow === true || user.following === true
+    );
+  }
+  if (ctx.followersSet.size > 0) return true;
+  return usersForMutuals('following').some((user) => user.follows_you === true);
+}
+
+function isMutualAccount(user, type, ctx) {
+  const key = (user.username || '').toLowerCase();
+  if (!key) return false;
+
+  if (type === 'followers') {
+    if (ctx.followingSet.size > 0) return ctx.followingSet.has(key);
+    return user.you_follow === true || user.following === true;
+  }
+
+  if (ctx.followersSet.size > 0) return ctx.followersSet.has(key);
+  return user.follows_you === true;
+}
+
+function refreshMutualFlagsFromOtherList(type) {
+  const otherType = mutualOtherListType(type);
+  const otherSet = buildHandleSetForList(otherType);
+  if (!otherSet.size) return { upgraded: 0, otherCount: 0 };
+
+  const flagKey = type === 'followers' ? 'you_follow' : 'follows_you';
+  let upgraded = 0;
+  const seen = new Set();
+
+  for (const user of curRaw(type)) {
+    const key = (user.username || '').toLowerCase();
+    if (!key || !otherSet.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    if (user[flagKey] !== true) {
+      user[flagKey] = true;
+      upgraded += 1;
+    }
+    const live = findListUserByHandle(type, key);
+    if (live && live[flagKey] !== true) live[flagKey] = true;
+  }
+
+  return { upgraded, otherCount: otherSet.size };
+}
+
+function excludeMutuals(users, type, ctx) {
+  return users.filter((user) => !isMutualAccount(user, type, ctx));
+}
+
+function fullListForType(type = listType) {
+  return curRaw(type).length ? curRaw(type).slice() : curList(type).slice();
 }
 
 function formatLastActiveField(ms) {
@@ -630,6 +962,17 @@ async function enrichLastActiveForUsers(tabId, users, onProgress) {
           cache[sn] = { last_active_ms: ts, fetched_at: now };
         }
       }
+      if (res?.ok && res.blueByName) {
+        for (const user of enriched) {
+          const key = (user.username || '').toLowerCase();
+          if (key && res.blueByName[key]) user.is_blue = true;
+        }
+        for (const [sn, isBlue] of Object.entries(res.blueByName)) {
+          if (!isBlue) continue;
+          const rawRow = findRawUserByHandle(listType, sn);
+          if (rawRow) rawRow.is_blue = true;
+        }
+      }
     } catch (error) {
       console.warn('[X Cleaner] REST users/lookup batch failed', error);
       if (error.status === 429) {
@@ -669,19 +1012,28 @@ async function enrichLastActiveForUsers(tabId, users, onProgress) {
   return enriched;
 }
 
-function applyFollowingFilters(source, options = {}) {
-  const {
-    removeBlue = false,
-    removeNew = false,
-    newAccountMonths = DEFAULT_NEW_ACCOUNT_MONTHS
-  } = options;
-  if (!removeBlue && !removeNew) return source.slice();
+function applyRemoveBlueFilter(source) {
+  return source.filter((user) => !user.is_blue);
+}
 
-  return source.filter((user) => {
-    if (removeBlue && user.is_blue) return false;
-    if (removeNew && isNewAccount(user.created_at, newAccountMonths)) return false;
-    return true;
-  });
+function syncBlueFlagsIntoRaw(type) {
+  let upgraded = 0;
+  for (const rawUser of curRaw(type)) {
+    const live = findListUserByHandle(type, rawUser.username);
+    if (live?.is_blue && !rawUser.is_blue) {
+      rawUser.is_blue = true;
+      upgraded += 1;
+    }
+  }
+  return upgraded;
+}
+
+async function refreshBlueFlagsFromSniffer(type) {
+  syncBlueFlagsIntoRaw(type);
+  if (!(await ensureJobTabId())) return 0;
+  await nudgeTabListScroll(jobTabId, 900);
+  await sleep(450);
+  return upgradeListFromSnifferDrain(jobTabId, type, jobState.username);
 }
 
 function snapshotListRaw(type = listType) {
@@ -709,7 +1061,8 @@ function serializeJobStateForPersist(type = listType) {
 
 async function persistListState(type = listType) {
   const cfg = listCfg(type);
-  if (!curList(type).length && !curRaw(type).length) {
+  const fullList = fullListForType(type);
+  if (!fullList.length) {
     await chrome.storage.local.remove(cfg.persistKey);
     return;
   }
@@ -718,14 +1071,18 @@ async function persistListState(type = listType) {
     version: XC_PERSIST_VERSION,
     listType: type,
     savedAt: new Date().toISOString(),
-    accountList: curList(type),
-    accountListRaw: curRaw(type).length ? curRaw(type) : curList(type).slice(),
-    jobState: serializeJobStateForPersist(type)
+    accountList: fullList,
+    accountListRaw: fullList,
+    jobState: {
+      ...serializeJobStateForPersist(type),
+      count: curList(type).length,
+      rawCount: fullList.length
+    }
   };
 
   try {
     await chrome.storage.local.set({ [cfg.persistKey]: payload });
-    lastPersistedCounts[type] = curList(type).length;
+    lastPersistedCounts[type] = fullList.length;
     if (type === listType) {
       jobState.savedAt = payload.savedAt;
     }
@@ -845,8 +1202,8 @@ async function restoreListState(type, options = {}) {
   try {
     const res = await chrome.storage.local.get(cfg.persistKey);
     const data = res[cfg.persistKey];
-    const accounts = data?.accountList || data?.followingList;
-    if (!accounts?.length) return false;
+    const raw = data.accountListRaw || data.followingListRaw || data?.accountList || data?.followingList;
+    if (!raw?.length) return false;
 
     const activeUser = (options.username || jobState.username || '').toLowerCase().replace(/^@+/, '');
     const savedUser = (data.jobState?.username || '').toLowerCase().replace(/^@+/, '');
@@ -858,9 +1215,9 @@ async function restoreListState(type, options = {}) {
       jobState.username = data.jobState?.username || savedUser;
     }
 
-    setCurList(accounts, type);
-    const raw = data.accountListRaw || data.followingListRaw;
-    setCurRaw(raw?.length ? raw : accounts.slice(), type);
+    const fullList = raw.slice();
+    setCurRaw(fullList, type);
+    setCurList(fullList, type);
 
     if (type === listType) {
       jobState = {
@@ -881,7 +1238,7 @@ async function restoreListState(type, options = {}) {
     if (tab?.id) jobTabId = tab.id;
 
     console.log(
-      `[X Cleaner] Restored ${curList(type).length.toLocaleString()} ${cfg.label.toLowerCase()} from storage`
+      `[X Cleaner] Restored ${curRaw(type).length.toLocaleString()} ${cfg.label.toLowerCase()} (full cache) from storage`
     );
     return true;
   } catch (error) {
@@ -950,6 +1307,7 @@ async function setListType(nextType) {
   }
 
   await chrome.storage.local.set({ [XC_LIST_TYPE_PREF_KEY]: nextType });
+  await hydrateSubscriptionFromStorage(jobState.username);
   notifyProgress();
   return getStatus();
 }
@@ -1054,7 +1412,7 @@ function formatCsvBool(value) {
 
 function buildCsv(users) {
   const header =
-    'username,display_name,friends_count,followers_count,tweet_count,created_at,is_blue,default_avatar,you_follow,follows_you,last_tweet_at\n';
+    'username,display_name,friends_count,followers_count,tweet_count,created_at,bio,is_blue,default_avatar,you_follow,follows_you,last_tweet_at\n';
   const rows = users.map((user) =>
     [
       user.username,
@@ -1063,6 +1421,7 @@ function buildCsv(users) {
       user.followers_count ?? '',
       user.tweet_count ?? '',
       user.created_at ?? '',
+      accountBio(user),
       user.is_blue ?? false,
       user.default_avatar ?? false,
       formatCsvBool(user.you_follow),
@@ -1080,7 +1439,12 @@ async function sendHudMessage(tabId, payload, retries = 1) {
 
   for (let attempt = 0; attempt < retries; attempt += 1) {
     try {
-      await chrome.tabs.sendMessage(tabId, payload);
+      const response = await chrome.tabs.sendMessage(tabId, payload);
+      if (payload.action === 'showHud' && response?.ok === false) {
+        if (attempt + 1 >= retries) break;
+        await sleep(400);
+        continue;
+      }
       return true;
     } catch (error) {
       if (attempt + 1 >= retries) break;
@@ -1089,6 +1453,38 @@ async function sendHudMessage(tabId, payload, retries = 1) {
   }
 
   return false;
+}
+
+async function ensureContentScriptReady(tabId) {
+  if (!tabId) return false;
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { action: 'ping' });
+      if (response?.ok) return true;
+    } catch (error) {
+      if (attempt === 2 || attempt === 5) {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content.js']
+          });
+        } catch (injectError) {}
+      }
+    }
+    await sleep(200 + attempt * 120);
+  }
+
+  return false;
+}
+
+async function ensureHudShown(tabId, extra = {}) {
+  if (!tabId) return false;
+  if (!(await ensureContentScriptReady(tabId))) return false;
+  return sendHudMessage(tabId, {
+    action: 'showHud',
+    ...buildHudState(extra)
+  }, 16);
 }
 
 async function ensureSnifferInstalled(tabId) {
@@ -1237,7 +1633,10 @@ function notifyProgress(extra = {}) {
   chrome.runtime.sendMessage(payload).catch(() => {});
 
   if (jobTabId) {
-    sendHudMessage(jobTabId, { action: 'updateHud', ...jobState, ...debugStatusPayload() }).catch(() => {});
+    sendHudMessage(jobTabId, {
+      action: 'updateHud',
+      ...buildHudState()
+    }).catch(() => {});
   }
 
   schedulePersist();
@@ -1250,9 +1649,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   ensureSnifferInstalled(tabId)
     .then(() => sendHudMessage(tabId, {
       action: 'updateHud',
-      ...jobState,
-      count: curList().length,
-      ...debugStatusPayload()
+      ...buildHudState()
     }, 12))
     .catch(() => {});
 });
@@ -1340,7 +1737,12 @@ async function syncActiveAccountFromTab(options = {}) {
   }
 
   if (refreshSub) {
-    await refreshSubscription(detected, forceSubRefresh);
+    const cacheFresh = !forceSubRefresh && await subscriptionCacheIsFresh(detected);
+    if (!cacheFresh) {
+      await refreshSubscription(detected, forceSubRefresh);
+    } else {
+      await hydrateSubscriptionFromStorage(detected);
+    }
   }
 
   return { ok: true, switched, username: detected, tabId: jobTabId };
@@ -2906,22 +3308,22 @@ async function runNativeListFetch(tabId, profile, type = listType) {
     listType: type
   });
 
-  const hudState = {
+  await sendHudMessage(tabId, {
     action: 'showHud',
-    username: resolvedUsername,
-    listType: type,
-    totalFollowing: profile.totalFollowing,
-    totalFollowers: profile.totalFollowers,
-    count: cachedCount,
-    isScraping: true,
-    reason: 'waiting-native',
-    method: 'native-sniffer',
-    status: tailResume
-      ? `Sniffer tail: ${cachedCount.toLocaleString()} / ${totalList?.toLocaleString() || '—'} ${cfg.label.toLowerCase()}...`
-      : `Listening for X native ${cfg.label} responses...`,
-    ...debugStatusPayload()
-  };
-  await sendHudMessage(tabId, hudState, 20);
+    ...buildHudState({
+      username: resolvedUsername,
+      listType: type,
+      totalFollowing: profile.totalFollowing,
+      totalFollowers: profile.totalFollowers,
+      count: cachedCount,
+      isScraping: true,
+      reason: 'waiting-native',
+      method: 'native-sniffer',
+      status: tailResume
+        ? `Sniffer tail: ${cachedCount.toLocaleString()} / ${totalList?.toLocaleString() || '—'} ${cfg.label.toLowerCase()}...`
+        : `Listening for X native ${cfg.label} responses...`
+    })
+  }, 20);
 
   if (!cachedCount) {
     setCurList([], type);
@@ -3144,27 +3546,33 @@ async function runNativeListFetch(tabId, profile, type = listType) {
   schedulePersist(true, type);
 }
 
-function finishEmptyFilter() {
-  setCurList([]);
-  jobState.filterRemoved = curRaw().length;
+function finishEmptyFilter(type = listType) {
+  setCurList([], type);
+  jobState.filterRemoved = curRaw(type).length;
   jobState.reason = 'filtered';
   jobState.isEnriching = false;
   jobState.filterPhase = null;
+  jobState.count = 0;
   notifyProgress({ status: 'All accounts removed by filters.' });
-  schedulePersist(true);
+  schedulePersist(true, type);
   return {
     ok: true,
     ...jobState,
     count: 0,
-    rawCount: curRaw().length,
+    rawCount: curRaw(type).length,
     removed: jobState.filterRemoved
   };
 }
 
 async function filterList(options = {}) {
-  const source = curRaw().length ? curRaw() : curList();
+  if (options.listType && LIST_CONFIG[options.listType]) {
+    await setListType(options.listType);
+  }
+
+  const type = listType;
+  const source = curRaw(type).length ? curRaw(type) : curList(type);
   if (!source.length) {
-    return { ok: false, error: `No ${listCfg().label.toLowerCase()} collected yet.` };
+    return { ok: false, error: `No ${listCfg(type).label.toLowerCase()} collected yet.` };
   }
 
   if (jobState.isScraping) {
@@ -3175,159 +3583,283 @@ async function filterList(options = {}) {
     return { ok: false, error: 'Activity lookup already running.' };
   }
 
-  if (!curRaw().length) {
-    snapshotListRaw();
+  if (!curRaw(type).length) {
+    snapshotListRaw(type);
   }
 
   const removeBlue = !!options.removeBlue;
-  const removeNew = !!options.removeNew;
   const removeInactive = !!options.removeInactive;
-  const newAccountMonths = normalizeNewAccountMonths(options.newAccountMonths);
+  const removeMutuals = !!options.removeMutuals;
+  const botCheck = !!options.botCheck;
   const inactiveMonths = normalizeInactiveMonths(options.inactiveMonths);
 
-  if (!removeBlue && !removeNew && !removeInactive) {
-    setCurList(curRaw().slice());
+  if (!removeBlue && !removeInactive && !removeMutuals && !botCheck) {
+    setCurList(curRaw(type).slice(), type);
     jobState.filterRemoved = 0;
-    jobState.reason = curList().length ? 'complete' : jobState.reason;
+    jobState.reason = curList(type).length ? 'complete' : jobState.reason;
     jobState.filterPhase = null;
-    notifyProgress({ status: `${curList().length.toLocaleString()} accounts ready to export.` });
-    schedulePersist(true);
+    notifyProgress({ status: `${curList(type).length.toLocaleString()} accounts ready (filters cleared).` });
+    schedulePersist(true, type);
     return {
       ok: true,
       ...jobState,
-      count: curList().length,
-      rawCount: curRaw().length,
+      count: curList(type).length,
+      rawCount: curRaw(type).length,
       removed: 0
     };
   }
 
-  let working = curRaw().slice();
+  let working = curRaw(type).slice();
   const parts = [];
   jobState.reason = 'filtering';
   jobState.isEnriching = false;
   jobState.enrichProcessed = 0;
   jobState.enrichTotal = 0;
 
+  if (removeMutuals) {
+    await ensureRestored();
+    const ctx = buildMutualFilterContext(type);
+    const otherCfg = listCfg(ctx.otherType);
+
+    if (!mutualDetectionAvailable(type, ctx)) {
+      return {
+        ok: false,
+        error: `Remove mutuals needs ${otherCfg.label} collected (or relationship flags on this list). Fetch ${otherCfg.label.toLowerCase()} first.`
+      };
+    }
+
+    const refresh = refreshMutualFlagsFromOtherList(type);
+    if (refresh.upgraded > 0) {
+      appendDebugStatusLog({
+        status: `Filter: merged mutual flags from ${otherCfg.label.toLowerCase()} on ${refresh.upgraded.toLocaleString()} accounts`,
+        method: jobState.method || 'filter',
+        reason: 'filtering'
+      });
+    }
+
+    const beforeMutuals = working.length;
+    working = excludeMutuals(working, type, ctx);
+    const mutualsRemoved = beforeMutuals - working.length;
+    if (mutualsRemoved > 0) {
+      parts.push(`mutuals (${mutualsRemoved.toLocaleString()})`);
+    }
+    jobState.filterPhase = 'mutuals';
+    notifyProgress({
+      reason: 'filtering',
+      filterPhase: 'mutuals',
+      status: mutualsRemoved > 0
+        ? `Remove mutuals: ${working.length.toLocaleString()} remaining (−${mutualsRemoved.toLocaleString()})`
+        : `Remove mutuals: 0 removed (${beforeMutuals.toLocaleString()} accounts — none matched mutuals)`
+    });
+    if (!working.length) return finishEmptyFilter(type);
+  }
+
   if (removeBlue) {
+    const blueMerged = await refreshBlueFlagsFromSniffer(type);
+    if (blueMerged > 0) {
+      syncWorkingFromRaw(working, type);
+      appendDebugStatusLog({
+        status: `Filter: sniffer merged is_blue on ${blueMerged.toLocaleString()} ${listCfg(type).label.toLowerCase()}`,
+        method: jobState.method || 'filter',
+        reason: 'filtering'
+      });
+    }
+
     const before = working.length;
-    working = applyFollowingFilters(working, { removeBlue: true, removeNew: false });
-    setCurList(working);
-    jobState.filterRemoved = curRaw().length - working.length;
+    working = applyRemoveBlueFilter(working);
+    setCurList(working, type);
+    jobState.filterRemoved = curRaw(type).length - working.length;
     jobState.filterPhase = 'blue';
+    jobState.reason = 'filtering';
     const removed = before - working.length;
-    if (removed > 0) parts.push(`blue (${removed.toLocaleString()})`);
+    if (removed > 0) parts.push(`verified (${removed.toLocaleString()})`);
+    const blueHint = removed === 0 && before > 0
+      ? ` (0/${before.toLocaleString()} flagged verified — open your ${listCfg(type).label.toLowerCase()} tab on X, then filter again)`
+      : '';
     notifyProgress({
       reason: 'filtering',
       filterPhase: 'blue',
-      status: `Remove blue: ${working.length.toLocaleString()} remaining (−${removed.toLocaleString()})`
+      isEnriching: false,
+      status: `Remove verified: ${working.length.toLocaleString()} remaining (−${removed.toLocaleString()})${blueHint}`
     });
-    schedulePersist(true);
-    if (!working.length) return finishEmptyFilter();
-  }
-
-  if (removeNew) {
-    const before = working.length;
-    working = applyFollowingFilters(working, {
-      removeBlue: false,
-      removeNew: true,
-      newAccountMonths
-    });
-    setCurList(working);
-    jobState.filterRemoved = curRaw().length - working.length;
-    jobState.filterPhase = 'new';
-    const removed = before - working.length;
-    if (removed > 0) parts.push(`new (${removed.toLocaleString()})`);
-    notifyProgress({
-      reason: 'filtering',
-      filterPhase: 'new',
-      status: `Remove new (< ${newAccountMonths} mo): ${working.length.toLocaleString()} remaining (−${removed.toLocaleString()})`
-    });
-    schedulePersist(true);
-    if (!working.length) return finishEmptyFilter();
+    if (!working.length) return finishEmptyFilter(type);
   }
 
   if (removeInactive) {
-    if (!(await ensureJobTabId())) {
-      return { ok: false, error: 'No X tab available for activity lookup.' };
+    if (type !== 'following') {
+      notifyProgress({
+        status: 'Last post filter applies to Following — skipped on Followers.'
+      });
+    } else {
+      if (!(await ensureJobTabId())) {
+        return { ok: false, error: 'No X tab available for activity lookup.' };
+      }
+
+      setCurList(working, type);
+      activeEnrich = { running: true, cancelled: false };
+      jobState.isEnriching = true;
+      jobState.reason = 'enriching';
+      jobState.filterPhase = 'inactive';
+      jobState.enrichTotal = working.length;
+      jobState.enrichProcessed = 0;
+      notifyProgress({
+        reason: 'enriching',
+        isEnriching: true,
+        enrichProcessed: 0,
+        enrichTotal: working.length,
+        status: `REST lookup: last tweet for ${working.length.toLocaleString()} following (${inactiveMonths} mo threshold)...`
+      });
+
+      let enrichCancelled = false;
+      try {
+        working = await enrichLastActiveForUsers(jobTabId, working, (progress) => {
+          const status = progress.waiting
+            ? `Waiting… checked ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`
+            : `REST last-tweet lookup ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
+          notifyProgress({
+            reason: 'enriching',
+            isEnriching: true,
+            enrichProcessed: progress.processed,
+            enrichTotal: progress.total,
+            status
+          });
+        });
+        enrichCancelled = !!activeEnrich?.cancelled;
+      } finally {
+        activeEnrich = null;
+        jobState.isEnriching = false;
+      }
+
+      if (enrichCancelled) {
+        setCurList(working, type);
+        return finishStoppedJob();
+      }
+
+      const beforeInactive = working.length;
+      // Keep inactive accounts only — export list = unfollow candidates (drop active).
+      working = working.filter((user) => isInactiveAccount(user.last_active_ms, inactiveMonths));
+      setCurList(working, type);
+      const activeRemoved = beforeInactive - working.length;
+      if (activeRemoved > 0) {
+        parts.push(`active (${activeRemoved.toLocaleString()})`);
+      }
+      jobState.filterRemoved = curRaw(type).length - working.length;
+      jobState.filterPhase = 'inactive';
+      notifyProgress({
+        reason: 'filtering',
+        filterPhase: 'inactive',
+        isEnriching: false,
+        enrichProcessed: beforeInactive,
+        enrichTotal: beforeInactive,
+        status: `Last post (${inactiveMonths} mo): ${working.length.toLocaleString()} unfollow candidates (−${activeRemoved.toLocaleString()} active)`
+      });
+      if (!working.length) return finishEmptyFilter(type);
     }
+  }
 
-    setCurList(working);
-    activeEnrich = { running: true, cancelled: false };
-    jobState.isEnriching = true;
-    jobState.reason = 'enriching';
-    jobState.filterPhase = 'inactive';
-    jobState.enrichTotal = working.length;
-    jobState.enrichProcessed = 0;
-    notifyProgress({
-      reason: 'enriching',
-      isEnriching: true,
-      enrichProcessed: 0,
-      enrichTotal: working.length,
-      status: `REST lookup: last tweet for ${working.length.toLocaleString()} accounts (${inactiveMonths} mo inactive)...`
-    });
+  if (botCheck) {
+    if (type !== 'followers') {
+      notifyProgress({
+        status: 'Bot check applies to Followers — skipped on Following.'
+      });
+    } else {
+      if (!(await ensureJobTabId())) {
+        return { ok: false, error: 'No X tab available for bot-check profile enrichment.' };
+      }
 
-    let enrichCancelled = false;
-    try {
-      working = await enrichLastActiveForUsers(jobTabId, working, (progress) => {
-        const status = progress.waiting
-          ? `Waiting… checked ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`
-          : `REST last-tweet lookup ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
+      const sparseCount = working.filter((user) => !hasReliableProfileForBotCheck(user)).length;
+      let enrichCancelled = false;
+
+      if (sparseCount > 0) {
+        activeEnrich = { running: true, cancelled: false };
+        jobState.isEnriching = true;
+        jobState.reason = 'enriching';
+        jobState.filterPhase = 'bot-enrich';
+        jobState.enrichTotal = sparseCount;
+        jobState.enrichProcessed = 0;
         notifyProgress({
           reason: 'enriching',
           isEnriching: true,
-          enrichProcessed: progress.processed,
-          enrichTotal: progress.total,
-          status
+          enrichProcessed: 0,
+          enrichTotal: sparseCount,
+          status: `Bot check: enriching ${sparseCount.toLocaleString()} sparse profiles (sniffer first, then batched lookup)...`
         });
+
+        try {
+          const enrichResult = await ensureReliableProfilesForBotCheck(
+            jobTabId,
+            type,
+            working,
+            (progress) => {
+              const status = progress.waiting
+                ? `Waiting… enriched ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()} sparse profiles`
+                : `Profile enrich ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
+              notifyProgress({
+                reason: 'enriching',
+                isEnriching: true,
+                enrichProcessed: progress.processed,
+                enrichTotal: progress.total,
+                status
+              });
+            }
+          );
+          working = enrichResult.users;
+          const { stats } = enrichResult;
+          if (stats.snifferMerged > 0 || stats.lookupUpgraded > 0) {
+            appendDebugStatusLog({
+              status: `Bot enrich: sniffer ${stats.snifferMerged.toLocaleString()} field merges, lookup upgraded ${stats.lookupUpgraded.toLocaleString()} / ${stats.lookedUp.toLocaleString()} sparse`,
+              method: jobState.method || 'filter',
+              reason: 'filtering'
+            });
+          }
+          enrichCancelled = !!activeEnrich?.cancelled;
+        } finally {
+          activeEnrich = null;
+          jobState.isEnriching = false;
+        }
+
+        if (enrichCancelled) {
+          setCurList(working, type);
+          return finishStoppedJob();
+        }
+      }
+
+      const beforeBots = working.length;
+      working = working.filter((user) => isPotentialBot(user));
+      setCurList(working, type);
+      const nonBotRemoved = beforeBots - working.length;
+      if (nonBotRemoved > 0) {
+        parts.push(`non-bot (${nonBotRemoved.toLocaleString()})`);
+      }
+      jobState.filterRemoved = curRaw(type).length - working.length;
+      jobState.filterPhase = 'bot';
+      notifyProgress({
+        reason: 'filtering',
+        filterPhase: 'bot',
+        isEnriching: false,
+        status: `Bot check: ${working.length.toLocaleString()} potential bots kept (−${nonBotRemoved.toLocaleString()} non-bot)`
       });
-      enrichCancelled = !!activeEnrich?.cancelled;
-    } finally {
-      activeEnrich = null;
-      jobState.isEnriching = false;
+      if (!working.length) return finishEmptyFilter(type);
     }
-
-    if (enrichCancelled) {
-      setCurList(working);
-      return finishStoppedJob();
-    }
-
-    const beforeInactive = working.length;
-    working = working.filter((user) => !isInactiveAccount(user.last_active_ms, inactiveMonths));
-    setCurList(working);
-    const inactiveRemoved = beforeInactive - working.length;
-    if (inactiveRemoved > 0) {
-      parts.push(`inactive (${inactiveRemoved.toLocaleString()})`);
-    }
-    jobState.filterRemoved = curRaw().length - working.length;
-    jobState.filterPhase = 'inactive';
-    notifyProgress({
-      reason: 'filtering',
-      filterPhase: 'inactive',
-      isEnriching: false,
-      enrichProcessed: beforeInactive,
-      enrichTotal: beforeInactive,
-      status: `Remove inactive (${inactiveMonths} mo): ${working.length.toLocaleString()} remaining (−${inactiveRemoved.toLocaleString()})`
-    });
-    schedulePersist(true);
-    if (!working.length) return finishEmptyFilter();
   }
 
-  setCurList(working);
-  jobState.filterRemoved = curRaw().length - curList().length;
+  setCurList(working, type);
+  jobState.filterRemoved = curRaw(type).length - curList(type).length;
   jobState.reason = 'filtered';
   jobState.filterPhase = null;
   jobState.isEnriching = false;
+  jobState.count = curList(type).length;
 
   notifyProgress({
-    status: `Filtered: ${curList().length.toLocaleString()} remaining (removed ${jobState.filterRemoved.toLocaleString()}${parts.length ? ` — ${parts.join(', ')}` : ''})`
+    status: `Filtered: ${curList(type).length.toLocaleString()} remaining (removed ${jobState.filterRemoved.toLocaleString()}${parts.length ? ` — ${parts.join(', ')}` : ''})`
   });
-  schedulePersist(true);
+  schedulePersist(true, type);
 
   return {
     ok: true,
     ...jobState,
-    count: curList().length,
-    rawCount: curRaw().length,
+    count: curList(type).length,
+    rawCount: curRaw(type).length,
     removed: jobState.filterRemoved
   };
 }
@@ -3613,7 +4145,7 @@ async function runGraphqlWorkerListFetch(tabId, profile, type = listType) {
   };
 
   if (tabId) {
-    await sendHudMessage(tabId, { action: 'showHud', ...jobState }, 12);
+    await sendHudMessage(tabId, { action: 'showHud', ...buildHudState() }, 12);
   }
   notifyProgress({ status: jobState.status });
 
@@ -3777,7 +4309,7 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
   if (tabId) {
     await sendHudMessage(tabId, {
       action: 'showHud',
-      ...jobState
+      ...buildHudState()
     }, 12);
   }
   notifyProgress({ status: jobState.status });
@@ -3801,33 +4333,20 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
     }
 
     try {
-      if (totalList != null && totalList <= 100) {
-        const domPre = await collectVisibleListUsersFromTab(tabId, profile.username);
-        const domAdded = addNativeUsers({ users: domPre?.users || [] }, seen, profile.username, type);
-        trimListToFetchLimit(type);
-        if (domAdded > 0) {
-          const totalLabel = totalList.toLocaleString();
-          notifyProgress({
-            reason: 'collecting',
-            method: 'rest-v1.1',
-            addedLastPage: domAdded,
-            status: `DOM pre-load: ${curList(type).length.toLocaleString()} / ${totalLabel} (+${domAdded})`
-          });
-        }
-      }
-
       const preDrain = await readNativeListQueueDrainFromTab(tabId, cfg.opName);
       if (preDrain?.users?.length) {
         const preAdded = addNativeUsers({ users: preDrain.users }, seen, profile.username, type);
+        const blueMerged = mergeSnifferFieldsIntoList(preDrain.users, type, profile.username);
         trimListToFetchLimit(type);
         const totalLabel = totalList != null ? totalList.toLocaleString() : '—';
+        const blueNote = blueMerged > 0 ? `, ${blueMerged} is_blue merged` : '';
         notifyProgress({
           reason: 'collecting',
           method: 'rest-v1.1',
           addedLastPage: preAdded,
           status: preAdded > 0
-            ? `Sniffer pre-load: ${curList(type).length.toLocaleString()} / ${totalLabel} (+${preAdded})`
-            : `Sniffer pre-load: ${preDrain.users.length} captured, ${preAdded} new (already had ${curList(type).length})`
+            ? `Sniffer pre-load: ${curList(type).length.toLocaleString()} / ${totalLabel} (+${preAdded}${blueNote})`
+            : `Sniffer pre-load: ${preDrain.users.length} captured, ${preAdded} new (already had ${curList(type).length}${blueNote})`
         });
       }
     } catch (error) {}
@@ -3905,17 +4424,25 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
         const added = addNativeUsers({ users: info.users || [] }, seen, profile.username, type);
         trimListToFetchLimit(type);
 
+        let blueMerged = 0;
+        if (tabId) {
+          await nudgeTabListScroll(tabId, info.page % 2 === 0 ? 1100 : 650);
+          await sleep(info.page % 2 === 0 ? 550 : 300);
+          blueMerged = await upgradeListFromSnifferDrain(tabId, type, profile.username);
+        }
+
         const totalLabel = totalList != null ? totalList.toLocaleString() : '—';
         const strategyNote = info.strategy ? ` [${info.strategy}]` : '';
         const recoveryNote = info.shortfallRecovery
           ? ` (tail recovery${info.shortfallLabel ? `: ${info.shortfallLabel}` : ''})`
           : '';
+        const blueNote = blueMerged > 0 ? `, ${blueMerged} is_blue` : '';
         notifyProgress({
           reason: 'collecting',
           method: 'rest-v1.1',
           addedLastPage: added,
           restPage: info.page,
-          status: `REST page ${info.page}: ${curList(type).length.toLocaleString()} / ${totalLabel} (+${added})${strategyNote}${recoveryNote}`
+          status: `REST page ${info.page}: ${curList(type).length.toLocaleString()} / ${totalLabel} (+${added}${blueNote})${strategyNote}${recoveryNote}`
         });
       }
     });
@@ -3947,6 +4474,21 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
         ? `${result.attemptSummary} | ${tailNote}`
         : tailNote;
     }
+  }
+
+  if (tabId) {
+    try {
+      await executeOnTab(tabId, () => window.scrollTo(0, Math.max(document.body.scrollHeight, 2400)));
+      await sleep(700);
+      const blueMerged = await upgradeListFromSnifferDrain(tabId, type, profile.username);
+      if (blueMerged > 0) {
+        appendDebugStatusLog({
+          status: `Sniffer final merge: is_blue on ${blueMerged.toLocaleString()} accounts`,
+          method: 'rest-v1.1',
+          reason: 'collecting'
+        });
+      }
+    } catch (error) {}
   }
 
   snapshotListRaw(type);
@@ -4027,8 +4569,59 @@ async function runExportFlow(requestedType = listType, options = {}) {
     listType: type
   });
 
-  await hydrateSubscriptionFromStorage(username);
-  refreshSubscription(username, false).catch(() => {});
+  await refreshSubscription(username, false);
+
+  const hudReady = await ensureHudShown(tab.id, {
+    isScraping: true,
+    reason: 'start',
+    listType: type,
+    username: jobState.username || username || null,
+    count: cachedCount,
+    fetchMode,
+    status: options.forceRefresh
+      ? `Fresh start — ${cfg.label.toLowerCase()}...`
+      : cachedCount > 0
+        ? `Resuming — ${cachedCount.toLocaleString()} ${cfg.label.toLowerCase()}...`
+        : `Starting ${cfg.label.toLowerCase()} collection...`
+  });
+
+  if (options.handoffAfterHud) {
+    if (!hudReady) {
+      return {
+        ok: false,
+        hudReady: false,
+        error: 'Could not open the on-page HUD on your X tab. Refresh x.com and try again.',
+        ...getStatus()
+      };
+    }
+    void runExportFlowJob(tab, type, options, username).catch((error) => {
+      if (isCancelledError(error)) {
+        finishStoppedJob();
+        return;
+      }
+      jobState.isScraping = false;
+      jobState.reason = 'error';
+      const errorText = String(error?.message || error);
+      const errorDetail = error?.attemptSummary ? `${errorText} (${error.attemptSummary})` : errorText;
+      jobState.status = errorDetail;
+      notifyProgress({ status: errorDetail, error: errorDetail, reason: 'error' });
+      persistDebugStatusLog();
+      activeFetch = null;
+    });
+    return {
+      ok: true,
+      hudReady: true,
+      isScraping: true,
+      ...getStatus()
+    };
+  }
+
+  return runExportFlowJob(tab, type, options, username);
+}
+
+async function runExportFlowJob(tab, type, options, username) {
+  const cfg = listCfg(type);
+  const fetchMode = normalizeFetchMode(options.fetchMode || jobState.fetchMode || (await getFetchMode()));
 
   try {
     activeFetch = { running: true, cancelled: false };
@@ -4221,8 +4814,7 @@ async function runExportFlow(requestedType = listType, options = {}) {
       };
       await sendHudMessage(tab.id, {
         action: 'showHud',
-        ...jobState,
-        status: 'Opening your profile...'
+        ...buildHudState({ status: 'Opening your profile...' })
       }, 8);
       notifyProgress({ status: 'Opening your profile...' });
 
@@ -4260,8 +4852,9 @@ async function runExportFlow(requestedType = listType, options = {}) {
       const totalLabel = totalForFetch != null ? totalForFetch.toLocaleString() : '—';
       await sendHudMessage(tab.id, {
         action: 'updateHud',
-        ...jobState,
-        status: `Logged in as @${jobState.username} • ${totalLabel} ${cfg.label.toLowerCase()}`
+        ...buildHudState({
+          status: `Logged in as @${jobState.username} • ${totalLabel} ${cfg.label.toLowerCase()}`
+        })
       }, 12);
       notifyProgress({
         status: `Logged in as @${jobState.username} • opening ${cfg.label}...`
@@ -4486,13 +5079,14 @@ async function bootstrapSubscription() {
   await restoreDebugStatusLogFromStorage();
   if (jobState.username) {
     await restoreAllListState();
-    await hydrateSubscriptionFromStorage(jobState.username);
+    await refreshSubscription(jobState.username, false);
+  } else {
+    await hydrateSubscriptionFromStorage(null);
   }
-  refreshSubscription(null, false).catch(() => {});
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('X Cleaner v0.80 installed (REST tab-context + PlugMonkey-style session)');
+  console.log('X Cleaner v0.81 installed (REST tab-context + PlugMonkey-style session)');
   bootstrapSubscription().catch(() => {});
 });
 
@@ -4524,7 +5118,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case 'runExportFlow':
         sendResponse(await runExportFlow(message.listType || listType, {
           fetchMode: message.fetchMode,
-          forceRefresh: !!message.forceRefresh
+          forceRefresh: !!message.forceRefresh,
+          handoffAfterHud: !!message.handoffAfterHud
         }));
         break;
       case 'stopScrape':
@@ -4539,10 +5134,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case 'filterFollowingList':
       case 'filterList':
         sendResponse(await filterList({
+          listType: message.listType,
           removeBlue: !!message.removeBlue,
-          removeNew: !!message.removeNew,
           removeInactive: !!message.removeInactive,
-          newAccountMonths: message.newAccountMonths,
+          removeMutuals: !!message.removeMutuals,
+          botCheck: !!message.botCheck,
           inactiveMonths: message.inactiveMonths
         }));
         break;

@@ -2,12 +2,10 @@ const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const exportBtn = document.getElementById('exportBtn');
 const filterBtn = document.getElementById('filterBtn');
+const removeMutualsEl = document.getElementById('removeMutuals');
 const removeBlueEl = document.getElementById('removeBlue');
-const removeNewEl = document.getElementById('removeNew');
 const removeInactiveEl = document.getElementById('removeInactive');
-const newAccountMonthsEl = document.getElementById('newAccountMonths');
-const newAccountMonthsDecEl = document.getElementById('newAccountMonthsDec');
-const newAccountMonthsIncEl = document.getElementById('newAccountMonthsInc');
+const botCheckEl = document.getElementById('botCheck');
 const inactiveMonthsEl = document.getElementById('inactiveMonths');
 const inactiveMonthsDecEl = document.getElementById('inactiveMonthsDec');
 const inactiveMonthsIncEl = document.getElementById('inactiveMonthsInc');
@@ -15,22 +13,12 @@ const inactiveMonthsIncEl = document.getElementById('inactiveMonthsInc');
 const FILTER_MONTHS_MIN = 1;
 const FILTER_MONTHS_MAX = 24;
 const FILTER_MONTHS_DEFAULT = 6;
-const NEW_ACCOUNT_MONTHS_PREF_KEY = 'xc_new_account_months_pref';
 const INACTIVE_MONTHS_PREF_KEY = 'xc_inactive_months_pref';
 
 function clampFilterMonths(value) {
   const months = Math.round(Number(value));
   if (!Number.isFinite(months)) return FILTER_MONTHS_DEFAULT;
   return Math.min(FILTER_MONTHS_MAX, Math.max(FILTER_MONTHS_MIN, months));
-}
-
-function readNewAccountMonths() {
-  return clampFilterMonths(newAccountMonthsEl?.value);
-}
-
-function setNewAccountMonthsInput(value) {
-  if (!newAccountMonthsEl) return;
-  newAccountMonthsEl.value = String(clampFilterMonths(value));
 }
 
 function readInactiveMonths() {
@@ -65,6 +53,10 @@ const upgradeBtn = document.getElementById('upgradeBtn');
 const modeFollowingEl = document.getElementById('modeFollowing');
 const modeFollowersEl = document.getElementById('modeFollowers');
 const freshStartEl = document.getElementById('freshStart');
+
+function closePopup() {
+  window.close();
+}
 
 const PRO_CHECKOUT_URL = 'https://x.com/d2fl/creator-subscriptions/subscribe';
 const FREE_FETCH_LIMIT = 200;
@@ -410,114 +402,54 @@ if (fetchModeSelect) {
 startBtn.addEventListener('click', async () => {
   const listType = selectedListType();
   const forceRefresh = !!freshStartEl?.checked;
-  const prior = await sendBackground('getStatus');
-  const priorCount = forceRefresh
-    ? 0
-    : (prior?.count
-      || (listType === 'followers' ? prior?.storedCounts?.followers : prior?.storedCounts?.following)
-      || 0);
-  updateUI({
-    isScraping: true,
-    count: priorCount,
-    totalFollowing: forceRefresh ? null : (prior?.totalFollowing ?? null),
-    totalFollowers: forceRefresh ? null : (prior?.totalFollowers ?? null),
-    listType,
-    username: prior?.username || null
-  });
   const fetchMode = fetchModeSelect?.value || 'auto';
-  const freshNote = forceRefresh ? ' (fresh start — clearing cache)' : '';
-  const modeHint = fetchMode === 'rest'
-    ? `REST fetch for ${listLabel(listType)} (200/page)${freshNote}...`
-    : fetchMode === 'sniffer'
-      ? `Opening profile and ${listLabel(listType)} page (sniffer)${freshNote}...`
-      : `Trying REST fetch for ${listLabel(listType)}, sniffer if needed${freshNote}...`;
-  setStatus(modeHint);
-  startPolling();
-
-  const result = await sendBackground('runExportFlow', { listType, fetchMode, forceRefresh });
-
-  stopPolling();
-  await refreshStatus();
-
-  if (!result.ok && !result.isScraping) {
-    setStatus(result.error || 'Failed to start collection.', true);
+  startBtn.disabled = true;
+  setStatus('Opening on-page panel on your X tab...');
+  const result = await sendBackground('runExportFlow', {
+    listType,
+    fetchMode,
+    forceRefresh,
+    handoffAfterHud: true
+  });
+  if (result?.hudReady) {
+    closePopup();
     return;
   }
+  startBtn.disabled = false;
+  setStatus(result?.error || 'Could not start collection — keep an x.com tab open and try again.', true);
 });
 
-stopBtn.addEventListener('click', async () => {
-  setStatus('Stopping collection...');
-  const result = await sendBackground('stopScrape');
-
-  if (!result.ok) {
-    setStatus(result.error || 'Failed to stop collection.', true);
-    return;
-  }
-
-  await refreshStatus();
+stopBtn.addEventListener('click', () => {
+  sendBackground('stopScrape');
+  closePopup();
 });
 
-filterBtn.addEventListener('click', async () => {
-  setStatus('Applying filters...');
-  const result = await sendBackground('filterList', {
+filterBtn.addEventListener('click', () => {
+  sendBackground('filterList', {
+    listType: selectedListType(),
+    removeMutuals: removeMutualsEl?.checked,
     removeBlue: removeBlueEl.checked,
-    removeNew: removeNewEl.checked,
     removeInactive: removeInactiveEl.checked,
-    newAccountMonths: readNewAccountMonths(),
+    botCheck: botCheckEl?.checked,
     inactiveMonths: readInactiveMonths()
   });
-
-  if (!result.ok) {
-    setStatus(result.error || 'Filter failed.', true);
-    return;
-  }
-
-  updateUI(result);
-  if (result.removed > 0) {
-    setStatus(
-      `Filtered to ${result.count.toLocaleString()} accounts (removed ${result.removed.toLocaleString()}).`
-    );
-  } else {
-    setStatus(`${result.count.toLocaleString()} accounts ready to export.`);
-  }
+  closePopup();
 });
 
-checkSubBtn.addEventListener('click', async () => {
-  checkSubBtn.disabled = true;
-  setStatus('Refreshing subscription status...');
-  try {
-    const result = await sendBackground('checkSubscription', { syncFromTab: true, force: true });
-    if (result.ok === false && !result.isSubscribed) {
-      setStatus(result.error || 'Could not refresh subscription.', true);
-      return;
-    }
-    updateUI(result);
-    if (result.subsFetchError) {
-      setStatus(`${result.subsFetchError} — using cached subscription status.`, true);
-    } else {
-      setStatus(result.subscriptionStatus || 'Subscription status updated.');
-    }
-  } finally {
-    checkSubBtn.disabled = false;
-  }
+checkSubBtn.addEventListener('click', () => {
+  sendBackground('checkSubscription', { syncFromTab: true, force: true });
+  closePopup();
 });
 
 upgradeBtn.addEventListener('click', () => {
   sendBackground('openSubscribe');
+  closePopup();
 });
 
-exportBtn.addEventListener('click', async () => {
+exportBtn.addEventListener('click', () => {
   if (exportBtn.disabled) return;
-  setStatus('Preparing CSV export...');
-  const result = await sendBackground('exportCSV');
-
-  if (!result.ok && !result.exported) {
-    setStatus(result.error || 'Export failed.', true);
-    return;
-  }
-
-  updateUI(result);
-  setStatus(`Exported ${result.count || 0} accounts${result.filename ? ` (${result.filename})` : ''}.`);
+  sendBackground('exportCSV');
+  closePopup();
 });
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -551,15 +483,6 @@ function wireFilterMonthsStepper({
 }
 
 wireFilterMonthsStepper({
-  inputEl: newAccountMonthsEl,
-  decEl: newAccountMonthsDecEl,
-  incEl: newAccountMonthsIncEl,
-  prefKey: NEW_ACCOUNT_MONTHS_PREF_KEY,
-  setInput: setNewAccountMonthsInput,
-  readValue: readNewAccountMonths
-});
-
-wireFilterMonthsStepper({
   inputEl: inactiveMonthsEl,
   decEl: inactiveMonthsDecEl,
   incEl: inactiveMonthsIncEl,
@@ -568,19 +491,7 @@ wireFilterMonthsStepper({
   readValue: readInactiveMonths
 });
 
-sendBackground('getStatus').then((state) => {
-  if (state?.ok !== false) updateUI(state);
-});
-
-sendBackground('checkSubscription', { syncFromTab: true, force: false }).then((result) => {
-  if (result?.ok !== false || result?.username || result?.isSubscribed != null) {
-    updateUI(result);
-  } else {
-    refreshStatus();
-  }
-}).catch(() => {
-  refreshStatus();
-});
+refreshStatus();
 
 sendBackground('getJobState').then((state) => {
   if (state?.isScraping) startPolling();

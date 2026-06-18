@@ -42,6 +42,12 @@
       word-break: break-word;
     }
     #statusLog.is-visible, #statusLogLabel.is-visible { display: block; }
+    .mutuals-filter {
+      display: block;
+      font-size: 12px;
+      margin: 8px 0 4px;
+      color: #333;
+    }
     .filter-box {
       margin: 10px 0;
       padding: 10px;
@@ -194,7 +200,7 @@
   </style>
 </head>
 <body>
-  <h2>X Cleaner v0.80</h2>
+  <h2>X Cleaner v0.81</h2>
   <div id="account">@—</div>
   <div class="list-toggle">
     <label><input type="radio" name="listType" id="modeFollowing" value="following" checked><span>Following</span></label>
@@ -227,28 +233,24 @@
   </div>
   <button id="startBtn">Start Collection</button>
   <button id="stopBtn" style="display:none;">Stop</button>
+  <label class="mutuals-filter" title="Uses the other list (Following/Followers) when relationship flags are missing">
+    <input type="checkbox" id="removeMutuals"> Remove mutuals
+  </label>
   <fieldset class="filter-box">
     <legend>Pre-export filter</legend>
-    <label><input type="checkbox" id="removeBlue"> Remove blue</label>
-    <label class="months-filter">
-      <input type="checkbox" id="removeNew">
-      <span>Remove new (&lt;</span>
-      <span class="months-stepper">
-        <button type="button" id="newAccountMonthsDec" aria-label="Decrease months">−</button>
-        <input type="number" id="newAccountMonths" value="6" min="1" max="24" step="1" aria-label="New account months">
-        <button type="button" id="newAccountMonthsInc" aria-label="Increase months">+</button>
-      </span>
-      <span>months)</span>
-    </label>
+    <label><input type="checkbox" id="removeBlue"> Remove Verified</label>
     <label class="months-filter">
       <input type="checkbox" id="removeInactive">
-      <span>Remove inactive (no tweet &gt;</span>
+      <span>Last post &gt;</span>
       <span class="months-stepper">
         <button type="button" id="inactiveMonthsDec" aria-label="Decrease months">−</button>
-        <input type="number" id="inactiveMonths" value="6" min="1" max="24" step="1" aria-label="Inactive months">
+        <input type="number" id="inactiveMonths" value="6" min="1" max="24" step="1" aria-label="Last post months">
         <button type="button" id="inactiveMonthsInc" aria-label="Increase months">+</button>
       </span>
-      <span>months)</span>
+      <span>months</span>
+    </label>
+    <label title="Followers only: keep accounts flagged as potential bots (any of: &lt;10 tweets, default avatar, no bio, account &lt;30 days)">
+      <input type="checkbox" id="botCheck"> Bot check
     </label>
     <button id="filterBtn" type="button">Filter</button>
   </fieldset>

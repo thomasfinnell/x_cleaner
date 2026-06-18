@@ -308,6 +308,7 @@ function xcRestMapApiUser(raw, listType) {
     followers_count: raw.followers_count ?? null,
     tweet_count: raw.statuses_count ?? null,
     created_at: raw.created_at || '',
+    bio: String(raw.description || '').trim(),
     is_blue: isBlue,
     default_avatar: !!raw.default_profile_image,
     you_follow: listType === 'following' ? true : (raw.following ?? null),
@@ -388,18 +389,28 @@ function xcRestMapUsersShow(response) {
   };
 }
 
-function xcRestParseUsersLookupLastActive(body) {
+function xcRestParseUsersLookupFields(body, listType = 'followers') {
   const lastActive = {};
+  const blueByName = {};
+  const profilesByName = {};
   const users = Array.isArray(body) ? body : [];
   for (const raw of users) {
     const sn = String(raw?.screen_name || '').toLowerCase().replace(/^@+/, '');
+    if (!sn) continue;
+    if (xcRestDetectBlue(raw)) blueByName[sn] = true;
+    const mapped = xcRestMapApiUser(raw, listType);
+    if (mapped) profilesByName[sn] = mapped;
     const createdAt = raw?.status?.created_at;
-    if (!sn || !createdAt) continue;
+    if (!createdAt) continue;
     const ts = Date.parse(createdAt);
     if (Number.isNaN(ts)) continue;
     lastActive[sn] = ts;
   }
-  return lastActive;
+  return { lastActive, blueByName, profilesByName };
+}
+
+function xcRestParseUsersLookupLastActive(body) {
+  return xcRestParseUsersLookupFields(body).lastActive;
 }
 
 function injectedRestUsersLookup(request) {
@@ -479,13 +490,15 @@ function injectedRestUsersLookup(request) {
       try {
         const result = await fetchOne(base);
         if (result) {
+          const parsed = xcRestParseUsersLookupFields(result.body);
           return {
             ok: true,
             body: result.body,
             strategy: result.label,
             url: result.url,
             attempts,
-            lastActive: xcRestParseUsersLookupLastActive(result.body)
+            lastActive: parsed.lastActive,
+            blueByName: parsed.blueByName
           };
         }
       } catch (error) {
@@ -536,13 +549,24 @@ async function xcRestUsersLookupFromTab(tabId, screenNames, options = {}) {
       };
     }
 
-    const lastActive = payload.lastActive || xcRestParseUsersLookupLastActive(payload.body);
+    const listType = options.listType || 'followers';
+    const parsed = xcRestParseUsersLookupFields(payload.body || [], listType);
+    if (payload.lastActive) {
+      Object.assign(parsed.lastActive, payload.lastActive);
+    }
+    if (payload.blueByName) {
+      Object.assign(parsed.blueByName, payload.blueByName);
+    }
     return {
       ok: true,
-      lastActive,
+      lastActive: parsed.lastActive,
+      blueByName: parsed.blueByName,
+      profilesByName: parsed.profilesByName,
       strategy: payload.strategy,
       attempts: payload.attempts || [],
-      matched: Object.keys(lastActive).length
+      matched: Object.keys(parsed.lastActive).length,
+      blueMatched: Object.keys(parsed.blueByName).length,
+      profileMatched: Object.keys(parsed.profilesByName).length
     };
   } catch (error) {
     return {
@@ -604,13 +628,23 @@ async function xcRestUsersLookupBatch(screenNames, options = {}) {
     const label = url.includes('twitter.com') ? 'worker@twitter.com' : 'worker@x.com';
     try {
       const body = await xcRestMakeApiRequest(url, 'GET', null, options);
-      const lastActive = xcRestParseUsersLookupLastActive(body);
+      const listType = options.listType || 'followers';
+      const parsed = xcRestParseUsersLookupFields(body, listType);
       attempts.push({
         strategy: label,
         users: handles.length,
-        matched: Object.keys(lastActive).length
+        matched: Object.keys(parsed.lastActive).length,
+        blueMatched: Object.keys(parsed.blueByName).length,
+        profileMatched: Object.keys(parsed.profilesByName).length
       });
-      return { ok: true, lastActive, attempts, strategy: label };
+      return {
+        ok: true,
+        lastActive: parsed.lastActive,
+        blueByName: parsed.blueByName,
+        profilesByName: parsed.profilesByName,
+        attempts,
+        strategy: label
+      };
     } catch (error) {
       attempts.push(`${label}: ${error.message}`);
       lastError = error;

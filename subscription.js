@@ -6,7 +6,7 @@ const XC_SUBSCRIPTIONS_PAGE_URL = 'https://x.com/settings/subscriptions';
 const XC_REQUIRED_CREATOR = 'd2fl';
 const XC_FREE_FETCH_LIMIT = 200;
 const XC_SUB_STATE_KEY = 'xfr_fetch_subscription_state';
-const XC_SUB_CACHE_TTL_MS = 15 * 60 * 1000;
+const XC_SUB_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const XC_SUBS_FETCH_RETRIES = 3;
 const XC_SUBS_FETCH_TIMEOUT_MS = 12000;
 const XC_SUBS_FETCH_RETRY_DELAY_MS = 1500;
@@ -169,6 +169,18 @@ function xcResolveAuthorization(userHandle, xCreatorHandles, xSniffOk, subsTxtHa
     xCreatorHandles: xCreatorHandles || [],
     xSniffOk: !!xSniffOk
   };
+}
+
+function xcSubscriptionCacheIsFresh(handle, cache = null) {
+  const normalized = xcNormalizeHandle(handle);
+  if (!normalized) return false;
+  const entry = cache ?? null;
+  return !!xcReadCachedAuthorization(entry, normalized);
+}
+
+async function xcSubscriptionCacheIsFreshForHandle(handle) {
+  const state = await xcLoadSubscriptionState();
+  return xcSubscriptionCacheIsFresh(handle, state.subscriptionCache);
 }
 
 function xcReadCachedAuthorization(cache, normalized) {
