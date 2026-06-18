@@ -1,6 +1,80 @@
 // On-page HUD for X Cleaner (collection runs via GraphQL in the background)
 const HUD_ID = 'xcleaner-hud';
 const HUD_DISMISSED_KEY = 'xc_hud_dismissed';
+const FILTER_MONTHS_MIN = 1;
+const FILTER_MONTHS_MAX = 24;
+const FILTER_MONTHS_DEFAULT = 6;
+const NEW_ACCOUNT_MONTHS_PREF_KEY = 'xc_new_account_months_pref';
+const INACTIVE_MONTHS_PREF_KEY = 'xc_inactive_months_pref';
+
+function clampFilterMonths(value) {
+  const months = Math.round(Number(value));
+  if (!Number.isFinite(months)) return FILTER_MONTHS_DEFAULT;
+  return Math.min(FILTER_MONTHS_MAX, Math.max(FILTER_MONTHS_MIN, months));
+}
+
+function readHudFilterMonths(hud, inputId) {
+  const input = hud?.querySelector(inputId);
+  return clampFilterMonths(input?.value);
+}
+
+function setHudFilterMonths(hud, inputId, value) {
+  const input = hud?.querySelector(inputId);
+  if (!input) return;
+  input.value = String(clampFilterMonths(value));
+}
+
+function persistFilterMonths(prefKey, value) {
+  try {
+    chrome.storage.local.set({ [prefKey]: clampFilterMonths(value) });
+  } catch (error) {}
+}
+
+function wireHudFilterMonthsStepper(hud, {
+  inputId,
+  decId,
+  incId,
+  prefKey
+}) {
+  const input = hud.querySelector(inputId);
+  const decBtn = hud.querySelector(decId);
+  const incBtn = hud.querySelector(incId);
+  if (!input) return;
+
+  const bump = (delta) => {
+    setHudFilterMonths(hud, inputId, readHudFilterMonths(hud, inputId) + delta);
+    persistFilterMonths(prefKey, readHudFilterMonths(hud, inputId));
+  };
+
+  decBtn?.addEventListener('click', () => bump(-1));
+  incBtn?.addEventListener('click', () => bump(1));
+  input.addEventListener('change', () => {
+    setHudFilterMonths(hud, inputId, input.value);
+    persistFilterMonths(prefKey, readHudFilterMonths(hud, inputId));
+  });
+
+  chrome.storage.local.get(prefKey, (res) => {
+    if (chrome.runtime.lastError) return;
+    if (res[prefKey] != null) {
+      setHudFilterMonths(hud, inputId, res[prefKey]);
+    }
+  });
+}
+
+function wireHudFilterMonthSteppers(hud) {
+  wireHudFilterMonthsStepper(hud, {
+    inputId: '#xcleaner-new-account-months',
+    decId: '#xcleaner-new-account-months-dec',
+    incId: '#xcleaner-new-account-months-inc',
+    prefKey: NEW_ACCOUNT_MONTHS_PREF_KEY
+  });
+  wireHudFilterMonthsStepper(hud, {
+    inputId: '#xcleaner-inactive-months',
+    decId: '#xcleaner-inactive-months-dec',
+    incId: '#xcleaner-inactive-months-inc',
+    prefKey: INACTIVE_MONTHS_PREF_KEY
+  });
+}
 
 function formatTotal(total) {
   return total == null ? '—' : total.toLocaleString();
@@ -78,6 +152,20 @@ function ensureHud() {
         cursor: pointer;
       }
       #${HUD_ID} .xc-close:hover { color: #fff; background: rgba(255,255,255,0.08); }
+      #${HUD_ID} .xc-fresh-start {
+        margin: 0 0 8px;
+        font-size: 11px;
+        color: #cfd9de;
+        line-height: 1.35;
+      }
+      #${HUD_ID} .xc-fresh-start label {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+        cursor: pointer;
+        font-weight: 700;
+      }
+      #${HUD_ID} .xc-fresh-start input { margin-top: 2px; }
       #${HUD_ID} .xc-start { background: #e7e9ea; color: #0f1419; }
       #${HUD_ID} .xc-method { color: #8b98a5; font-size: 11px; margin-bottom: 6px; }
       #${HUD_ID} .xc-toggle {
@@ -105,7 +193,32 @@ function ensureHud() {
       #${HUD_ID} .xc-mutuals { color: #8b98a5; font-size: 11px; margin-bottom: 6px; min-height: 14px; }
       #${HUD_ID} .xc-account { color: #cfd9de; margin-bottom: 4px; }
       #${HUD_ID} .xc-progress { font-size: 22px; font-weight: 700; margin: 8px 0; }
-      #${HUD_ID} .xc-status { color: #cfd9de; min-height: 18px; margin-bottom: 8px; }
+      #${HUD_ID} .xc-status { color: #cfd9de; min-height: 18px; margin-bottom: 6px; font-size: 12px; line-height: 1.35; }
+      #${HUD_ID} .xc-status-log {
+        display: none;
+        margin: 0 0 8px;
+        padding: 6px 8px;
+        border: 1px solid #2f3336;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.35);
+        color: #9ec8e8;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 10px;
+        line-height: 1.35;
+        max-height: calc(10px * 1.35 * 10 + 12px);
+        overflow-y: auto;
+        overflow-x: hidden;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      #${HUD_ID} .xc-status-log.is-visible { display: block; }
+      #${HUD_ID} .xc-status-log-label {
+        display: none;
+        color: #6e767d;
+        font-size: 10px;
+        margin-bottom: 4px;
+      }
+      #${HUD_ID} .xc-status-log-label.is-visible { display: block; }
       #${HUD_ID} .xc-filter {
         margin: 8px 0;
         padding: 8px;
@@ -123,6 +236,45 @@ function ensureHud() {
         display: block;
         font-size: 12px;
         margin: 4px 0;
+        color: #cfd9de;
+      }
+      #${HUD_ID} .xc-months-filter {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+      }
+      #${HUD_ID} .xc-months-stepper {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+      }
+      #${HUD_ID} .xc-months-stepper input {
+        width: 38px;
+        text-align: center;
+        padding: 2px 4px;
+        border: 1px solid #2f3336;
+        border-radius: 6px;
+        font-size: 12px;
+        background: rgba(0, 0, 0, 0.35);
+        color: #fff;
+      }
+      #${HUD_ID} .xc-months-stepper input::-webkit-outer-spin-button,
+      #${HUD_ID} .xc-months-stepper input::-webkit-inner-spin-button {
+        -webkit-appearance: none;
+        margin: 0;
+      }
+      #${HUD_ID} .xc-months-stepper input[type=number] {
+        -moz-appearance: textfield;
+      }
+      #${HUD_ID} .xc-months-stepper button {
+        width: 22px;
+        margin: 0;
+        padding: 2px 0;
+        font-size: 11px;
+        line-height: 1.2;
+        border-radius: 6px;
+        background: #2f3336;
         color: #cfd9de;
       }
       #${HUD_ID} button {
@@ -179,13 +331,39 @@ function ensureHud() {
     <div class="xc-progress" id="xcleaner-progress">0 / —</div>
     <div class="xc-mutuals" id="xcleaner-mutuals"></div>
     <div class="xc-status" id="xcleaner-status">Ready</div>
+    <div class="xc-status-log-label" id="xcleaner-status-log-label">Status log (debug, kept after finish)</div>
+    <div class="xc-status-log" id="xcleaner-status-log" aria-live="polite"></div>
+    <div class="xc-fresh-start">
+      <label for="xcleaner-fresh-start">
+        <input type="checkbox" id="xcleaner-fresh-start">
+        <span>Fresh start (clear cached list for selected tab)</span>
+      </label>
+    </div>
     <button class="xc-start" id="xcleaner-start" type="button">Start Collection</button>
     <button class="xc-stop" id="xcleaner-stop" style="display:none;">Stop</button>
     <div class="xc-filter">
       <div class="xc-filter-title">Pre-export filter</div>
       <label><input type="checkbox" id="xcleaner-remove-blue"> Remove blue</label>
-      <label><input type="checkbox" id="xcleaner-remove-new"> Remove new (&lt; 6 months)</label>
-      <label><input type="checkbox" id="xcleaner-remove-inactive"> Remove inactive (no tweet &gt; 6 months)</label>
+      <label class="xc-months-filter">
+        <input type="checkbox" id="xcleaner-remove-new">
+        <span>Remove new (&lt;</span>
+        <span class="xc-months-stepper">
+          <button type="button" id="xcleaner-new-account-months-dec" aria-label="Decrease months">−</button>
+          <input type="number" id="xcleaner-new-account-months" value="6" min="1" max="24" step="1" aria-label="New account months">
+          <button type="button" id="xcleaner-new-account-months-inc" aria-label="Increase months">+</button>
+        </span>
+        <span>months)</span>
+      </label>
+      <label class="xc-months-filter">
+        <input type="checkbox" id="xcleaner-remove-inactive">
+        <span>Remove inactive (no tweet &gt;</span>
+        <span class="xc-months-stepper">
+          <button type="button" id="xcleaner-inactive-months-dec" aria-label="Decrease months">−</button>
+          <input type="number" id="xcleaner-inactive-months" value="6" min="1" max="24" step="1" aria-label="Inactive months">
+          <button type="button" id="xcleaner-inactive-months-inc" aria-label="Increase months">+</button>
+        </span>
+        <span>months)</span>
+      </label>
       <button class="xc-filter-btn" id="xcleaner-filter" type="button">Filter</button>
     </div>
     <div class="xc-sub">
@@ -199,16 +377,21 @@ function ensureHud() {
   `;
 
   document.documentElement.appendChild(hud);
+  wireHudFilterMonthSteppers(hud);
 
   hud.querySelector('#xcleaner-close').addEventListener('click', () => {
+    chrome.runtime.sendMessage({ action: 'stopScrape' }).catch(() => {});
     hideHud();
   });
 
   hud.querySelector('#xcleaner-start').addEventListener('click', () => {
     const listType = selectedHudListType();
+    const forceRefresh = !!hud.querySelector('#xcleaner-fresh-start')?.checked;
     const statusEl = hud.querySelector('#xcleaner-status');
-    statusEl.textContent = `Starting ${listLabel(listType).toLowerCase()} collection...`;
-    chrome.runtime.sendMessage({ action: 'runExportFlow', listType }).catch(() => {});
+    statusEl.textContent = forceRefresh
+      ? `Fresh start — clearing cached ${listLabel(listType).toLowerCase()}...`
+      : `Starting ${listLabel(listType).toLowerCase()} collection...`;
+    chrome.runtime.sendMessage({ action: 'runExportFlow', listType, forceRefresh }).catch(() => {});
   });
 
   hud.querySelector('#xcleaner-stop').addEventListener('click', () => {
@@ -224,7 +407,7 @@ function ensureHud() {
     const refreshBtn = hud.querySelector('#xcleaner-sub-refresh');
     refreshBtn.disabled = true;
     statusEl.textContent = 'Refreshing subscription status...';
-    chrome.runtime.sendMessage({ action: 'checkSubscription', force: true }, (result) => {
+    chrome.runtime.sendMessage({ action: 'checkSubscription', syncFromTab: true, force: true }, (result) => {
       refreshBtn.disabled = false;
       if (chrome.runtime.lastError) {
         statusEl.textContent = chrome.runtime.lastError.message || 'Refresh failed.';
@@ -247,7 +430,9 @@ function ensureHud() {
       action: 'filterList',
       removeBlue,
       removeNew,
-      removeInactive
+      removeInactive,
+      newAccountMonths: readHudFilterMonths(hud, '#xcleaner-new-account-months'),
+      inactiveMonths: readHudFilterMonths(hud, '#xcleaner-inactive-months')
     }).catch(() => {});
   });
 
@@ -296,6 +481,25 @@ function formatTotalForState(state) {
   return total == null ? '—' : total.toLocaleString();
 }
 
+function renderDebugStatusLog(hud, state = {}) {
+  const logEl = hud.querySelector('#xcleaner-status-log');
+  const labelEl = hud.querySelector('#xcleaner-status-log-label');
+  if (!logEl || !labelEl) return;
+
+  const enabled = state.debugStatusLogEnabled !== false;
+  const lines = Array.isArray(state.debugStatusLog) ? state.debugStatusLog : [];
+  const showLog = enabled && lines.length > 0;
+  logEl.classList.toggle('is-visible', showLog);
+  labelEl.classList.toggle('is-visible', showLog);
+  if (!showLog) {
+    if (!enabled) logEl.textContent = '';
+    return;
+  }
+
+  logEl.textContent = lines.length ? lines.join('\n') : '(waiting for status updates...)';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
 function updateHud(state = {}) {
   if (isHudDismissed()) return;
 
@@ -327,11 +531,40 @@ function updateHud(state = {}) {
 
   const mutualsEl = hud.querySelector('#xcleaner-mutuals');
   const mutuals = state.mutuals;
-  if (mutuals?.hasBoth) {
-    mutualsEl.textContent =
-      `Mutuals: ${mutuals.mutualCount.toLocaleString()} (${mutuals.followingCount.toLocaleString()} ∩ ${mutuals.followersCount.toLocaleString()})`;
+  const stored = state.storedCounts || {};
+  const activeType = state.listType || 'following';
+  const activeLabel = listLabel(activeType);
+  const otherLabel = activeType === 'followers' ? 'Following' : 'Followers';
+  const otherCount = activeType === 'followers' ? stored.following : stored.followers;
+  const activeCount = state.count || (activeType === 'followers' ? stored.followers : stored.following) || 0;
+
+  let mutualLine = '';
+  if (mutuals) {
+    mutualLine = `Mutuals: ${(mutuals.mutualCount || 0).toLocaleString()}`;
+    if (mutuals.hasRelationshipData && mutuals.source) {
+      const srcLabel = mutuals.source === 'followers' ? 'followers' : 'following';
+      mutualLine += ` (live from ${srcLabel}`;
+      if (mutuals.relationshipCoverage && mutuals.relationshipTotal) {
+        mutualLine += `, ${mutuals.relationshipCoverage.toLocaleString()} / ${mutuals.relationshipTotal.toLocaleString()} with flags`;
+      }
+      mutualLine += ')';
+    } else if (mutuals.hasBoth) {
+      mutualLine += ` (${mutuals.followingCount.toLocaleString()} following ∩ ${mutuals.followersCount.toLocaleString()} followers)`;
+    }
+  }
+
+  if ((state.reason === 'complete' || state.reason === 'stopped') && activeCount > 0) {
+    let line = `${activeLabel}: ${activeCount.toLocaleString()} collected`;
+    if (otherCount > 0) {
+      line += ` • ${otherLabel}: ${otherCount.toLocaleString()} saved (prior)`;
+    }
+    if (mutualLine) line += ` • ${mutualLine}`;
+    mutualsEl.textContent = line;
+  } else if (state.isScraping && activeCount > 0 && mutualLine) {
+    mutualsEl.textContent = mutualLine;
+  } else if (mutualLine && (mutuals?.hasBoth || mutuals?.hasRelationshipData)) {
+    mutualsEl.textContent = mutualLine;
   } else {
-    const stored = state.storedCounts || {};
     const parts = [];
     if (stored.following > 0) parts.push(`${stored.following.toLocaleString()} following saved`);
     if (stored.followers > 0) parts.push(`${stored.followers.toLocaleString()} followers saved`);
@@ -339,6 +572,7 @@ function updateHud(state = {}) {
   }
 
   const startBtn = hud.querySelector('#xcleaner-start');
+  const freshStartEl = hud.querySelector('#xcleaner-fresh-start');
   const stopBtn = hud.querySelector('#xcleaner-stop');
   const exportBtn = hud.querySelector('#xcleaner-export');
   const filterBtn = hud.querySelector('#xcleaner-filter');
@@ -357,6 +591,7 @@ function updateHud(state = {}) {
 
   startBtn.style.display = busy ? 'none' : 'block';
   startBtn.disabled = filterBusy;
+  if (freshStartEl) freshStartEl.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
   exportBtn.disabled = count === 0 || busy || !canExport;
   exportBtn.classList.toggle('export-locked', count > 0 && !canExport);
@@ -371,6 +606,8 @@ function updateHud(state = {}) {
     statusEl.textContent = state.status || `Waiting for X to load your ${label} list...`;
   } else if (state.reason === 'rate-limited') {
     statusEl.textContent = state.error || 'Rate limited — retrying...';
+  } else if (state.reason === 'collecting' && state.status) {
+    statusEl.textContent = state.status;
   } else if (state.isScraping) {
     if (state.status) {
       statusEl.textContent = state.status;
@@ -386,9 +623,9 @@ function updateHud(state = {}) {
   } else if (state.reason === 'filtered') {
     statusEl.textContent = state.status || `Filtered to ${count.toLocaleString()} accounts.`;
   } else if (state.reason === 'complete') {
-    statusEl.textContent = state.canExport
+    statusEl.textContent = state.status || (state.canExport
       ? 'Complete. Start again, filter, or export CSV any time.'
-      : (state.status || 'Complete (free tier). Filter here; subscribe @d2fl to export.');
+      : 'Complete (free tier). Filter here; subscribe @d2fl to export.');
   } else if (state.reason === 'exported') {
     statusEl.textContent = `Exported ${count.toLocaleString()} accounts.`;
   } else if (state.reason === 'stopped' && count > 0) {
@@ -400,6 +637,8 @@ function updateHud(state = {}) {
   } else {
     statusEl.textContent = 'Press Start Collection to fetch your list.';
   }
+
+  renderDebugStatusLog(hud, state);
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -428,20 +667,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 function syncHudFromBackground() {
   if (isHudDismissed()) return;
 
-  chrome.runtime.sendMessage({ action: 'checkSubscription', force: false }, (state) => {
+  chrome.runtime.sendMessage({ action: 'getStatus' }, (state) => {
     if (chrome.runtime.lastError || !state) return;
-    if (isHudDismissed() && !state.isScraping) return;
+    if (isHudDismissed() && !state.isScraping && !(state.debugStatusLog || []).length) return;
     if (
       state.isScraping ||
       state.count > 0 ||
       state.username ||
       state.reason === 'error' ||
       state.reason === 'complete' ||
+      state.reason === 'stopped' ||
       state.reason === 'exported' ||
       state.reason === 'filtered' ||
       state.reason === 'filtering' ||
       state.reason === 'enriching' ||
-      state.isEnriching
+      state.isEnriching ||
+      (state.debugStatusLogEnabled && (state.debugStatusLog || []).length > 0)
     ) {
       updateHud(state);
     }

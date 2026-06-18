@@ -17,7 +17,31 @@
       color: #111;
       margin: 8px 0 12px;
     }
-    #status { font-size: 13px; line-height: 1.4; color: #222; }
+    #status { font-size: 13px; line-height: 1.4; color: #222; margin-bottom: 6px; }
+    #statusLogLabel {
+      display: none;
+      font-size: 10px;
+      color: #888;
+      margin-bottom: 4px;
+    }
+    #statusLog {
+      display: none;
+      margin: 0 0 8px;
+      padding: 6px 8px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      background: #f4f8fb;
+      color: #234;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 10px;
+      line-height: 1.35;
+      max-height: calc(10px * 1.35 * 10 + 12px);
+      overflow-y: auto;
+      overflow-x: hidden;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #statusLog.is-visible, #statusLogLabel.is-visible { display: block; }
     .filter-box {
       margin: 10px 0;
       padding: 10px;
@@ -35,6 +59,43 @@
       display: block;
       font-size: 12px;
       margin: 6px 0;
+      color: #333;
+    }
+    .months-filter {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 4px;
+    }
+    .months-stepper {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+    }
+    .months-stepper input {
+      width: 42px;
+      text-align: center;
+      padding: 2px 4px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    .months-stepper input::-webkit-outer-spin-button,
+    .months-stepper input::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+    .months-stepper input[type=number] {
+      -moz-appearance: textfield;
+    }
+    .months-stepper button {
+      width: 24px;
+      padding: 2px 0;
+      margin: 0;
+      font-size: 11px;
+      line-height: 1.2;
+      border-radius: 6px;
+      background: #eee;
       color: #333;
     }
     #filterBtn { background: #536471; color: #fff; }
@@ -65,6 +126,24 @@
       color: #fff;
       border-color: #111;
     }
+    .fetch-mode-box {
+      margin: 0 0 8px;
+      font-size: 12px;
+      color: #444;
+    }
+    .fetch-mode-box label {
+      display: block;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+    #fetchModeSelect {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 12px;
+      background: #fff;
+    }
     #mutuals { font-size: 12px; color: #555; margin-bottom: 8px; min-height: 16px; }
     .sub-box {
       margin: 8px 0 10px;
@@ -87,16 +166,49 @@
     #checkSubBtn { background: #536471; color: #fff; }
     #upgradeBtn { background: #1d9bf0; color: #fff; }
     #exportBtn.export-locked { background: #aab8c2; }
+    .fresh-start-box {
+      margin: 0 0 10px;
+      padding: 8px 10px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      background: #fffdf8;
+      font-size: 12px;
+      line-height: 1.35;
+      color: #444;
+    }
+    .fresh-start-box label {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .fresh-start-box input { margin-top: 2px; }
+    .fresh-start-hint {
+      display: block;
+      margin: 4px 0 0 22px;
+      font-weight: 400;
+      color: #666;
+      font-size: 11px;
+    }
   </style>
 </head>
 <body>
-  <h2>X Cleaner v0.63</h2>
+  <h2>X Cleaner v0.77</h2>
   <div id="account">@—</div>
   <div class="list-toggle">
     <label><input type="radio" name="listType" id="modeFollowing" value="following" checked><span>Following</span></label>
     <label><input type="radio" name="listType" id="modeFollowers" value="followers"><span>Followers</span></label>
   </div>
-  <div id="method">Collect Following via native X responses + scroll</div>
+  <div class="fetch-mode-box">
+    <label for="fetchModeSelect">Fetch engine</label>
+    <select id="fetchModeSelect">
+      <option value="auto" selected>Auto — REST → GraphQL worker → sniffer</option>
+      <option value="rest">REST v1.1 only (200/page)</option>
+      <option value="sniffer">Sniffer only (legacy)</option>
+    </select>
+  </div>
+  <div id="method">Collect Following via REST v1.1 (auto)</div>
   <div id="progress">0 / —</div>
   <div id="mutuals"></div>
   <div class="sub-box">
@@ -106,17 +218,44 @@
       <button id="upgradeBtn" type="button">Subscribe @d2fl for unlimited</button>
     </div>
   </div>
+  <div class="fresh-start-box">
+    <label for="freshStart">
+      <input type="checkbox" id="freshStart">
+      <span>Fresh start</span>
+    </label>
+    <span class="fresh-start-hint">Clear saved list for the selected tab (Following or Followers) before collecting. Other list stays cached.</span>
+  </div>
   <button id="startBtn">Start Collection</button>
   <button id="stopBtn" style="display:none;">Stop</button>
   <fieldset class="filter-box">
     <legend>Pre-export filter</legend>
     <label><input type="checkbox" id="removeBlue"> Remove blue</label>
-    <label><input type="checkbox" id="removeNew"> Remove new (&lt; 6 months)</label>
-    <label><input type="checkbox" id="removeInactive"> Remove inactive (no tweet &gt; 6 months)</label>
+    <label class="months-filter">
+      <input type="checkbox" id="removeNew">
+      <span>Remove new (&lt;</span>
+      <span class="months-stepper">
+        <button type="button" id="newAccountMonthsDec" aria-label="Decrease months">−</button>
+        <input type="number" id="newAccountMonths" value="6" min="1" max="24" step="1" aria-label="New account months">
+        <button type="button" id="newAccountMonthsInc" aria-label="Increase months">+</button>
+      </span>
+      <span>months)</span>
+    </label>
+    <label class="months-filter">
+      <input type="checkbox" id="removeInactive">
+      <span>Remove inactive (no tweet &gt;</span>
+      <span class="months-stepper">
+        <button type="button" id="inactiveMonthsDec" aria-label="Decrease months">−</button>
+        <input type="number" id="inactiveMonths" value="6" min="1" max="24" step="1" aria-label="Inactive months">
+        <button type="button" id="inactiveMonthsInc" aria-label="Increase months">+</button>
+      </span>
+      <span>months)</span>
+    </label>
     <button id="filterBtn" type="button">Filter</button>
   </fieldset>
   <button id="exportBtn" title="Requires @d2fl subscription">Export CSV</button>
-  <div id="status">Opens your profile, then the selected list. Progress updates live on the X page.</div>
+  <div id="status">Auto: REST (200/page) → GraphQL worker → sniffer. Reload at chrome://extensions after update.</div>
+  <div id="statusLogLabel">Status log (debug — copy/paste to report issues)</div>
+  <div id="statusLog" aria-live="polite"></div>
   <div class="hint">Requires an open, logged-in x.com tab.</div>
   <script src="popup.js"></script>
 </body>

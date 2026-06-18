@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Cleaner - Export Following",
-  "version": "0.63",
+  "version": "0.77",
   "description": "Export your X (Twitter) Following list to CSV",
   "permissions": [
     "activeTab",
@@ -13,6 +13,8 @@
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
+    "https://api.x.com/*",
+    "https://api.twitter.com/*",
     "https://d2fl.com/*"
   ],
   "action": {
@@ -30,6 +32,11 @@
       "js": ["xc-fetch-sniffer.js"],
       "run_at": "document_start",
       "world": "MAIN"
+    },
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["xc-rest-bridge.js"],
+      "run_at": "document_start"
     },
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],

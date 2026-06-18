@@ -5,26 +5,95 @@ const XC_PRO_CHECKOUT_URL = 'https://x.com/d2fl/creator-subscriptions/subscribe'
 const XC_SUBSCRIPTIONS_PAGE_URL = 'https://x.com/settings/subscriptions';
 const XC_REQUIRED_CREATOR = 'd2fl';
 const XC_FREE_FETCH_LIMIT = 200;
-const XC_SUB_STATE_KEY = 'xc_subscription_state';
+const XC_SUB_STATE_KEY = 'xfr_fetch_subscription_state';
 const XC_SUB_CACHE_TTL_MS = 15 * 60 * 1000;
+const XC_SUBS_FETCH_RETRIES = 3;
+const XC_SUBS_FETCH_TIMEOUT_MS = 12000;
+const XC_SUBS_FETCH_RETRY_DELAY_MS = 1500;
+
+let xcLastSubsFetchError = null;
 
 function xcNormalizeHandle(handle) {
   return (handle || '').trim().replace(/^@+/, '').toLowerCase();
 }
 
-async function xcFetchSubsList() {
+function xcSubsFetchSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function xcGetLastSubsFetchError() {
+  return xcLastSubsFetchError;
+}
+
+async function xcFetchWithTimeout(url, options = {}, timeoutMs = XC_SUBS_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(XC_SUBS_URL, { cache: 'no-store' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    return text
-      .split(/\r?\n/)
-      .map((line) => xcNormalizeHandle(line))
-      .filter(Boolean);
-  } catch (error) {
-    console.warn('[X Cleaner] Failed to fetch subs.txt from d2fl.com:', error);
-    return null;
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+function xcParseSubsTxtBody(text) {
+  const raw = String(text || '').replace(/^\uFEFF/, '').trim();
+  if (!raw) return [];
+
+  const lowered = raw.slice(0, 256).toLowerCase();
+  if (lowered.startsWith('<!doctype') || lowered.startsWith('<html') || lowered.includes('<head')) {
+    throw new Error('Received HTML instead of subs.txt (hosting challenge or redirect)');
+  }
+
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.replace(/#.*$/, '').trim())
+    .map((line) => xcNormalizeHandle(line))
+    .filter(Boolean);
+}
+
+async function xcFetchSubsList(options = {}) {
+  const maxAttempts = options.retries ?? XC_SUBS_FETCH_RETRIES;
+  const baseDelayMs = options.retryDelayMs ?? XC_SUBS_FETCH_RETRY_DELAY_MS;
+  const timeoutMs = options.timeoutMs ?? XC_SUBS_FETCH_TIMEOUT_MS;
+  const fetchOptions = {
+    cache: 'no-store',
+    headers: {
+      Accept: 'text/plain,*/*',
+      'Accept-Language': 'en-US,en;q=0.9'
+    }
+  };
+
+  xcLastSubsFetchError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const res = await xcFetchWithTimeout(XC_SUBS_URL, fetchOptions, timeoutMs);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (contentType.includes('text/html')) {
+        throw new Error('Content-Type text/html (expected text/plain)');
+      }
+      const text = await res.text();
+      const handles = xcParseSubsTxtBody(text);
+      if (!handles.length) {
+        throw new Error('subs.txt was empty or unreadable');
+      }
+      return { handles, raw: text };
+    } catch (error) {
+      const detail = error?.name === 'AbortError'
+        ? 'timed out'
+        : (error?.message || String(error));
+      xcLastSubsFetchError = attempt < maxAttempts
+        ? `Subscription check attempt ${attempt}/${maxAttempts} failed (${detail})`
+        : `Could not reach d2fl.com subscription service after ${maxAttempts} attempts (${detail})`;
+      console.warn(`[X Cleaner] ${xcLastSubsFetchError}`);
+      if (attempt < maxAttempts) {
+        await xcSubsFetchSleep(baseDelayMs * attempt);
+      }
+    }
+  }
+
+  return null;
 }
 
 async function xcLoadSubscriptionState() {
@@ -131,6 +200,48 @@ function xcReadCachedAuthorization(cache, normalized) {
   return null;
 }
 
+function xcBuildInfoFromCachedAuth(normalized, cached, extra = {}) {
+  return xcBuildSubscriptionInfo(normalized, cached.isSubscribed, cached.source, {
+    xCreatorHandles: cached.xCreatorHandles || [],
+    xSniffOk: !!cached.xSniffOk,
+    subsTxtAuthorized: !!cached.subsTxtAuthorized || cached.source === 'subs.txt',
+    subsFetchFailed: false,
+    subsFetchError: null,
+    subsTxtMatched: cached.source === 'subs.txt' ? cached.isSubscribed : false,
+    subsTxtHandleCount: extra.subsTxtHandleCount ?? 0,
+    hydratedFromStorage: true,
+    ...extra
+  });
+}
+
+async function xcHydrateSubscriptionFromStorage(handle) {
+  const state = await xcLoadSubscriptionState();
+  const normalized = xcNormalizeHandle(handle || state.lastHandle || '');
+  if (!normalized) {
+    return xcBuildSubscriptionInfo('', false, null, { hydratedFromStorage: true });
+  }
+
+  const cache = state.subscriptionCache;
+  const cached = xcReadCachedAuthorization(cache, normalized);
+  if (cached) {
+    return xcBuildInfoFromCachedAuth(normalized, cached, {
+      subsTxtHandleCount: cache?.subsTxtHandles?.length ?? 0
+    });
+  }
+
+  if (state.lastHandle === normalized) {
+    return xcBuildSubscriptionInfo(normalized, !!state.isSubscribed, state.subscriptionSource, {
+      xCreatorHandles: cache?.xCreatorHandles || [],
+      xSniffOk: !!cache?.xSniffOk,
+      subsTxtAuthorized: state.subscriptionSource === 'subs.txt',
+      subsTxtHandleCount: cache?.subsTxtHandles?.length ?? 0,
+      hydratedFromStorage: true
+    });
+  }
+
+  return xcBuildSubscriptionInfo(normalized, false, null, { hydratedFromStorage: true });
+}
+
 async function xcCheckSubscription(handle, options = {}) {
   const normalized = xcNormalizeHandle(handle);
   const forceCheck = !!options.forceCheck;
@@ -147,22 +258,25 @@ async function xcCheckSubscription(handle, options = {}) {
   }
 
   const cache = state.subscriptionCache;
-  if (!forceCheck) {
-    const cached = xcReadCachedAuthorization(cache, normalized);
-    if (cached) {
-      state.isSubscribed = cached.isSubscribed;
-      state.subscriptionSource = cached.source;
-      state.lastHandle = normalized;
-      await xcSaveSubscriptionState(state);
-      return xcBuildSubscriptionInfo(normalized, cached.isSubscribed, cached.source, {
-        xCreatorHandles: cached.xCreatorHandles,
-        xSniffOk: cached.xSniffOk,
-        subsTxtAuthorized: cached.subsTxtAuthorized
-      });
-    }
+  const cached = !forceCheck ? xcReadCachedAuthorization(cache, normalized) : null;
+  const cacheFresh = !!cached;
+
+  // Passive checks: return fresh cache immediately so UI is not blocked on subs.txt.
+  if (cacheFresh && !forceCheck) {
+    return xcBuildInfoFromCachedAuth(normalized, cached, {
+      subsTxtHandleCount: cache?.subsTxtHandles?.length ?? 0
+    });
   }
 
-  const subsTxtHandles = await xcFetchSubsList();
+  const subsFetchOpts = forceCheck
+    ? { retries: XC_SUBS_FETCH_RETRIES, timeoutMs: XC_SUBS_FETCH_TIMEOUT_MS }
+    : { retries: 1, timeoutMs: 6000 };
+  const subsTxtResult = await xcFetchSubsList(subsFetchOpts);
+  const subsTxtHandles = subsTxtResult?.handles || null;
+  const subsFetchFailed = subsTxtResult === null;
+  const subsFetchError = subsFetchFailed ? xcLastSubsFetchError : null;
+  const subsTxtMatched = !subsFetchFailed && subsTxtHandles.includes(normalized);
+
   let resolved = xcResolveAuthorization(normalized, [], false, subsTxtHandles);
   if (resolved.isSubscribed) {
     state.isSubscribed = true;
@@ -181,14 +295,18 @@ async function xcCheckSubscription(handle, options = {}) {
     return xcBuildSubscriptionInfo(normalized, true, resolved.source, {
       xCreatorHandles: [],
       xSniffOk: false,
-      subsTxtAuthorized: true
+      subsTxtAuthorized: true,
+      subsFetchFailed,
+      subsFetchError,
+      subsTxtMatched,
+      subsTxtHandleCount: subsTxtHandles?.length ?? 0
     });
   }
 
-  let xCreatorHandles = [];
-  let xSniffOk = false;
+  let xCreatorHandles = cached?.xCreatorHandles || [];
+  let xSniffOk = !!cached?.xSniffOk;
 
-  if (typeof sniff === 'function') {
+  if (!cacheFresh && typeof sniff === 'function') {
     try {
       const sniffResult = await sniff();
       if (sniffResult?.ok) {
@@ -205,7 +323,32 @@ async function xcCheckSubscription(handle, options = {}) {
   if (subsTxtHandles === null && !resolved.isSubscribed && state.lastHandle === normalized) {
     return xcBuildSubscriptionInfo(normalized, !!state.isSubscribed, state.subscriptionSource, {
       xCreatorHandles,
-      xSniffOk
+      xSniffOk,
+      subsFetchFailed: true,
+      subsFetchError,
+      subsTxtMatched: false,
+      subsTxtHandleCount: 0
+    });
+  }
+
+  // Keep prior authorization when a passive re-check cannot re-prove access (wrong tab, sniff miss).
+  if (
+    !resolved.isSubscribed
+    && state.isSubscribed
+    && state.lastHandle === normalized
+    && (
+      (state.subscriptionSource === 'x-creator' && (!xSniffOk || !xCreatorHandles.length))
+      || (state.subscriptionSource === 'subs.txt' && subsFetchFailed)
+    )
+  ) {
+    return xcBuildSubscriptionInfo(normalized, true, state.subscriptionSource, {
+      xCreatorHandles: state.subscriptionCache?.xCreatorHandles || xCreatorHandles,
+      xSniffOk: state.subscriptionCache?.xSniffOk || xSniffOk,
+      subsTxtAuthorized: state.subscriptionSource === 'subs.txt',
+      subsFetchFailed,
+      subsFetchError,
+      subsTxtMatched: state.subscriptionSource === 'subs.txt' ? true : subsTxtMatched,
+      subsTxtHandleCount: subsTxtHandles?.length ?? state.subscriptionCache?.subsTxtHandles?.length ?? 0
     });
   }
 
@@ -223,11 +366,23 @@ async function xcCheckSubscription(handle, options = {}) {
   };
   await xcSaveSubscriptionState(state);
 
-  return xcBuildSubscriptionInfo(normalized, resolved.isSubscribed, resolved.source, {
+  const info = xcBuildSubscriptionInfo(normalized, resolved.isSubscribed, resolved.source, {
     xCreatorHandles: resolved.xCreatorHandles,
     xSniffOk: resolved.xSniffOk,
-    subsTxtAuthorized: resolved.source === 'subs.txt'
+    subsTxtAuthorized: resolved.source === 'subs.txt',
+    subsFetchFailed,
+    subsFetchError,
+    subsTxtMatched,
+    subsTxtHandleCount: subsTxtHandles?.length ?? 0
   });
+
+  if (!resolved.isSubscribed && !subsFetchFailed) {
+    console.log(
+      `[X Cleaner] subs.txt loaded (${subsTxtHandles.length} handles); @${normalized} ${subsTxtMatched ? 'authorized' : 'not in list'}`
+    );
+  }
+
+  return info;
 }
 
 function xcFormatSubscriptionStatus(info, handle) {
