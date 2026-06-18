@@ -1,0 +1,14 @@
+# Chrome extension signing keys (local only — do not commit)
+keys/*
+!keys/README.md
+*.pem
+
+# Packaged builds
+*.crx
+*.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~

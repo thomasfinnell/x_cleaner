@@ -4480,7 +4480,7 @@ async function bootstrapSubscription() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('X Cleaner v0.77 installed (REST tab-context + PlugMonkey-style session)');
+  console.log('X Cleaner v0.80 installed (REST tab-context + PlugMonkey-style session)');
   bootstrapSubscription().catch(() => {});
 });
 
