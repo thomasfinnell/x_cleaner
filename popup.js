@@ -101,8 +101,8 @@ function formatSubscriptionStatus(state) {
   if (state.subscriptionStatus) return state.subscriptionStatus;
   const handle = state.username ? `@${state.username}` : '(not detected)';
   if (state.isSubscribed) {
-    if (state.subscriptionSource === 'subs.txt') {
-      return `Beta access — unlimited fetch & export (${handle})`;
+    if (state.subscriptionSource === 'owner') {
+      return `Owner account — unlimited fetch & export (${handle})`;
     }
     if (state.subscriptionSource === 'x-creator') {
       return `Subscribed to @d2fl on X — unlimited fetch & export (${handle})`;
@@ -114,11 +114,11 @@ function formatSubscriptionStatus(state) {
 
 function renderSubscription(state) {
   let text = formatSubscriptionStatus(state);
-  if (state.subsFetchError) {
-    text += ` — ⚠ ${state.subsFetchError}`;
+  if (state.sniffFailed && state.sniffError) {
+    text += ` — ⚠ ${state.sniffError}`;
   }
   subStatusEl.textContent = text;
-  subStatusEl.style.color = state.subsFetchError ? '#b8860b' : '';
+  subStatusEl.style.color = state.sniffFailed && state.sniffError ? '#b8860b' : '';
   const showSubscribe = !state.isSubscribed;
   upgradeBtn.style.display = showSubscribe ? 'block' : 'none';
   checkSubBtn.disabled = !!state.isScraping;

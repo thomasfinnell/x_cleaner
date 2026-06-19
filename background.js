@@ -213,9 +213,7 @@ async function refreshSubscription(handle, forceCheck = false) {
     const normalized = xcNormalizeHandle(resolvedHandle);
     const cached = xcReadCachedAuthorization(state.subscriptionCache, normalized);
     if (cached) {
-      subscriptionInfo = xcBuildInfoFromCachedAuth(normalized, cached, {
-        subsTxtHandleCount: state.subscriptionCache?.subsTxtHandles?.length ?? 0
-      });
+      subscriptionInfo = xcBuildInfoFromCachedAuth(normalized, cached);
       return subscriptionInfo;
     }
   }
@@ -252,8 +250,8 @@ async function refreshSubscription(handle, forceCheck = false) {
     }
     subscriptionInfo = {
       ...subscriptionInfo,
-      subsFetchFailed: true,
-      subsFetchError: `Subscription check timed out after ${Math.round(timeoutMs / 1000)}s`
+      sniffFailed: true,
+      sniffError: `Subscription check timed out after ${Math.round(timeoutMs / 1000)}s — using cached status`
     };
   }
 
@@ -1197,6 +1195,10 @@ function refreshMutualFlagsFromOtherList(type) {
 
 function excludeMutuals(users, type, ctx) {
   return users.filter((user) => !isMutualAccount(user, type, ctx));
+}
+
+function isYouFollowingAccount(user, ctx) {
+  return isMutualAccount(user, 'followers', ctx);
 }
 
 function fullListForType(type = listType) {
@@ -4206,11 +4208,34 @@ async function filterList(options = {}) {
         status: 'Bot check applies to Followers — skipped on Following.'
       });
     } else {
+      await ensureRestored();
+      const mutualCtx = buildMutualFilterContext('followers');
+      const followingCfg = listCfg('following');
+
+      if (!mutualDetectionAvailable('followers', mutualCtx)) {
+        return {
+          ok: false,
+          error: 'Bot check needs you_follow on follower rows (included in a REST Followers fetch) or a Following list to cross-check. Re-fetch Followers if relationship flags are missing.'
+        };
+      }
+
+      const mutualRefresh = refreshMutualFlagsFromOtherList('followers');
+      if (mutualRefresh.upgraded > 0) {
+        appendDebugStatusLog({
+          status: `Bot check: filled you_follow from ${followingCfg.label.toLowerCase()} on ${mutualRefresh.upgraded.toLocaleString()} accounts`,
+          method: jobState.method || 'filter',
+          reason: 'filtering'
+        });
+      }
+
+      const youFollowSkipped = working.filter((user) => isYouFollowingAccount(user, mutualCtx)).length;
+      let candidates = working.filter((user) => !isYouFollowingAccount(user, mutualCtx));
+
       if (!(await ensureJobTabId())) {
         return { ok: false, error: 'No X tab available for bot-check profile enrichment.' };
       }
 
-      const sparseCount = working.filter((user) => !hasReliableProfileForBotCheck(user)).length;
+      const sparseCount = candidates.filter((user) => !hasReliableProfileForBotCheck(user)).length;
       let enrichCancelled = false;
 
       if (sparseCount > 0) {
@@ -4232,7 +4257,7 @@ async function filterList(options = {}) {
           const enrichResult = await ensureReliableProfilesForBotCheck(
             jobTabId,
             type,
-            working,
+            candidates,
             (progress) => {
               const status = progress.waiting
                 ? `Waiting… enriched ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()} sparse profiles`
@@ -4246,7 +4271,7 @@ async function filterList(options = {}) {
               });
             }
           );
-          working = enrichResult.users;
+          candidates = enrichResult.users;
           const { stats } = enrichResult;
           if (stats.snifferMerged > 0 || stats.lookupUpgraded > 0) {
             appendDebugStatusLog({
@@ -4262,25 +4287,32 @@ async function filterList(options = {}) {
         }
 
         if (enrichCancelled) {
+          working = candidates;
           setCurList(working, type);
           return finishStoppedJob();
         }
       }
 
-      const beforeBots = working.length;
-      working = working.filter((user) => isPotentialBot(user));
+      const beforeBots = candidates.length;
+      working = candidates.filter((user) => isPotentialBot(user));
       setCurList(working, type);
       const nonBotRemoved = beforeBots - working.length;
       if (nonBotRemoved > 0) {
         parts.push(`non-bot (${nonBotRemoved.toLocaleString()})`);
       }
+      if (youFollowSkipped > 0) {
+        parts.push(`you-follow skipped (${youFollowSkipped.toLocaleString()})`);
+      }
       jobState.filterRemoved = curRaw(type).length - working.length;
       jobState.filterPhase = 'bot';
+      const youFollowHint = youFollowSkipped > 0
+        ? `, −${youFollowSkipped.toLocaleString()} you-follow`
+        : '';
       notifyProgress({
         reason: 'filtering',
         filterPhase: 'bot',
         isEnriching: false,
-        status: `Bot check: ${working.length.toLocaleString()} potential bots kept (−${nonBotRemoved.toLocaleString()} non-bot)`
+        status: `Bot check: ${working.length.toLocaleString()} potential bots kept (−${nonBotRemoved.toLocaleString()} non-bot${youFollowHint})`
       });
       if (!working.length) return finishEmptyFilter(type);
     }
@@ -5560,7 +5592,7 @@ async function bootstrapSubscription() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('X Cleaner v0.81 installed (REST tab-context + PlugMonkey-style session)');
+  console.log('X Cleaner v0.85 installed (REST tab-context session)');
   bootstrapSubscription().catch(() => {});
 });
 

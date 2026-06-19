@@ -25,7 +25,7 @@ foreach ($f in $required) {
 
 # Manifest JSON
 $manifest = Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
-Assert 'manifest version 0.63' ($manifest.version -eq '0.63')
+Assert 'manifest version 0.85' ($manifest.version -eq '0.85')
 Assert 'background service worker' ($manifest.background.service_worker -eq 'background.js')
 
 # Action wiring (popup/background/content agree)
@@ -61,8 +61,8 @@ Assert 'mutual count alice/bob/carol' ($mutuals.Count -eq 2 -and $mutuals -conta
 
 $sub = Get-Content (Join-Path $root 'subscription.js') -Raw
 Assert 'subscription.js exists' (Test-Path (Join-Path $root 'subscription.js'))
-Assert 'subs.txt url' ($sub -match 'd2fl\.com/subs\.txt')
 Assert 'required creator d2fl' ($sub -match 'XC_REQUIRED_CREATOR')
+Assert 'pro owner handles' ($sub -match 'XC_PRO_OWNER_HANDLES')
 Assert 'sniffer captures UserCreatorSubscriptions' ((Get-Content (Join-Path $root 'xc-fetch-sniffer.js') -Raw) -match 'UserCreatorSubscriptions')
 Assert 'readCreatorSubscriptionsCapture helper' ($api -match 'readCreatorSubscriptionsCapture')
 Assert 'free fetch limit 200' ($sub -match 'XC_FREE_FETCH_LIMIT = 200')
@@ -72,7 +72,6 @@ Assert 'background openSubscribe action' ($bg -match "case 'openSubscribe'")
 Assert 'HUD subscribe button' ($content -match 'xcleaner-subscribe')
 Assert 'HUD refresh subscription button' ($content -match 'xcleaner-sub-refresh')
 Assert 'export gated in background' ($bg -match 'subscriptionInfo\.canExport')
-Assert 'manifest allows d2fl.com' ((Get-Content (Join-Path $root 'manifest.json') -Raw) -match 'd2fl\.com')
 
 Write-Host ""
 Write-Host "Results: $passed passed, $failed failed"

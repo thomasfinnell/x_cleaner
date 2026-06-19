@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Cleaner - Export Following",
-  "version": "0.82",
+  "version": "0.85",
   "description": "Export your X (Twitter) Following list to CSV",
   "permissions": [
     "activeTab",
@@ -14,8 +14,7 @@
     "https://x.com/*",
     "https://twitter.com/*",
     "https://api.x.com/*",
-    "https://api.twitter.com/*",
-    "https://d2fl.com/*"
+    "https://api.twitter.com/*"
   ],
   "action": {
     "default_popup": "popup.html",

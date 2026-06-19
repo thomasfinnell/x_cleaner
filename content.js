@@ -378,7 +378,7 @@ function ensureHud() {
         </span>
         <span>months</span>
       </label>
-      <label title="Followers only: keep potential bots (&lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits)">
+      <label title="Followers only: keep potential bots you do not follow. Skips accounts you follow (you_follow from Followers REST, or Following list if fetched). Signals: &lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits.">
         <input type="checkbox" id="xcleaner-bot-check"> Bot check
       </label>
       <button class="xc-filter-btn" id="xcleaner-filter" type="button">Filter</button>
@@ -514,8 +514,8 @@ function formatHudSubscriptionStatus(state) {
   const handle = state.username ? `@${state.username}` : '(not detected)';
   const freeLimit = state.freeFetchLimit || 200;
   if (state.isSubscribed) {
-    if (state.subscriptionSource === 'subs.txt') {
-      return `Beta access — unlimited fetch & export (${handle})`;
+    if (state.subscriptionSource === 'owner') {
+      return `Owner account — unlimited fetch & export (${handle})`;
     }
     if (state.subscriptionSource === 'x-creator') {
       return `Subscribed to @d2fl on X — unlimited fetch & export (${handle})`;
@@ -638,7 +638,12 @@ function updateHud(state = {}) {
   const filterBusy = !!state.isEnriching || state.reason === 'filtering';
   const canExport = !!state.canExport;
 
-  subStatusEl.textContent = formatHudSubscriptionStatus(state);
+  let subText = formatHudSubscriptionStatus(state);
+  if (state.sniffFailed && state.sniffError) {
+    subText += ` — ⚠ ${state.sniffError}`;
+  }
+  subStatusEl.textContent = subText;
+  subStatusEl.style.color = state.sniffFailed && state.sniffError ? '#ffd400' : '';
   subSubscribeBtn.style.display = state.isSubscribed ? 'none' : 'block';
   subRefreshBtn.disabled = busy;
   subSubscribeBtn.disabled = busy;
