@@ -40,6 +40,7 @@ const listStore = {
 const DEFAULT_INACTIVE_MONTHS = 6;
 const BOT_CHECK_TWEET_MAX = 10;
 const BOT_CHECK_ACCOUNT_MAX_DAYS = 30;
+const BOT_CHECK_USERNAME_TRAILING_DIGITS = 4;
 const MIN_FILTER_MONTHS = 1;
 const MAX_FILTER_MONTHS = 24;
 const ENRICH_BATCH_SIZE = XC_REST_LOOKUP_BATCH_SIZE;
@@ -49,6 +50,8 @@ const SNIFFER_ENRICH_SCROLL = 1100;
 const SNIFFER_ENRICH_DELAY_MS = 450;
 const XC_ACTIVITY_CACHE_KEY = 'xc_activity_cache';
 const XC_ACTIVITY_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const XC_ENRICH_ARCHIVE_KEY = 'xc_enrich_archive';
+const XC_ENRICH_ARCHIVE_VERSION = 1;
 const XC_LIST_TYPE_PREF_KEY = 'xc_list_type_pref';
 const XC_FETCH_MODE_PREF_KEY = 'xc_fetch_mode_pref';
 const XC_FETCH_MODES = ['auto', 'rest', 'sniffer'];
@@ -64,7 +67,7 @@ const XC_PRE_LIST_FETCH_SETTLE_MS = 1500;
 const XC_POST_SNIFFER_SETTLE_MS = 800;
 
 // Set false to hide the scrollable status log in the HUD/popup.
-const XC_DEBUG_STATUS_LOG = true;
+const XC_DEBUG_STATUS_LOG = false;
 const XC_DEBUG_STATUS_LOG_MAX_LINES = 50;
 const XC_DEBUG_STATUS_LOG_STORAGE_KEY = 'xc_debug_status_log';
 
@@ -74,6 +77,9 @@ const restoredTypes = { following: false, followers: false };
 let restorePromise = null;
 const persistDebounceTimers = { following: null, followers: null };
 const lastPersistedCounts = { following: 0, followers: 0 };
+let enrichArchiveStore = null;
+let enrichArchiveSaveTimer = null;
+const freshStartBackupTypes = new Set();
 
 function listCfg(type = listType) {
   return LIST_CONFIG[type] || LIST_CONFIG.following;
@@ -271,18 +277,11 @@ function normalizeFetchMode(mode) {
 }
 
 async function getFetchMode() {
-  try {
-    const stored = await chrome.storage.local.get(XC_FETCH_MODE_PREF_KEY);
-    return normalizeFetchMode(stored[XC_FETCH_MODE_PREF_KEY]);
-  } catch (error) {
-    return XC_FETCH_MODE_DEFAULT;
-  }
+  return XC_FETCH_MODE_DEFAULT;
 }
 
-async function setFetchMode(mode) {
-  const normalized = normalizeFetchMode(mode);
-  await chrome.storage.local.set({ [XC_FETCH_MODE_PREF_KEY]: normalized });
-  return normalized;
+async function setFetchMode(_mode) {
+  return XC_FETCH_MODE_DEFAULT;
 }
 
 function fetchModeLabel(mode) {
@@ -304,8 +303,40 @@ function subscriptionPayload() {
   };
 }
 
+const LIST_TYPE_IDLE_REASONS = new Set([
+  'filtered',
+  'complete',
+  'stopped',
+  'exported',
+  'error',
+  'end-of-list',
+  'filtering',
+  'enriching'
+]);
+
+function isListTypeSwitchLocked(state = jobState) {
+  if (activeFetch?.running) return true;
+  if (!state.isScraping) return false;
+  return !LIST_TYPE_IDLE_REASONS.has(state.reason);
+}
+
+function normalizeClientState(state) {
+  const next = { ...state };
+  const enriching = !!(activeEnrich?.running || next.isEnriching);
+  const collecting = !!activeFetch?.running;
+
+  if (!collecting && LIST_TYPE_IDLE_REASONS.has(next.reason)) {
+    next.isScraping = false;
+  }
+  if (!enriching && (next.reason === 'filtered' || next.reason === 'complete' || next.reason === 'stopped')) {
+    next.isEnriching = false;
+  }
+  next.listTypeLocked = isListTypeSwitchLocked(next);
+  return next;
+}
+
 function buildHudState(extra = {}) {
-  return {
+  return normalizeClientState({
     ...jobState,
     listType,
     count: curList().length,
@@ -320,7 +351,7 @@ function buildHudState(extra = {}) {
     ...subscriptionPayload(),
     ...debugStatusPayload(),
     ...extra
-  };
+  });
 }
 
 function sleep(ms) {
@@ -394,7 +425,250 @@ function mergeUserFields(existing, incoming) {
   if (incoming.display_name && !existing.display_name) {
     existing.display_name = incoming.display_name;
   }
+  if (incoming.last_active_ms != null && existing.last_active_ms == null) {
+    existing.last_active_ms = incoming.last_active_ms;
+  }
   return existing;
+}
+
+function normalizeArchiveOwner(username) {
+  return String(username || '').toLowerCase().replace(/^@+/, '');
+}
+
+function pickEnrichableFields(user) {
+  if (!user?.username) return null;
+
+  const fields = { username: user.username };
+  let hasData = false;
+
+  if (user.last_active_ms != null) {
+    fields.last_active_ms = user.last_active_ms;
+    hasData = true;
+  }
+  const bio = accountBio(user);
+  if (bio) {
+    fields.bio = bio;
+    hasData = true;
+  }
+  if (user.is_blue) {
+    fields.is_blue = true;
+    hasData = true;
+  }
+  if (user.tweet_count != null && user.tweet_count !== '') {
+    fields.tweet_count = user.tweet_count;
+    hasData = true;
+  }
+  if (user.created_at) {
+    fields.created_at = user.created_at;
+    hasData = true;
+  }
+  if (user.default_avatar) {
+    fields.default_avatar = true;
+    hasData = true;
+  }
+  if (user.followers_count != null && user.followers_count !== '') {
+    fields.followers_count = user.followers_count;
+    hasData = true;
+  }
+  if (user.friends_count != null && user.friends_count !== '') {
+    fields.friends_count = user.friends_count;
+    hasData = true;
+  }
+  if (user.display_name) {
+    fields.display_name = user.display_name;
+    hasData = true;
+  }
+  if (user.you_follow != null) {
+    fields.you_follow = user.you_follow;
+    hasData = true;
+  }
+  if (user.follows_you != null) {
+    fields.follows_you = user.follows_you;
+    hasData = true;
+  }
+
+  return hasData ? fields : null;
+}
+
+async function ensureEnrichArchiveLoaded() {
+  if (enrichArchiveStore) return enrichArchiveStore;
+
+  try {
+    const res = await chrome.storage.local.get(XC_ENRICH_ARCHIVE_KEY);
+    enrichArchiveStore = res[XC_ENRICH_ARCHIVE_KEY] || { version: XC_ENRICH_ARCHIVE_VERSION, accounts: {} };
+    if (!enrichArchiveStore.accounts) enrichArchiveStore.accounts = {};
+  } catch (error) {
+    enrichArchiveStore = { version: XC_ENRICH_ARCHIVE_VERSION, accounts: {} };
+  }
+
+  return enrichArchiveStore;
+}
+
+function scheduleEnrichArchiveSave(force = false) {
+  if (force) {
+    clearTimeout(enrichArchiveSaveTimer);
+    enrichArchiveSaveTimer = null;
+    if (!enrichArchiveStore) return;
+    chrome.storage.local.set({ [XC_ENRICH_ARCHIVE_KEY]: enrichArchiveStore }).catch(() => {});
+    return;
+  }
+
+  clearTimeout(enrichArchiveSaveTimer);
+  enrichArchiveSaveTimer = setTimeout(() => {
+    enrichArchiveSaveTimer = null;
+    if (!enrichArchiveStore) return;
+    chrome.storage.local.set({ [XC_ENRICH_ARCHIVE_KEY]: enrichArchiveStore }).catch(() => {});
+  }, 500);
+}
+
+function getArchivedEnrichment(type, handle) {
+  if (!enrichArchiveStore || !jobState.username || !handle) return null;
+
+  const owner = normalizeArchiveOwner(jobState.username);
+  const key = String(handle).toLowerCase();
+  return enrichArchiveStore.accounts[owner]?.[type]?.[key] || null;
+}
+
+function rememberEnrichment(type, user) {
+  if (!enrichArchiveStore || !jobState.username || !user?.username) return;
+
+  const picked = pickEnrichableFields(user);
+  if (!picked) return;
+
+  const owner = normalizeArchiveOwner(jobState.username);
+  if (!enrichArchiveStore.accounts[owner]) {
+    enrichArchiveStore.accounts[owner] = { following: {}, followers: {} };
+  }
+  if (!enrichArchiveStore.accounts[owner][type]) {
+    enrichArchiveStore.accounts[owner][type] = {};
+  }
+
+  const bucket = enrichArchiveStore.accounts[owner][type];
+  const key = String(user.username).toLowerCase();
+  if (!bucket[key]) {
+    bucket[key] = { username: user.username };
+  }
+  mergeUserFields(bucket[key], picked);
+  scheduleEnrichArchiveSave();
+}
+
+function releaseEnrichArchiveEntry(type, handle) {
+  if (!enrichArchiveStore || !jobState.username || !handle) return false;
+
+  const owner = normalizeArchiveOwner(jobState.username);
+  const key = String(handle).toLowerCase();
+  const bucket = enrichArchiveStore.accounts[owner]?.[type];
+  if (!bucket?.[key]) return false;
+
+  delete bucket[key];
+  scheduleEnrichArchiveSave();
+  return true;
+}
+
+function consumeArchivedEnrichmentForUser(user, type = listType) {
+  if (!freshStartBackupTypes.has(type) || !user?.username) return false;
+
+  const archived = getArchivedEnrichment(type, user.username);
+  if (!archived) return false;
+
+  const before = pickEnrichableFields(user);
+  mergeUserFields(user, archived);
+  releaseEnrichArchiveEntry(type, user.username);
+
+  const after = pickEnrichableFields(user);
+  return JSON.stringify(before) !== JSON.stringify(after);
+}
+
+function hydrateUserFromStoredEnrichment(user, type = listType) {
+  return consumeArchivedEnrichmentForUser(user, type);
+}
+
+function syncListEnrichmentToRaw(type = listType) {
+  for (const row of curList(type)) {
+    const rawRow = findRawUserByHandle(type, row.username);
+    if (rawRow) mergeUserFields(rawRow, row);
+  }
+}
+
+function hydrateListFromStoredEnrichment(type = listType) {
+  if (!freshStartBackupTypes.has(type) || !enrichArchiveStore || !jobState.username) return 0;
+
+  let merged = 0;
+  const seen = new Set();
+
+  for (const user of curList(type)) {
+    const key = (user.username || '').toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    if (consumeArchivedEnrichmentForUser(user, type)) merged += 1;
+  }
+
+  for (const user of curRaw(type)) {
+    const key = (user.username || '').toLowerCase();
+    if (!key || seen.has(key)) continue;
+    if (consumeArchivedEnrichmentForUser(user, type)) merged += 1;
+    seen.add(key);
+  }
+
+  syncListEnrichmentToRaw(type);
+  return merged;
+}
+
+function finalizeFreshStartBackup(type = listType) {
+  if (!freshStartBackupTypes.has(type)) return 0;
+
+  const owner = normalizeArchiveOwner(jobState.username);
+  const bucket = enrichArchiveStore?.accounts?.[owner]?.[type];
+  const remaining = bucket ? Object.keys(bucket).length : 0;
+
+  if (bucket) {
+    enrichArchiveStore.accounts[owner][type] = {};
+  }
+  freshStartBackupTypes.delete(type);
+  scheduleEnrichArchiveSave(true);
+  return remaining;
+}
+
+function applyArchivedEnrichmentToList(type) {
+  return hydrateListFromStoredEnrichment(type);
+}
+
+async function archiveListEnrichment(type = listType) {
+  await ensureEnrichArchiveLoaded();
+
+  const rows = curRaw(type).length ? curRaw(type) : curList(type);
+  for (const row of rows) {
+    rememberEnrichment(type, row);
+  }
+
+  const cache = await loadActivityCache();
+  const now = Date.now();
+  for (const row of rows) {
+    const key = (row.username || '').toLowerCase();
+    const entry = cache[key];
+    if (entry?.last_active_ms && now - (entry.fetched_at || 0) < XC_ACTIVITY_CACHE_TTL_MS) {
+      rememberEnrichment(type, { username: row.username, last_active_ms: entry.last_active_ms });
+    }
+  }
+
+  scheduleEnrichArchiveSave(true);
+  freshStartBackupTypes.add(type);
+}
+
+async function purgeEnrichArchiveForOtherUsers(activeUsername) {
+  await ensureEnrichArchiveLoaded();
+  const active = normalizeArchiveOwner(activeUsername);
+  if (!active || !enrichArchiveStore?.accounts) return;
+
+  let changed = false;
+  for (const owner of Object.keys(enrichArchiveStore.accounts)) {
+    if (owner !== active) {
+      delete enrichArchiveStore.accounts[owner];
+      changed = true;
+    }
+  }
+
+  if (changed) scheduleEnrichArchiveSave(true);
 }
 
 function findListUserByHandle(type, username) {
@@ -453,8 +727,23 @@ function syncWorkingFromRaw(working, type) {
   for (const user of working) {
     const rawRow = findRawUserByHandle(type, user.username);
     if (rawRow) mergeUserFields(user, rawRow);
+    consumeArchivedEnrichmentForUser(user, type);
   }
   return working;
+}
+
+function syncLastActiveIntoRaw(working, type = listType) {
+  let upgraded = 0;
+  for (const user of working) {
+    if (user.last_active_ms == null) continue;
+    const rawRow = findRawUserByHandle(type, user.username);
+    if (!rawRow) continue;
+    if (rawRow.last_active_ms !== user.last_active_ms) {
+      rawRow.last_active_ms = user.last_active_ms;
+      upgraded += 1;
+    }
+  }
+  return upgraded;
 }
 
 async function enrichSparseProfilesViaLookup(tabId, users, type, onProgress) {
@@ -591,10 +880,13 @@ function addNativeUsers(nativeBatch, seen, ownerUsername, type = listType) {
     if (seen.has(key)) {
       const existing = curList(type).find((row) => (row.username || '').toLowerCase() === key);
       mergeUserFields(existing, user);
+      consumeArchivedEnrichmentForUser(existing, type);
       continue;
     }
     seen.add(key);
-    curList(type).push(user);
+    const row = { ...user };
+    consumeArchivedEnrichmentForUser(row, type);
+    curList(type).push(row);
     added++;
   }
 
@@ -816,12 +1108,20 @@ function isYoungAccount(createdAt, days = BOT_CHECK_ACCOUNT_MAX_DAYS) {
   return ts > cutoff;
 }
 
+function hasTrailingDigitUsername(user, minTrailingDigits = BOT_CHECK_USERNAME_TRAILING_DIGITS) {
+  const handle = String(user?.username || '').replace(/^@+/, '').trim();
+  if (!handle) return false;
+  const trailingDigits = handle.match(/\d+$/);
+  return !!(trailingDigits && trailingDigits[0].length > minTrailingDigits);
+}
+
 function isPotentialBot(user) {
   if (!user) return false;
   if (user.default_avatar) return true;
   if (hasNoBio(user)) return true;
   if (isLowTweetAccount(user)) return true;
   if (isYoungAccount(user.created_at)) return true;
+  if (hasTrailingDigitUsername(user)) return true;
   return false;
 }
 
@@ -917,6 +1217,49 @@ async function saveActivityCache(cache) {
   await chrome.storage.local.set({ [XC_ACTIVITY_CACHE_KEY]: cache });
 }
 
+function hasStoredLastActive(user, type = listType, cache = {}, now = Date.now()) {
+  if (user.last_active_ms != null) return true;
+  const key = (user.username || '').toLowerCase();
+  if (!key) return false;
+  if (freshStartBackupTypes.has(type)) {
+    const archived = getArchivedEnrichment(type, key);
+    if (archived?.last_active_ms != null) return true;
+  }
+  const entry = cache[key];
+  return !!(entry?.last_active_ms && now - (entry.fetched_at || 0) < XC_ACTIVITY_CACHE_TTL_MS);
+}
+
+function hydrateLastActiveFromStoredSources(user, type = listType, cache = {}, now = Date.now()) {
+  if (user.last_active_ms != null) return true;
+  const key = (user.username || '').toLowerCase();
+  if (!key) return false;
+
+  if (freshStartBackupTypes.has(type)) {
+    const archived = getArchivedEnrichment(type, key);
+    if (archived?.last_active_ms != null) {
+      user.last_active_ms = archived.last_active_ms;
+      return true;
+    }
+  }
+
+  const entry = cache[key];
+  if (entry?.last_active_ms && now - (entry.fetched_at || 0) < XC_ACTIVITY_CACHE_TTL_MS) {
+    user.last_active_ms = entry.last_active_ms;
+    return true;
+  }
+
+  return false;
+}
+
+function countLastActiveLookupNeeded(users, cache, now = Date.now(), type = listType) {
+  let needed = 0;
+  for (const user of users) {
+    if (hasStoredLastActive(user, type, cache, now)) continue;
+    needed += 1;
+  }
+  return needed;
+}
+
 async function enrichLastActiveForUsers(tabId, users, onProgress) {
   const cache = await loadActivityCache();
   const now = Date.now();
@@ -924,20 +1267,15 @@ async function enrichLastActiveForUsers(tabId, users, onProgress) {
 
   const needsLookup = [];
   for (const user of enriched) {
-    const key = (user.username || '').toLowerCase();
-    const entry = cache[key];
-    if (entry?.last_active_ms && now - (entry.fetched_at || 0) < XC_ACTIVITY_CACHE_TTL_MS) {
-      user.last_active_ms = entry.last_active_ms;
-      continue;
-    }
+    if (hydrateLastActiveFromStoredSources(user, listType, cache, now)) continue;
     needsLookup.push(user);
   }
 
   let processed = enriched.length - needsLookup.length;
   const total = enriched.length;
-  if (onProgress) onProgress({ processed, total });
+  if (onProgress) onProgress({ processed, total, fromCache: needsLookup.length === 0 });
 
-  if (tabId) {
+  if (tabId && needsLookup.length > 0) {
     await xcRestPrepareSession(tabId);
   }
 
@@ -1037,9 +1375,11 @@ async function refreshBlueFlagsFromSniffer(type) {
 }
 
 function snapshotListRaw(type = listType) {
+  hydrateListFromStoredEnrichment(type);
   setCurRaw(curList(type).slice(), type);
   jobState.rawCount = curRaw(type).length;
   schedulePersist(true, type);
+  finalizeFreshStartBackup(type);
 }
 
 function serializeJobStateForPersist(type = listType) {
@@ -1134,6 +1474,8 @@ async function purgePersistForOtherUsers(activeUsername) {
   const activeUser = (activeUsername || '').toLowerCase().replace(/^@+/, '');
   if (!activeUser) return;
 
+  await purgeEnrichArchiveForOtherUsers(activeUser);
+
   for (const type of LIST_TYPES) {
     const cfg = listCfg(type);
     const res = await chrome.storage.local.get(cfg.persistKey);
@@ -1218,7 +1560,6 @@ async function restoreListState(type, options = {}) {
     const fullList = raw.slice();
     setCurRaw(fullList, type);
     setCurList(fullList, type);
-
     if (type === listType) {
       jobState = {
         ...jobState,
@@ -1280,9 +1621,17 @@ async function setListType(nextType) {
     return { ok: false, error: 'Invalid list type.' };
   }
 
+  if (isListTypeSwitchLocked()) {
+    return { ok: false, error: 'Wait until collection finishes before switching lists.' };
+  }
+
   await ensureRestored();
   listType = nextType;
   jobState.listType = nextType;
+  if (!activeFetch?.running) {
+    jobState.isScraping = false;
+    jobState.isEnriching = false;
+  }
   jobState.count = curList().length;
   jobState.rawCount = curRaw().length || curList().length;
 
@@ -1309,7 +1658,7 @@ async function setListType(nextType) {
   await chrome.storage.local.set({ [XC_LIST_TYPE_PREF_KEY]: nextType });
   await hydrateSubscriptionFromStorage(jobState.username);
   notifyProgress();
-  return getStatus();
+  return normalizeClientState(getStatus());
 }
 
 function usersForMutuals(type) {
@@ -1487,6 +1836,48 @@ async function ensureHudShown(tabId, extra = {}) {
   }, 16);
 }
 
+function attachHudReady(result, hudReady) {
+  if (!hudReady) return result;
+  return { ...result, hudReady: true };
+}
+
+async function ensurePopupHudHandoff(options = {}, hudExtra = {}) {
+  if (!options.handoffAfterHud) {
+    return { ok: true, hudReady: false };
+  }
+
+  const tab = await findFocusedXTab();
+  if (!tab?.id) {
+    return {
+      ok: false,
+      hudReady: false,
+      error: 'No X tab found. Open x.com in a browser tab first.'
+    };
+  }
+
+  jobTabId = tab.id;
+  const hudReady = await ensureHudShown(tab.id, hudExtra);
+
+  if (!hudReady) {
+    return {
+      ok: false,
+      hudReady: false,
+      error: 'Could not open the on-page HUD on your X tab. Refresh x.com and try again.',
+      ...normalizeClientState(getStatus())
+    };
+  }
+
+  return { ok: true, hudReady: true };
+}
+
+async function ensureFilterHudHandoff(options = {}, type = listType) {
+  return ensurePopupHudHandoff(options, {
+    listType: type,
+    reason: 'filtering',
+    status: 'Applying filters on the X page panel...'
+  });
+}
+
 async function ensureSnifferInstalled(tabId) {
   const installed = await executeOnTab(tabId, () => !!window.__xcSnifferInstalled);
   if (installed) return true;
@@ -1615,7 +2006,7 @@ function notifyProgress(extra = {}) {
     ...extra
   });
 
-  const payload = {
+  const payload = normalizeClientState({
     type: 'scrapeStatus',
     ok: true,
     ...jobState,
@@ -1628,7 +2019,7 @@ function notifyProgress(extra = {}) {
     mutuals: computeMutuals(),
     ...subscriptionPayload(),
     ...debugStatusPayload()
-  };
+  });
 
   chrome.runtime.sendMessage(payload).catch(() => {});
 
@@ -3548,20 +3939,29 @@ async function runNativeListFetch(tabId, profile, type = listType) {
 
 function finishEmptyFilter(type = listType) {
   setCurList([], type);
+  activeEnrich = null;
   jobState.filterRemoved = curRaw(type).length;
   jobState.reason = 'filtered';
   jobState.isEnriching = false;
+  jobState.isScraping = false;
   jobState.filterPhase = null;
+  jobState.enrichProcessed = 0;
+  jobState.enrichTotal = 0;
   jobState.count = 0;
-  notifyProgress({ status: 'All accounts removed by filters.' });
+  notifyProgress({
+    reason: 'filtered',
+    isScraping: false,
+    isEnriching: false,
+    status: `All accounts removed by filters (${curRaw(type).length.toLocaleString()} still in raw — switch list or clear filters to restore).`
+  });
   schedulePersist(true, type);
-  return {
+  return normalizeClientState({
     ok: true,
     ...jobState,
     count: 0,
     rawCount: curRaw(type).length,
     removed: jobState.filterRemoved
-  };
+  });
 }
 
 async function filterList(options = {}) {
@@ -3569,15 +3969,19 @@ async function filterList(options = {}) {
     await setListType(options.listType);
   }
 
+  await ensureEnrichArchiveLoaded();
+
   const type = listType;
   const source = curRaw(type).length ? curRaw(type) : curList(type);
   if (!source.length) {
     return { ok: false, error: `No ${listCfg(type).label.toLowerCase()} collected yet.` };
   }
 
-  if (jobState.isScraping) {
+  if (isListTypeSwitchLocked()) {
     return { ok: false, error: 'Wait until collection finishes before filtering.' };
   }
+
+  jobState.isScraping = false;
 
   if (activeEnrich?.running) {
     return { ok: false, error: 'Activity lookup already running.' };
@@ -3586,6 +3990,23 @@ async function filterList(options = {}) {
   if (!curRaw(type).length) {
     snapshotListRaw(type);
   }
+
+  const handoff = await ensureFilterHudHandoff(options, type);
+  if (!handoff.ok) return handoff;
+
+  if (options.handoffAfterHud) {
+    void filterList({ ...options, handoffAfterHud: false }).catch((error) => {
+      jobState.reason = 'error';
+      const errorText = String(error?.message || error);
+      notifyProgress({ status: errorText, error: errorText, reason: 'error' });
+    });
+    return attachHudReady({
+      ok: true,
+      ...normalizeClientState(getStatus())
+    }, true);
+  }
+
+  const filterHudReady = handoff.hudReady;
 
   const removeBlue = !!options.removeBlue;
   const removeInactive = !!options.removeInactive;
@@ -3600,13 +4021,13 @@ async function filterList(options = {}) {
     jobState.filterPhase = null;
     notifyProgress({ status: `${curList(type).length.toLocaleString()} accounts ready (filters cleared).` });
     schedulePersist(true, type);
-    return {
+    return attachHudReady({
       ok: true,
       ...jobState,
       count: curList(type).length,
       rawCount: curRaw(type).length,
       removed: 0
-    };
+    }, filterHudReady);
   }
 
   let working = curRaw(type).slice();
@@ -3695,24 +4116,41 @@ async function filterList(options = {}) {
         return { ok: false, error: 'No X tab available for activity lookup.' };
       }
 
-      setCurList(working, type);
-      activeEnrich = { running: true, cancelled: false };
-      jobState.isEnriching = true;
-      jobState.reason = 'enriching';
-      jobState.filterPhase = 'inactive';
-      jobState.enrichTotal = working.length;
-      jobState.enrichProcessed = 0;
-      notifyProgress({
-        reason: 'enriching',
-        isEnriching: true,
-        enrichProcessed: 0,
-        enrichTotal: working.length,
-        status: `REST lookup: last tweet for ${working.length.toLocaleString()} following (${inactiveMonths} mo threshold)...`
-      });
+      syncWorkingFromRaw(working, type);
+      const activityCache = await loadActivityCache();
+      const now = Date.now();
+      for (const user of working) {
+        hydrateLastActiveFromStoredSources(user, type, activityCache, now);
+      }
+      const lookupNeeded = countLastActiveLookupNeeded(working, activityCache, now, type);
+
+      if (lookupNeeded > 0) {
+        setCurList(working, type);
+        activeEnrich = { running: true, cancelled: false };
+        jobState.isEnriching = true;
+        jobState.reason = 'enriching';
+        jobState.filterPhase = 'inactive';
+        jobState.enrichTotal = lookupNeeded;
+        jobState.enrichProcessed = 0;
+        notifyProgress({
+          reason: 'enriching',
+          isEnriching: true,
+          enrichProcessed: 0,
+          enrichTotal: lookupNeeded,
+          status: `REST lookup: last tweet for ${lookupNeeded.toLocaleString()} following (${inactiveMonths} mo threshold)...`
+        });
+      } else {
+        notifyProgress({
+          reason: 'filtering',
+          filterPhase: 'inactive',
+          status: `Last post (${inactiveMonths} mo): using saved tweet dates — no new lookups`
+        });
+      }
 
       let enrichCancelled = false;
       try {
         working = await enrichLastActiveForUsers(jobTabId, working, (progress) => {
+          if (progress.fromCache) return;
           const status = progress.waiting
             ? `Waiting… checked ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`
             : `REST last-tweet lookup ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
@@ -3731,9 +4169,14 @@ async function filterList(options = {}) {
       }
 
       if (enrichCancelled) {
+        syncLastActiveIntoRaw(working, type);
         setCurList(working, type);
+        schedulePersist(true, type);
         return finishStoppedJob();
       }
+
+      syncLastActiveIntoRaw(working, type);
+      schedulePersist(true, type);
 
       const beforeInactive = working.length;
       // Keep inactive accounts only — export list = unfollow candidates (drop active).
@@ -4538,8 +4981,10 @@ async function runExportFlow(requestedType = listType, options = {}) {
 
   let username = await detectHandle(tab.id);
   await alignAccountForJob(username || '');
+  await ensureEnrichArchiveLoaded();
 
   if (options.forceRefresh) {
+    await archiveListEnrichment(type);
     setCurList([], type);
     setCurRaw([], type);
     restoredTypes[type] = false;
@@ -4973,6 +5418,26 @@ async function stopScrape() {
   return { ok: true, ...jobState, count: curList().length, reason: 'stopped' };
 }
 
+function listFilterWasApplied(type = listType) {
+  const count = curList(type).length;
+  const rawCount = curRaw(type).length;
+  if (jobState.reason === 'filtered' || jobState.reason === 'filtering') return true;
+  return rawCount > 0 && count < rawCount;
+}
+
+function isExportFiltered(type = listType) {
+  if (!listFilterWasApplied(type)) return false;
+
+  const count = curList(type).length;
+  const profileTotal = totalForType(type);
+  if (profileTotal != null) {
+    return count < profileTotal;
+  }
+
+  const rawCount = curRaw(type).length;
+  return rawCount > 0 && count < rawCount;
+}
+
 async function exportCSV() {
   await ensureRestored();
 
@@ -4995,7 +5460,9 @@ async function exportCSV() {
 
   const owner = jobState.username || 'user';
   const cfg = listCfg();
-  const filename = `x_${cfg.path}_${owner}_${new Date().toISOString().slice(0, 10)}.csv`;
+  const date = new Date().toISOString().slice(0, 10);
+  const filteredSuffix = isExportFiltered() ? '_filtered' : '';
+  const filename = `x_${cfg.path}_${owner}_${date}${filteredSuffix}.csv`;
   const csvContent = buildCsv(curList());
 
   await executeOnTab(jobTabId, injectedXCleanerApiCall, [{
@@ -5006,7 +5473,14 @@ async function exportCSV() {
 
   jobState.reason = 'exported';
   notifyProgress();
-  return { ok: true, ...jobState, count: curList().length, exported: true, filename };
+  return {
+    ok: true,
+    ...jobState,
+    count: curList().length,
+    exported: true,
+    filename,
+    isFiltered: isExportFiltered()
+  };
 }
 
 async function getStatusAsync() {
@@ -5019,7 +5493,7 @@ async function getStatusAsync() {
     following: listStore.following.list.length,
     followers: listStore.followers.list.length
   };
-  return {
+  return normalizeClientState({
     ok: true,
     ...jobState,
     listType,
@@ -5035,7 +5509,7 @@ async function getStatusAsync() {
     fetchModeLabel: fetchModeLabel(fetchMode),
     ...subscriptionPayload(),
     ...debugStatusPayload()
-  };
+  });
 }
 
 function getStatus() {
@@ -5043,7 +5517,7 @@ function getStatus() {
     following: listStore.following.list.length,
     followers: listStore.followers.list.length
   };
-  return {
+  return normalizeClientState({
     ok: true,
     ...jobState,
     listType,
@@ -5059,7 +5533,7 @@ function getStatus() {
     fetchModeLabel: fetchModeLabel(jobState.fetchMode || XC_FETCH_MODE_DEFAULT),
     ...subscriptionPayload(),
     ...debugStatusPayload()
-  };
+  });
 }
 
 async function restoreDebugStatusLogFromStorage() {
@@ -5139,13 +5613,44 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           removeInactive: !!message.removeInactive,
           removeMutuals: !!message.removeMutuals,
           botCheck: !!message.botCheck,
-          inactiveMonths: message.inactiveMonths
+          inactiveMonths: message.inactiveMonths,
+          handoffAfterHud: !!message.handoffAfterHud
         }));
         break;
       case 'getMutuals':
         sendResponse({ ok: true, ...computeMutuals() });
         break;
       case 'checkSubscription':
+        if (message.handoffAfterHud) {
+          const handoff = await ensurePopupHudHandoff(message, {
+            status: 'Refreshing subscription status...'
+          });
+          if (!handoff.ok) {
+            sendResponse(handoff);
+            break;
+          }
+          void (async () => {
+            if (message.syncFromTab) {
+              await syncActiveAccountFromTab({
+                tabId: message.tabId,
+                username: message.username || null,
+                refreshSub: true,
+                forceSubRefresh: !!message.force
+              });
+            } else {
+              await refreshSubscription(message.username || null, !!message.force);
+            }
+            notifyProgress();
+          })().catch((error) => {
+            const errorText = String(error?.message || error);
+            notifyProgress({ status: errorText, error: errorText, reason: 'error' });
+          });
+          sendResponse(attachHudReady({
+            ok: true,
+            ...normalizeClientState(getStatus())
+          }, true));
+          break;
+        }
         if (message.syncFromTab) {
           await syncActiveAccountFromTab({
             tabId: message.tabId,

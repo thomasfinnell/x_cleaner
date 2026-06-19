@@ -200,21 +200,13 @@
   </style>
 </head>
 <body>
-  <h2>X Cleaner v0.81</h2>
+  <h2>X Cleaner v0.82</h2>
   <div id="account">@—</div>
   <div class="list-toggle">
     <label><input type="radio" name="listType" id="modeFollowing" value="following" checked><span>Following</span></label>
     <label><input type="radio" name="listType" id="modeFollowers" value="followers"><span>Followers</span></label>
   </div>
-  <div class="fetch-mode-box">
-    <label for="fetchModeSelect">Fetch engine</label>
-    <select id="fetchModeSelect">
-      <option value="auto" selected>Auto — REST → GraphQL worker → sniffer</option>
-      <option value="rest">REST v1.1 only (200/page)</option>
-      <option value="sniffer">Sniffer only (legacy)</option>
-    </select>
-  </div>
-  <div id="method">Collect Following via REST v1.1 (auto)</div>
+  <div id="method">Collect Following via auto fetch</div>
   <div id="progress">0 / —</div>
   <div id="mutuals"></div>
   <div class="sub-box">
@@ -249,15 +241,13 @@
       </span>
       <span>months</span>
     </label>
-    <label title="Followers only: keep accounts flagged as potential bots (any of: &lt;10 tweets, default avatar, no bio, account &lt;30 days)">
+    <label title="Followers only: keep potential bots (any of: &lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits)">
       <input type="checkbox" id="botCheck"> Bot check
     </label>
     <button id="filterBtn" type="button">Filter</button>
   </fieldset>
   <button id="exportBtn" title="Requires @d2fl subscription">Export CSV</button>
-  <div id="status">Auto: REST (200/page) → GraphQL worker → sniffer. Reload at chrome://extensions after update.</div>
-  <div id="statusLogLabel">Status log (debug — copy/paste to report issues)</div>
-  <div id="statusLog" aria-live="polite"></div>
+  <div id="status">Requires an open, logged-in x.com tab. Reload at chrome://extensions after update.</div>
   <div class="hint">Requires an open, logged-in x.com tab.</div>
   <script src="popup.js"></script>
 </body>

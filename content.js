@@ -354,8 +354,6 @@ function ensureHud() {
     <div class="xc-progress" id="xcleaner-progress">0 / —</div>
     <div class="xc-mutuals" id="xcleaner-mutuals"></div>
     <div class="xc-status" id="xcleaner-status">Ready</div>
-    <div class="xc-status-log-label" id="xcleaner-status-log-label">Status log (debug, kept after finish)</div>
-    <div class="xc-status-log" id="xcleaner-status-log" aria-live="polite"></div>
     <div class="xc-fresh-start">
       <label for="xcleaner-fresh-start">
         <input type="checkbox" id="xcleaner-fresh-start">
@@ -380,7 +378,7 @@ function ensureHud() {
         </span>
         <span>months</span>
       </label>
-      <label title="Followers only: keep potential bots (&lt;10 tweets, default avatar, no bio, account &lt;30 days)">
+      <label title="Followers only: keep potential bots (&lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits)">
         <input type="checkbox" id="xcleaner-bot-check"> Bot check
       </label>
       <button class="xc-filter-btn" id="xcleaner-filter" type="button">Filter</button>
@@ -463,14 +461,28 @@ function ensureHud() {
 
   const modeFollowing = hud.querySelector('#xcleaner-mode-following');
   const modeFollowers = hud.querySelector('#xcleaner-mode-followers');
-  modeFollowing.addEventListener('change', () => {
-    if (modeFollowing.checked) {
-      sendToBackground({ action: 'setListType', listType: 'following' });
+  modeFollowing.addEventListener('change', async () => {
+    if (!modeFollowing.checked) return;
+    const result = await sendToBackground({ action: 'setListType', listType: 'following' });
+    if (result?.ok !== false) {
+      updateHud(result);
+      return;
+    }
+    modeFollowers.checked = true;
+    if (result?.error) {
+      hud.querySelector('#xcleaner-status').textContent = result.error;
     }
   });
-  modeFollowers.addEventListener('change', () => {
-    if (modeFollowers.checked) {
-      sendToBackground({ action: 'setListType', listType: 'followers' });
+  modeFollowers.addEventListener('change', async () => {
+    if (!modeFollowers.checked) return;
+    const result = await sendToBackground({ action: 'setListType', listType: 'followers' });
+    if (result?.ok !== false) {
+      updateHud(result);
+      return;
+    }
+    modeFollowing.checked = true;
+    if (result?.error) {
+      hud.querySelector('#xcleaner-status').textContent = result.error;
     }
   });
 
@@ -479,6 +491,22 @@ function ensureHud() {
 
 function listLabel(type) {
   return type === 'followers' ? 'Followers' : 'Following';
+}
+
+function isListTypeLocked(state = {}) {
+  if (state.listTypeLocked != null) return !!state.listTypeLocked;
+  if (!state.isScraping) return false;
+  const idleReasons = new Set([
+    'filtered',
+    'complete',
+    'stopped',
+    'exported',
+    'error',
+    'end-of-list',
+    'filtering',
+    'enriching'
+  ]);
+  return !idleReasons.has(state.reason);
 }
 
 function formatHudSubscriptionStatus(state) {
@@ -537,8 +565,9 @@ function updateHud(state = {}) {
     `Collect ${listLabel(type)} via native X responses`;
   hud.querySelector('#xcleaner-mode-following').checked = type !== 'followers';
   hud.querySelector('#xcleaner-mode-followers').checked = type === 'followers';
-  hud.querySelector('#xcleaner-mode-following').disabled = !!state.isScraping;
-  hud.querySelector('#xcleaner-mode-followers').disabled = !!state.isScraping;
+  const listLocked = isListTypeLocked(state);
+  hud.querySelector('#xcleaner-mode-following').disabled = listLocked;
+  hud.querySelector('#xcleaner-mode-followers').disabled = listLocked;
 
   hud.querySelector('#xcleaner-account').textContent =
     state.username ? `@${state.username}` : '@—';

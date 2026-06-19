@@ -74,6 +74,22 @@ function listLabel(type = currentListType) {
   return type === 'followers' ? 'Followers' : 'Following';
 }
 
+function isListTypeLocked(state = {}) {
+  if (state.listTypeLocked != null) return !!state.listTypeLocked;
+  if (!state.isScraping) return false;
+  const idleReasons = new Set([
+    'filtered',
+    'complete',
+    'stopped',
+    'exported',
+    'error',
+    'end-of-list',
+    'filtering',
+    'enriching'
+  ]);
+  return !idleReasons.has(state.reason);
+}
+
 function formatTotal(state) {
   if (state.fetchTarget != null) return state.fetchTarget.toLocaleString();
   if (state.totalList != null) return state.totalList.toLocaleString();
@@ -227,9 +243,6 @@ function renderProgress(state) {
       ? 'GraphQL worker'
       : (state.method === 'native-sniffer' ? 'sniffer' : engineNote);
   methodEl.textContent = `Collect ${listLabel()} via ${activeMethod} (${limitNote})`;
-  if (fetchModeSelect && state.fetchMode) {
-    fetchModeSelect.value = state.fetchMode;
-  }
   renderSubscription(state);
 
   if (state.isEnriching && state.enrichTotal) {
@@ -244,11 +257,11 @@ function renderProgress(state) {
   renderMutuals(state);
 
   const busy = !!state.isScraping;
+  const listLocked = isListTypeLocked(state);
   startBtn.disabled = busy;
-  modeFollowingEl.disabled = busy;
-  modeFollowersEl.disabled = busy;
+  modeFollowingEl.disabled = listLocked;
+  modeFollowersEl.disabled = listLocked;
   if (freshStartEl) freshStartEl.disabled = busy;
-  if (fetchModeSelect) fetchModeSelect.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
   const canExport = !!state.canExport;
   exportBtn.disabled = count === 0 || !canExport;
@@ -357,7 +370,10 @@ function updateUI(state = {}) {
 
 async function refreshStatus() {
   const result = await sendBackground('getStatus');
-  if (result.ok || result.count > 0 || result.username || result.isScraping) {
+  if (
+    result?.ok !== false &&
+    (result.ok || result.count > 0 || result.username || result.isScraping || result.reason === 'filtered')
+  ) {
     updateUI(result);
   }
 }
@@ -377,8 +393,15 @@ function stopPolling() {
 async function switchListType(nextType) {
   if (nextType === currentListType) return;
   const result = await sendBackground('setListType', { listType: nextType });
-  if (result.ok || result.count > 0 || result.username) {
+  if (result?.ok !== false) {
     updateUI(result);
+  } else if (result?.error) {
+    setStatus(result.error, true);
+    if (nextType === 'followers') {
+      modeFollowingEl.checked = true;
+    } else {
+      modeFollowersEl.checked = true;
+    }
   }
 }
 
@@ -390,19 +413,10 @@ modeFollowersEl.addEventListener('change', () => {
   if (modeFollowersEl.checked) switchListType('followers');
 });
 
-if (fetchModeSelect) {
-  fetchModeSelect.addEventListener('change', async () => {
-    const result = await sendBackground('setFetchMode', { fetchMode: fetchModeSelect.value });
-    if (result.ok || result.fetchMode) {
-      updateUI(result);
-    }
-  });
-}
-
 startBtn.addEventListener('click', async () => {
   const listType = selectedListType();
   const forceRefresh = !!freshStartEl?.checked;
-  const fetchMode = fetchModeSelect?.value || 'auto';
+  const fetchMode = 'auto';
   startBtn.disabled = true;
   setStatus('Opening on-page panel on your X tab...');
   const result = await sendBackground('runExportFlow', {
@@ -424,21 +438,46 @@ stopBtn.addEventListener('click', () => {
   closePopup();
 });
 
-filterBtn.addEventListener('click', () => {
-  sendBackground('filterList', {
+filterBtn.addEventListener('click', async () => {
+  filterBtn.disabled = true;
+  setStatus('Opening on-page panel on your X tab...');
+  const result = await sendBackground('filterList', {
     listType: selectedListType(),
     removeMutuals: removeMutualsEl?.checked,
     removeBlue: removeBlueEl.checked,
     removeInactive: removeInactiveEl.checked,
     botCheck: botCheckEl?.checked,
-    inactiveMonths: readInactiveMonths()
+    inactiveMonths: readInactiveMonths(),
+    handoffAfterHud: true
   });
-  closePopup();
+  if (result?.hudReady) {
+    closePopup();
+    return;
+  }
+  filterBtn.disabled = false;
+  setStatus(
+    result?.error || 'Could not open on-page panel — keep an x.com tab open and try again.',
+    true
+  );
 });
 
-checkSubBtn.addEventListener('click', () => {
-  sendBackground('checkSubscription', { syncFromTab: true, force: true });
-  closePopup();
+checkSubBtn.addEventListener('click', async () => {
+  checkSubBtn.disabled = true;
+  setStatus('Opening on-page panel on your X tab...');
+  const result = await sendBackground('checkSubscription', {
+    syncFromTab: true,
+    force: true,
+    handoffAfterHud: true
+  });
+  if (result?.hudReady) {
+    closePopup();
+    return;
+  }
+  checkSubBtn.disabled = false;
+  setStatus(
+    result?.error || 'Could not open on-page panel — keep an x.com tab open and try again.',
+    true
+  );
 });
 
 upgradeBtn.addEventListener('click', () => {
