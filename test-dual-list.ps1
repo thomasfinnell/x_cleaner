@@ -128,6 +128,9 @@ Assert 'list preview modal helper' ((Get-Content (Join-Path $root 'list-preview.
 Assert 'popup view button' ($popupHtml -match 'id="viewBtn"')
 Assert 'HUD view button' ($content -match 'id="xcleaner-view"')
 Assert 'manifest loads list-preview in content' (($manifest.content_scripts | ForEach-Object { $_.js }) -join ',' -match 'list-preview\.js')
+Assert 'view count helper' ((Get-Content (Join-Path $root 'list-preview.js') -Raw) -match 'function xcCountForListType')
+Assert 'setListType restores list rows' ($bg -match 'await restoreListState\(nextType\)')
+Assert 'ensureRestored loads all lists' ($bg -notmatch 'if \(curList\(\)\.length \|\| activeFetch')
 
 Write-Host ""
 Write-Host "Results: $passed passed, $failed failed"

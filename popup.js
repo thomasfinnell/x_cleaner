@@ -98,12 +98,7 @@ function selectedImportMode() {
 }
 
 function activeListCount(state = {}) {
-  const type = state.listType || currentListType || 'following';
-  const stats = state.listStats || {};
-  const typeStats = type === 'followers' ? stats.followers : stats.following;
-  if (typeStats?.count != null) return typeStats.count;
-  if (state.storedCounts?.[type] != null) return state.storedCounts[type];
-  return state.count || 0;
+  return xcCountForListType(state, selectedListType());
 }
 
 function listLabel(type = currentListType) {

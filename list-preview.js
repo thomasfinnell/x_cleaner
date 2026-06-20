@@ -3,6 +3,16 @@
 const XC_LIST_PREVIEW_OVERLAY_ID = 'xc-list-preview-overlay';
 const XC_LIST_PREVIEW_MAX_ROWS = 5;
 
+function xcCountForListType(state = {}, type = 'following') {
+  const stats = state.listStats || {};
+  const stored = state.storedCounts || {};
+  const typeStats = type === 'followers' ? stats.followers : stats.following;
+  if (typeStats && typeStats.count != null) return typeStats.count;
+  if (stored[type] != null) return stored[type];
+  if (state.listType === type && state.count != null) return state.count;
+  return 0;
+}
+
 function xcFormatPreviewCell(value) {
   if (value == null || value === '') return '';
   if (typeof value === 'boolean') return value ? 'true' : 'false';

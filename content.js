@@ -948,8 +948,8 @@ function updateHud(state = {}) {
   if (freshStartEl) freshStartEl.disabled = busy;
   if (fastScrollEl) fastScrollEl.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
-  const typeStats = type === 'followers' ? followers : following;
-  const previewCount = typeStats?.count ?? stored[type] ?? count;
+  const hudType = selectedHudListType();
+  const previewCount = xcCountForListType(state, hudType);
   if (viewBtn) {
     viewBtn.disabled = previewCount === 0;
     viewBtn.title = previewCount > 0

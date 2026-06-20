@@ -1768,9 +1768,6 @@ async function restoreAllListState() {
 }
 
 function ensureRestored() {
-  if (curList().length || activeFetch?.running) {
-    return Promise.resolve(restoredFromStorage());
-  }
   if (!restorePromise) {
     restorePromise = restoreAllListState().finally(() => {
       restorePromise = null;
@@ -1795,6 +1792,7 @@ async function setListType(nextType) {
     jobState.isScraping = false;
     jobState.isEnriching = false;
   }
+  await restoreListState(nextType);
   jobState.count = curList().length;
   jobState.rawCount = curRaw().length || curList().length;
 
@@ -1959,6 +1957,7 @@ function mapListPreviewRow(user) {
 
 async function getListPreview(requestedType = listType) {
   const type = LIST_CONFIG[requestedType] ? requestedType : listType;
+  await ensureRestored();
   await restoreListState(type);
   const cfg = listCfg(type);
   const users = curList(type).slice(0, 5);
@@ -6403,6 +6402,7 @@ async function exportCSV() {
 }
 
 async function getStatusAsync() {
+  await ensureRestored();
   await restoreDebugStatusLogFromStorage();
   if (jobState.username) {
     await hydrateSubscriptionFromStorage(jobState.username);
