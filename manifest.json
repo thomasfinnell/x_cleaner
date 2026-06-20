@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Cleaner - Export Following",
-  "version": "0.91",
+  "version": "0.92",
   "description": "Export your X (Twitter) Following list to CSV",
   "permissions": [
     "activeTab",

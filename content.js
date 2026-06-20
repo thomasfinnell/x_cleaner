@@ -6,7 +6,7 @@ const FILTER_MONTHS_MAX = 24;
 const FILTER_MONTHS_DEFAULT = 6;
 const INACTIVE_MONTHS_PREF_KEY = 'xc_inactive_months_pref';
 const FAST_SCROLL_PREF_KEY = 'xc_fast_scroll_pref';
-const FAST_SCROLL_WARN = 'Fast mode uses aggressive scrolling and may trigger reduced reach or a shadowban on X. Leave unchecked for gentle overnight pacing.';
+const FAST_SCROLL_WARN = 'Fast mode uses REST bulk + aggressive scrolling and may trigger reduced reach or a shadowban on X. Leave unchecked for observe-only gentle pacing (scroll + sniffer + DOM, no REST bulk).';
 
 function isExtensionContextValid() {
   try {
@@ -775,9 +775,20 @@ function updateHud(state = {}) {
   const type = state.listType || 'following';
   const label = listLabel(type).toLowerCase();
 
-  const scrollNote = state.fastScrollLabel || (state.fastScroll ? 'fast scroll' : 'gentle scroll');
+  const scrollNote = state.fastScrollLabel || (state.fastScroll ? 'fast scroll' : 'observe + gentle scroll');
+  const engineNote = state.fetchModeLabel || state.fetchMode || 'auto';
+  const activeMethod = state.method === 'rest-v1.1'
+    ? 'REST v1.1'
+    : state.method === 'graphql-worker'
+      ? 'GraphQL worker'
+      : state.method === 'observe'
+        ? 'observe'
+        : (state.method === 'native-sniffer' ? 'sniffer' : engineNote);
+  const limitNote = state.isSubscribed
+    ? 'unlimited'
+    : `up to ${state.fetchLimit || 200}`;
   hud.querySelector('#xcleaner-method').textContent =
-    `Collect ${listLabel(type)} via native X responses, ${scrollNote}`;
+    `Collect ${listLabel(type)} via ${activeMethod}, ${scrollNote} (${limitNote})`;
   const fastScrollEl = hud.querySelector('#xcleaner-fast-scroll');
   if (fastScrollEl && state.fastScroll != null && fastScrollEl.checked !== !!state.fastScroll) {
     fastScrollEl.checked = !!state.fastScroll;

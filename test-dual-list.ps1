@@ -25,7 +25,7 @@ foreach ($f in $required) {
 
 # Manifest JSON
 $manifest = Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
-Assert 'manifest version 0.91' ($manifest.version -eq '0.91')
+Assert 'manifest version 0.92' ($manifest.version -eq '0.92')
 Assert 'background service worker' ($manifest.background.service_worker -eq 'background.js')
 
 # Action wiring (popup/background/content agree)
@@ -102,6 +102,18 @@ Assert 'HUD following card' ($content -match 'xcleaner-following-card')
 Assert 'HUD followers card' ($content -match 'xcleaner-followers-card')
 Assert 'list switch only locked during fetch' ($bg -match 'activeFetch\?\.running \|\| activeEnrich\?\.running')
 Assert 'small shortfall tail-gap recovery' ($bg -match 'fetchListTailGap')
+
+# Observe-only gentle mode (Fast off)
+Assert 'observe list fetch function' ($bg -match 'async function runObserveListFetch')
+Assert 'gentle mode routes to observe' ($bg -match '!fastScrollEnabled && fetchMode === .auto.')
+Assert 'observe export flow job' ($bg -match 'async function runObserveExportFlowJob')
+Assert 'gentle dwell 30s base' ($bg -match 'XC_GENTLE_DWELL_BASE_MS = 30000')
+Assert 'gentle dwell 5s jitter' ($bg -match 'XC_GENTLE_DWELL_JITTER_MS = 5000')
+Assert 'list mutation observer start' ($api -match 'function injectedStartListObserver')
+Assert 'list mutation observer drain' ($api -match 'function injectedDrainObserveListUsers')
+Assert 'light dom collect helper' ($api -match 'function injectedCollectVisibleListUsersLight')
+Assert 'observe scroll mode label' ($bg -match 'observe \+ gentle scroll')
+Assert 'popup observe method label' ($popup -match "state\.method === 'observe'")
 
 Write-Host ""
 Write-Host "Results: $passed passed, $failed failed"

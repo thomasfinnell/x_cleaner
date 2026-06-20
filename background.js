@@ -57,6 +57,8 @@ const XC_LIST_TYPE_PREF_KEY = 'xc_list_type_pref';
 const XC_FETCH_MODE_PREF_KEY = 'xc_fetch_mode_pref';
 const XC_FETCH_MODES = ['auto', 'rest', 'sniffer'];
 const XC_FETCH_MODE_DEFAULT = 'auto';
+const XC_GENTLE_DWELL_BASE_MS = 30000;
+const XC_GENTLE_DWELL_JITTER_MS = 5000;
 const XC_FAST_SCROLL_PREF_KEY = 'xc_fast_scroll_pref';
 const XC_PERSIST_VERSION = 1;
 const XC_PERSIST_COLLECT_INTERVAL = 250;
@@ -299,7 +301,7 @@ async function setFastScrollPref(enabled) {
 }
 
 function scrollModeLabel() {
-  return fastScrollEnabled ? 'fast scroll' : 'gentle scroll';
+  return fastScrollEnabled ? 'fast scroll' : 'observe + gentle scroll';
 }
 
 function scrollJitterMs(base, spread = 0.35) {
@@ -339,7 +341,9 @@ async function sleepAfterScrollStep(type = listType, context = 'tail') {
 async function maybeGentleDwellPause() {
   if (fastScrollEnabled) return;
   if (gentleScrollStepCount % 10 !== 0) return;
-  const dwellMs = scrollJitterMs(90000, 0.4);
+  const dwellMs = XC_GENTLE_DWELL_BASE_MS
+    + Math.floor(Math.random() * (XC_GENTLE_DWELL_JITTER_MS * 2 + 1))
+    - XC_GENTLE_DWELL_JITTER_MS;
   notifyProgress({
     status: `Gentle pace — pausing ${Math.round(dwellMs / 1000)}s before next scroll...`
   });
@@ -2726,6 +2730,18 @@ function nativeListenTimeoutMs(type, passes, remaining) {
   return type === 'followers' ? 6000 : 4000;
 }
 
+function observeListenTimeoutMs(type, passes, remaining) {
+  if (passes === 0) {
+    return type === 'followers' ? 25000 : 20000;
+  }
+  if (remaining > 0 && remaining <= 100) {
+    return scrollJitterMs(8000, 0.25);
+  }
+  return type === 'followers'
+    ? scrollJitterMs(14000, 0.3)
+    : scrollJitterMs(11000, 0.3);
+}
+
 function effectiveTotalList(type, profile) {
   const cfg = listCfg(type);
   const fromProfile = profile?.[cfg.totalKey];
@@ -4068,6 +4084,290 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
   }
 
   return totalAdded;
+}
+
+async function runObserveListFetch(tabId, profile, type = listType) {
+  const cfg = listCfg(type);
+  const resolvedUsername = profile.username;
+  const totalList = effectiveTotalList(type, profile);
+  if (totalList != null) {
+    profile[cfg.totalKey] = totalList;
+    jobState[cfg.totalKey] = totalList;
+  }
+
+  const listUrl = `https://x.com/${resolvedUsername}/${cfg.path}`;
+  await ensureSnifferInstalled(tabId);
+
+  await chrome.tabs.update(tabId, {
+    url: listUrl,
+    active: true
+  });
+  const listNavSettleMs = type === 'followers' ? XC_FOLLOWERS_NAV_SETTLE_MS : XC_LIST_NAV_SETTLE_MS;
+  await waitAfterTabNavigation(tabId, listNavSettleMs);
+  await ensureSnifferInstalled(tabId);
+
+  const listPageTotal = await scrapeListPageTotal(tabId, type);
+  if (listPageTotal != null && (totalList == null || listPageTotal > totalList)) {
+    profile[cfg.totalKey] = listPageTotal;
+    jobState[cfg.totalKey] = listPageTotal;
+  }
+
+  const cachedCount = curList(type).length;
+  const effectiveTotal = effectiveTotalList(type, profile);
+
+  if (cachedCount > 0 && effectiveTotal != null && cachedCount >= effectiveTotal) {
+    snapshotListRaw(type);
+    jobState.isScraping = false;
+    jobState.reason = 'complete';
+    jobState.count = cachedCount;
+    jobState.status = `Already have ${cachedCount.toLocaleString()} ${cfg.label.toLowerCase()} — skipping observe fetch`;
+    notifyProgress({ status: jobState.status });
+    schedulePersist(true, type);
+    return;
+  }
+
+  appendDebugStatusLogStart({
+    status: `Starting ${cfg.label} observe collection (gentle scroll + sniffer + DOM)`,
+    reason: 'start',
+    method: 'observe',
+    listType: type
+  });
+
+  if (!cachedCount) {
+    setCurList([], type);
+    setCurRaw([], type);
+  }
+  listType = type;
+
+  await sendHudMessage(tabId, {
+    action: 'showHud',
+    ...buildHudState({
+      username: resolvedUsername,
+      listType: type,
+      totalFollowing: profile.totalFollowing,
+      totalFollowers: profile.totalFollowers,
+      count: cachedCount,
+      isScraping: true,
+      reason: 'collecting',
+      method: 'observe',
+      status: `Observe ${cfg.label.toLowerCase()} — gentle scroll, no REST bulk...`
+    })
+  }, 20);
+  notifyProgress({
+    reason: 'collecting',
+    method: 'observe',
+    status: `Observe ${cfg.label.toLowerCase()} — gentle scroll, no REST bulk...`
+  });
+
+  const seen = buildSeenFromCurList(type, resolvedUsername);
+  let lastSeq = 0;
+  let stalePasses = 0;
+  let passes = 0;
+  let batchesWithAdds = 0;
+  const fetchTarget = effectiveFetchTarget(effectiveTotal);
+
+  try {
+    await startListObserverFromTab(tabId, resolvedUsername);
+  } catch (error) {}
+
+  while (!activeFetch?.cancelled) {
+    const remaining = remainingListCount(type, effectiveTotal, fetchTarget);
+    const listenMs = observeListenTimeoutMs(type, passes, remaining);
+    let added = 0;
+    let parsedLastBatch = 0;
+
+    const native = await waitForNativeList(tabId, cfg.opName, lastSeq, listenMs);
+    if (native?.users?.length) {
+      parsedLastBatch += native.users.length;
+      const nativeAdded = addNativeUsers(native, seen, resolvedUsername, type);
+      added += nativeAdded;
+      if (native.seq) lastSeq = Math.max(lastSeq, native.seq);
+    }
+
+    try {
+      const observed = await drainListObserverFromTab(tabId);
+      if (observed?.users?.length) {
+        parsedLastBatch += observed.users.length;
+        added += addNativeUsers({ users: observed.users }, seen, resolvedUsername, type);
+      }
+    } catch (error) {}
+
+    try {
+      const domBatch = await collectVisibleListUsersLightFromTab(tabId, resolvedUsername);
+      if (domBatch?.users?.length) {
+        parsedLastBatch += domBatch.users.length;
+        added += addNativeUsers({ users: domBatch.users }, seen, resolvedUsername, type);
+      }
+    } catch (error) {}
+
+    trimListToFetchLimit(type);
+    passes += 1;
+    if (added > 0) {
+      stalePasses = 0;
+      batchesWithAdds += 1;
+    } else {
+      stalePasses += 1;
+    }
+
+    const targetLabel = fetchTarget != null ? fetchTarget.toLocaleString() : '—';
+    const capNote = subscriptionInfo.fetchLimit != null && !subscriptionInfo.isSubscribed
+      ? ' (free limit)'
+      : '';
+    const atTail = nativeLikelyAtTail(type, curList(type).length, effectiveTotal);
+    const tailNote = atTail ? ' [tail]' : '';
+    notifyProgress({
+      reason: 'collecting',
+      method: 'observe',
+      passes,
+      pages: batchesWithAdds,
+      parsedLastPage: parsedLastBatch,
+      addedLastPage: added,
+      fetchTarget,
+      status: `Observe ${curList(type).length.toLocaleString()} / ${targetLabel}${capNote} ${cfg.label.toLowerCase()} (+${added}, parsed ${parsedLastBatch}${tailNote})`
+    });
+
+    if (subscriptionInfo.fetchLimit != null && curList(type).length >= subscriptionInfo.fetchLimit) break;
+    if (
+      effectiveTotal != null &&
+      curList(type).length >= effectiveTotal &&
+      !nativeListLikelyHasMore(curList(type).length, effectiveTotal, type)
+    ) {
+      break;
+    }
+
+    const collected = curList(type).length;
+    const staleLimit = nativeStalePassLimit(type, effectiveTotal, collected);
+    if (atTail && stalePasses >= 3) break;
+    if (collected > 0 && stalePasses >= staleLimit) break;
+    if (passes > 1500) break;
+
+    const onListPage = await tabIsOnListPage(tabId, resolvedUsername, cfg.path);
+    if (!onListPage) {
+      await chrome.tabs.update(tabId, { url: listUrl });
+      await waitForTabComplete(tabId);
+      await sleep(1200);
+      try {
+        await startListObserverFromTab(tabId, resolvedUsername);
+      } catch (error) {}
+      continue;
+    }
+
+    await scrollListStep(tabId);
+    await sleep(await sleepAfterScrollStep(type, 'native-loop'));
+  }
+
+  if (!activeFetch?.cancelled && listFetchNeedsMore(type, effectiveTotal)) {
+    await recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen, effectiveTotal);
+  }
+
+  if (!activeFetch?.cancelled && listFetchNeedsMore(type, effectiveTotal)) {
+    await fetchListTailDom(tabId, profile, type, seen, effectiveTotal);
+  }
+
+  try {
+    await stopListObserverFromTab(tabId);
+  } catch (error) {}
+
+  snapshotListRaw(type);
+  jobState.isScraping = false;
+  jobState.reason = activeFetch?.cancelled ? 'stopped' : (curList(type).length > 0 ? 'complete' : 'observe-empty');
+  jobState.method = 'observe';
+  jobState.count = curList(type).length;
+  const shortBy = effectiveTotal != null ? Math.max(0, effectiveTotal - curList(type).length) : 0;
+  jobState.status = curList(type).length > 0
+    ? shortBy > 0
+      ? `Observe complete — ${curList(type).length.toLocaleString()} / ${effectiveTotal.toLocaleString()} ${cfg.label.toLowerCase()} (short by ${shortBy})`
+      : `Observe complete — ${curList(type).length.toLocaleString()} ${cfg.label.toLowerCase()}`
+    : 'Observe returned 0 — scroll the list manually, then retry';
+  notifyProgress({ status: jobState.status });
+  schedulePersist(true, type);
+}
+
+async function runObserveExportFlowJob(tab, type, username) {
+  const cfg = listCfg(type);
+  const fetchMode = 'auto';
+
+  jobState = {
+    username: username || null,
+    listType: type,
+    totalFollowing: null,
+    totalFollowers: null,
+    count: curList(type).length,
+    isScraping: true,
+    reason: 'loading-profile',
+    method: 'observe',
+    fetchMode
+  };
+
+  await ensureSnifferInstalled(tab.id);
+
+  if (!username) {
+    username = await detectHandle(tab.id);
+    if (!username) {
+      return {
+        ok: false,
+        error: 'Could not detect your X username. Open x.com/home or your profile, then try again.'
+      };
+    }
+  }
+
+  notifyProgress({ status: 'Opening profile for observe fetch...' });
+  await chrome.tabs.update(tab.id, {
+    url: `https://x.com/${username}`,
+    active: true
+  });
+  await waitAfterTabNavigation(tab.id, XC_PROFILE_NAV_SETTLE_MS);
+  throwIfCancelled();
+
+  const profile = await scrapeProfileStats(tab.id, username);
+  throwIfCancelled();
+
+  jobState.username = profile.username || username;
+  await alignAccountForJob(jobState.username);
+  jobState.totalFollowing = profile.totalFollowing;
+  jobState.totalFollowers = profile.totalFollowers;
+  jobState.reason = 'profile-loaded';
+
+  const totalForFetch = profile[cfg.totalKey];
+  const resumeCount = curList(type).length;
+  if (resumeCount > 0 && totalForFetch != null && resumeCount >= totalForFetch) {
+    jobState.count = resumeCount;
+    jobState.reason = 'complete';
+    jobState.isScraping = false;
+    jobState.status = `Already have ${resumeCount.toLocaleString()} ${cfg.label.toLowerCase()} — skipping fetch`;
+    notifyProgress({ status: jobState.status });
+    await chrome.storage.local.set({ [XC_LIST_TYPE_PREF_KEY]: type });
+    persistListState(type).catch(() => {});
+    return {
+      ok: true,
+      ...jobState,
+      count: resumeCount,
+      mutuals: computeMutuals(),
+      fetchMode,
+      ...subscriptionPayload(),
+      ...debugStatusPayload()
+    };
+  }
+
+  const totalLabel = totalForFetch != null ? totalForFetch.toLocaleString() : '—';
+  notifyProgress({
+    status: `Logged in as @${jobState.username} • observe ${cfg.label.toLowerCase()} (${totalLabel}) — no REST bulk`
+  });
+
+  await runObserveListFetch(tab.id, profile, type);
+
+  await chrome.storage.local.set({ [XC_LIST_TYPE_PREF_KEY]: type });
+  persistListState(type).catch(() => {});
+  persistDebugStatusLog();
+  return {
+    ok: curList(type).length > 0,
+    ...jobState,
+    count: curList(type).length,
+    mutuals: computeMutuals(),
+    fetchMode,
+    ...subscriptionPayload(),
+    ...debugStatusPayload()
+  };
 }
 
 async function runNativeListFetch(tabId, profile, type = listType) {
@@ -5583,6 +5883,10 @@ async function runExportFlowJob(tab, type, options, username) {
 
   try {
     activeFetch = { running: true, cancelled: false };
+
+    if (!fastScrollEnabled && fetchMode === 'auto') {
+      return await runObserveExportFlowJob(tab, type, username);
+    }
 
     let profile = null;
     let fastFetchSucceeded = false;

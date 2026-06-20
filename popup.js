@@ -67,7 +67,7 @@ const fastScrollEl = document.getElementById('fastScroll');
 const fastScrollToastEl = document.getElementById('fastScrollToast');
 
 const FAST_SCROLL_PREF_KEY = 'xc_fast_scroll_pref';
-const FAST_SCROLL_WARN = 'Fast mode uses aggressive scrolling and may trigger reduced reach or a shadowban on X. Leave unchecked for gentle overnight pacing.';
+const FAST_SCROLL_WARN = 'Fast mode uses REST bulk + aggressive scrolling and may trigger reduced reach or a shadowban on X. Leave unchecked for observe-only gentle pacing (scroll + sniffer + DOM, no REST bulk).';
 let fastScrollToastTimer = null;
 
 function closePopup() {
@@ -288,7 +288,9 @@ function renderProgress(state) {
     ? 'REST v1.1'
     : state.method === 'graphql-worker'
       ? 'GraphQL worker'
-      : (state.method === 'native-sniffer' ? 'sniffer' : engineNote);
+      : state.method === 'observe'
+        ? 'observe'
+        : (state.method === 'native-sniffer' ? 'sniffer' : engineNote);
   const scrollNote = state.fastScrollLabel || (state.fastScroll ? 'fast scroll' : 'gentle scroll');
   methodEl.textContent = `Collect ${listLabel()} via ${activeMethod}, ${scrollNote} (${limitNote})`;
   if (fastScrollEl && state.fastScroll != null && fastScrollEl.checked !== !!state.fastScroll) {

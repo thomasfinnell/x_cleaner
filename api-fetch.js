@@ -867,6 +867,179 @@ function injectedCollectVisibleListUsers(screenName) {
   return { users };
 }
 
+function injectedFindListRoot() {
+  const labels = ['Timeline: Followers', 'Timeline: Following', 'Followers', 'Following'];
+  for (const label of labels) {
+    const el = document.querySelector(`[aria-label="${label}"]`);
+    if (el) return el;
+  }
+  const main = document.querySelector('main');
+  if (!main) return null;
+  let best = null;
+  let bestCells = 0;
+  main.querySelectorAll('section[role="region"], div[role="region"]').forEach((region) => {
+    const count = region.querySelectorAll('[data-testid="UserCell"]').length;
+    if (count > bestCells) {
+      bestCells = count;
+      best = region;
+    }
+  });
+  return best || main;
+}
+
+function injectedParseUserCellFromDom(cell, ownerLower, skip) {
+  if (!cell) return null;
+  let handle = null;
+  const nameLink = cell.querySelector('[data-testid="User-Name"] a[href^="/"]');
+  if (nameLink) {
+    const href = (nameLink.getAttribute('href') || '').split('?')[0];
+    const match = href.match(/^\/([^/]+)$/);
+    if (match) handle = match[1];
+  }
+  if (!handle) {
+    const profileLink = cell.querySelector('a[href^="/"][role="link"]');
+    if (profileLink) {
+      const href = (profileLink.getAttribute('href') || '').split('?')[0];
+      const match = href.match(/^\/([^/]+)$/);
+      if (match) handle = match[1];
+    }
+  }
+  if (!handle) return null;
+  const key = String(handle).toLowerCase();
+  if (!key || skip.has(key)) return null;
+
+  const displayEl = cell.querySelector('[data-testid="User-Name"] span');
+  const displayName = displayEl ? String(displayEl.textContent || '').trim() : '';
+  const isBlue = !!(
+    cell.querySelector('[data-testid="icon-verified"]')
+    || cell.querySelector('svg[aria-label*="Verified"]')
+    || cell.querySelector('[aria-label*="Verified account"]')
+  );
+
+  return {
+    username: handle,
+    display_name: displayName,
+    friends_count: null,
+    followers_count: null,
+    tweet_count: null,
+    created_at: '',
+    bio: '',
+    is_blue: isBlue,
+    default_avatar: false
+  };
+}
+
+function injectedStartListObserver(screenName) {
+  if (window.__xcObserveState?.observer) {
+    return { ok: true, already: true };
+  }
+
+  const owner = String(screenName || '').replace(/^@+/, '').toLowerCase();
+  const skip = new Set([
+    'home', 'explore', 'notifications', 'messages', 'search', 'settings', 'i',
+    'compose', 'login', 'signup', 'followers', 'following', 'account', 'privacy',
+    'grok', 'x', 'twitter', 'support', 'safety', 'premium', 'verified', 'help',
+    'ads', 'business', 'developers', 'xai', 'create', owner
+  ].filter(Boolean));
+
+  const root = injectedFindListRoot();
+  if (!root) return { ok: false, error: 'list root not found' };
+
+  const state = {
+    observer: null,
+    users: [],
+    seen: new Set()
+  };
+
+  const ingestCell = (cell) => {
+    const user = injectedParseUserCellFromDom(cell, owner, skip);
+    if (!user) return;
+    const key = user.username.toLowerCase();
+    if (state.seen.has(key)) return;
+    state.seen.add(key);
+    state.users.push(user);
+  };
+
+  const scanRoot = (scope) => {
+    scope.querySelectorAll('[data-testid="UserCell"]').forEach(ingestCell);
+  };
+
+  scanRoot(root);
+
+  state.observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (!node || node.nodeType !== 1) continue;
+        if (node.matches?.('[data-testid="UserCell"]')) ingestCell(node);
+        node.querySelectorAll?.('[data-testid="UserCell"]').forEach(ingestCell);
+      }
+    }
+  });
+  state.observer.observe(root, { childList: true, subtree: true });
+  window.__xcObserveState = state;
+  return { ok: true, initial: state.users.length };
+}
+
+function injectedDrainObserveListUsers() {
+  const state = window.__xcObserveState;
+  if (!state) return { users: [] };
+  const users = state.users.splice(0, state.users.length);
+  return { users };
+}
+
+function injectedStopListObserver() {
+  const state = window.__xcObserveState;
+  if (state?.observer) {
+    try {
+      state.observer.disconnect();
+    } catch (error) {}
+  }
+  window.__xcObserveState = null;
+  return { ok: true };
+}
+
+function injectedCollectVisibleListUsersLight(screenName) {
+  const owner = String(screenName || '').replace(/^@+/, '').toLowerCase();
+  const skip = new Set([
+    'home', 'explore', 'notifications', 'messages', 'search', 'settings', 'i',
+    'compose', 'login', 'signup', 'followers', 'following', 'account', 'privacy',
+    'grok', 'x', 'twitter', 'support', 'safety', 'premium', 'verified', 'help',
+    'ads', 'business', 'developers', 'xai', 'create', owner
+  ].filter(Boolean));
+
+  const root = injectedFindListRoot();
+  if (!root) return { users: [] };
+
+  const users = [];
+  const seen = new Set();
+  root.querySelectorAll('[data-testid="UserCell"]').forEach((cell) => {
+    const user = injectedParseUserCellFromDom(cell, owner, skip);
+    if (!user) return;
+    const key = user.username.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    users.push(user);
+  });
+
+  return { users };
+}
+
+async function startListObserverFromTab(tabId, screenName) {
+  return executeOnTab(tabId, injectedStartListObserver, [screenName]);
+}
+
+async function drainListObserverFromTab(tabId) {
+  return executeOnTab(tabId, injectedDrainObserveListUsers, []);
+}
+
+async function stopListObserverFromTab(tabId) {
+  return executeOnTab(tabId, injectedStopListObserver, []);
+}
+
+async function collectVisibleListUsersLightFromTab(tabId, screenName) {
+  return executeOnTab(tabId, injectedCollectVisibleListUsersLight, [screenName]);
+}
+
 function readNativeFollowingList(minSeq) {
   return readNativeList('Following', minSeq);
 }
