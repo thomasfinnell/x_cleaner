@@ -197,6 +197,45 @@
       color: #666;
       font-size: 11px;
     }
+    .import-box {
+      margin: 10px 0 0;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      background: #fafafa;
+    }
+    .import-box legend {
+      font-size: 12px;
+      font-weight: 700;
+      color: #444;
+      padding: 0 4px;
+    }
+    .import-mode label {
+      display: block;
+      font-size: 12px;
+      margin: 4px 0;
+      color: #333;
+    }
+    .import-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .import-actions button {
+      flex: 1;
+      margin: 0;
+      padding: 8px 6px;
+      font-size: 11px;
+      background: #536471;
+      color: #fff;
+    }
+    .import-hint {
+      margin-top: 6px;
+      font-size: 11px;
+      color: #666;
+      line-height: 1.35;
+      min-height: 14px;
+    }
   </style>
 </head>
 <body>
@@ -241,12 +280,26 @@
       </span>
       <span>months</span>
     </label>
-    <label title="Followers only: keep potential bots you do not follow. Skips accounts you follow (you_follow from Followers REST, or Following list if fetched). Signals: &lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits.">
+    <label title="Followers only: keep potential bots you do not follow. Skips accounts you follow (you_follow from Followers REST, or Following list if fetched). Signals: &lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits, followers &gt;2× following.">
       <input type="checkbox" id="botCheck"> Bot check
     </label>
     <button id="filterBtn" type="button">Filter</button>
   </fieldset>
   <button id="exportBtn" title="Requires @d2fl subscription">Export CSV</button>
+  <fieldset class="import-box">
+    <legend>Load CSV</legend>
+    <div class="import-mode">
+      <label><input type="radio" name="importMode" id="importModeReplace" value="replace" checked> Replace list</label>
+      <label><input type="radio" name="importMode" id="importModeAppend" value="append"> Append (dedupe)</label>
+    </div>
+    <div class="import-actions">
+      <button id="loadFollowingBtn" type="button">Load Following</button>
+      <button id="loadFollowersBtn" type="button">Load Followers</button>
+    </div>
+    <input id="importFollowingInput" type="file" accept=".csv,text/csv" hidden>
+    <input id="importFollowersInput" type="file" accept=".csv,text/csv" hidden>
+    <div id="importInfo" class="import-hint">X Cleaner export or one handle per line. Free tier: 200 records max.</div>
+  </fieldset>
   <div id="status">Requires an open, logged-in x.com tab. Reload at chrome://extensions after update.</div>
   <div class="hint">Requires an open, logged-in x.com tab.</div>
   <script src="popup.js"></script>

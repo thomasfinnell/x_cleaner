@@ -53,6 +53,12 @@ const upgradeBtn = document.getElementById('upgradeBtn');
 const modeFollowingEl = document.getElementById('modeFollowing');
 const modeFollowersEl = document.getElementById('modeFollowers');
 const freshStartEl = document.getElementById('freshStart');
+const loadFollowingBtn = document.getElementById('loadFollowingBtn');
+const loadFollowersBtn = document.getElementById('loadFollowersBtn');
+const importFollowingInput = document.getElementById('importFollowingInput');
+const importFollowersInput = document.getElementById('importFollowersInput');
+const importInfoEl = document.getElementById('importInfo');
+const importModeReplaceEl = document.getElementById('importModeReplace');
 
 function closePopup() {
   window.close();
@@ -68,6 +74,10 @@ let lastDebugStatusLogEnabled = true;
 
 function selectedListType() {
   return modeFollowersEl.checked ? 'followers' : 'following';
+}
+
+function selectedImportMode() {
+  return importModeReplaceEl?.checked ? 'replace' : 'append';
 }
 
 function listLabel(type = currentListType) {
@@ -271,6 +281,9 @@ function renderProgress(state) {
     : 'Export requires @d2fl subscription';
   filterBtn.disabled =
     count === 0 || busy || !!state.isEnriching || state.reason === 'filtering';
+  const importBusy = busy || !!state.isEnriching || state.reason === 'filtering';
+  if (loadFollowingBtn) loadFollowingBtn.disabled = importBusy;
+  if (loadFollowersBtn) loadFollowersBtn.disabled = importBusy;
 }
 
 function sendBackground(action, payload = {}) {
@@ -489,6 +502,46 @@ exportBtn.addEventListener('click', () => {
   if (exportBtn.disabled) return;
   sendBackground('exportCSV');
   closePopup();
+});
+
+async function handleCsvImport(listType, file) {
+  if (!file) return;
+  const mode = selectedImportMode();
+  if (loadFollowingBtn) loadFollowingBtn.disabled = true;
+  if (loadFollowersBtn) loadFollowersBtn.disabled = true;
+  setStatus(`Loading ${listLabel(listType).toLowerCase()} CSV...`);
+  try {
+    const csvText = await file.text();
+    const result = await sendBackground('loadListCsv', { listType, csvText, mode });
+    if (result?.ok !== false && (result.ok || result.count > 0)) {
+      updateUI(result);
+      if (importInfoEl) {
+        importInfoEl.textContent = result.status || `Loaded ${(result.importLoaded || result.count || 0).toLocaleString()} ${listLabel(listType).toLowerCase()}.`;
+      }
+      return;
+    }
+    setStatus(result?.error || 'CSV import failed.', true);
+  } catch (error) {
+    setStatus(String(error?.message || error || 'CSV import failed.'), true);
+  } finally {
+    if (loadFollowingBtn) loadFollowingBtn.disabled = false;
+    if (loadFollowersBtn) loadFollowersBtn.disabled = false;
+  }
+}
+
+loadFollowingBtn?.addEventListener('click', () => importFollowingInput?.click());
+loadFollowersBtn?.addEventListener('click', () => importFollowersInput?.click());
+
+importFollowingInput?.addEventListener('change', async () => {
+  const file = importFollowingInput.files?.[0];
+  importFollowingInput.value = '';
+  await handleCsvImport('following', file);
+});
+
+importFollowersInput?.addEventListener('change', async () => {
+  const file = importFollowersInput.files?.[0];
+  importFollowersInput.value = '';
+  await handleCsvImport('followers', file);
 });
 
 chrome.runtime.onMessage.addListener((message) => {

@@ -1,14 +1,12 @@
 # X Cleaner Chrome Extension
 
-Version: 0.6
+Version: 0.86
 
-Export your X Following list to CSV.
-
-This project is a **fetch lab** for perfecting the GraphQL following-list code used by X Follower Remover.
+Export your X (Twitter) **Following** and **Followers** lists to CSV. Filter lists (mutuals, inactive, bots, etc.) and load CSV files for offline editing or handoff to [X Follower Remover](https://github.com/thomasfinnell/X-follower-Remover).
 
 ## How it works
 
-This extension uses **X's GraphQL API** (the same internal API the website uses), not DOM scraping. That means:
+This extension uses **X's internal APIs** (GraphQL and REST), not DOM scraping. That means:
 
 - Your tab does **not** need to navigate to profile or following pages
 - The screen does **not** scroll or refresh while collecting
@@ -17,16 +15,24 @@ This extension uses **X's GraphQL API** (the same internal API the website uses)
 You must have an open, logged-in `x.com` tab so the extension can use your session cookies.
 
 ## Installation
+
 1. Open Chrome: `chrome://extensions/`
-2. Enable Developer mode
+2. Enable **Developer mode**
 3. Click **Load unpacked**
-4. Select this folder (`x_cleaner`)
+4. Select this folder (`x_cleaner`), or a copy built with `pack-local.ps1`
+
+Do not drag a `.crx` onto Chrome — modern Chrome blocks sideloaded CRX files.
 
 ## Usage
+
 1. Keep a logged-in x.com tab open
-2. Click the extension icon
-3. Click **Start Collection**
-4. Watch progress: `collected / total following`
-5. Click **Export CSV** in the popup or the on-page panel when ready
+2. Click the extension icon (or use the on-page HUD panel)
+3. Choose **Following** or **Followers**, then **Start Collection**
+4. Optionally run **Filter** (remove mutuals, blue checks, inactive accounts, bots)
+5. **Export CSV** when ready (requires @d2fl subscription), or use **Load CSV** to replace/append a list from a prior export
+
+Free tier: fetch and CSV import are capped at 200 records. Subscribe to [@d2fl on X](https://x.com/d2fl/creator-subscriptions/subscribe) for unlimited fetch/export.
 
 Note: X changes API query IDs occasionally — the extension fetches current IDs from x.com on startup with fallbacks.
+
+See **[FLOWCHART.md](FLOWCHART.md)** for Mermaid flowcharts: architecture, collection (REST → GraphQL → sniffer), filters, CSV import/export, subscription gate, and dual-list storage.

@@ -41,6 +41,7 @@ const DEFAULT_INACTIVE_MONTHS = 6;
 const BOT_CHECK_TWEET_MAX = 10;
 const BOT_CHECK_ACCOUNT_MAX_DAYS = 30;
 const BOT_CHECK_USERNAME_TRAILING_DIGITS = 4;
+const BOT_CHECK_FOLLOWERS_RATIO = 2;
 const MIN_FILTER_MONTHS = 1;
 const MAX_FILTER_MONTHS = 24;
 const ENRICH_BATCH_SIZE = XC_REST_LOOKUP_BATCH_SIZE;
@@ -1113,6 +1114,19 @@ function hasTrailingDigitUsername(user, minTrailingDigits = BOT_CHECK_USERNAME_T
   return !!(trailingDigits && trailingDigits[0].length > minTrailingDigits);
 }
 
+function hasHighFollowerRatio(user, ratio = BOT_CHECK_FOLLOWERS_RATIO) {
+  const followers = user?.followers_count;
+  const following = user?.friends_count;
+  if (followers == null || followers === '' || following == null || following === '') {
+    return false;
+  }
+  const followerN = Number(followers);
+  const followingN = Number(following);
+  if (!Number.isFinite(followerN) || !Number.isFinite(followingN)) return false;
+  if (followingN < 0 || followerN < 0) return false;
+  return followerN > ratio * followingN;
+}
+
 function isPotentialBot(user) {
   if (!user) return false;
   if (user.default_avatar) return true;
@@ -1120,6 +1134,7 @@ function isPotentialBot(user) {
   if (isLowTweetAccount(user)) return true;
   if (isYoungAccount(user.created_at)) return true;
   if (hasTrailingDigitUsername(user)) return true;
+  if (hasHighFollowerRatio(user)) return true;
   return false;
 }
 
@@ -1397,6 +1412,7 @@ function serializeJobStateForPersist(type = listType) {
     reason: jobState.reason,
     method: jobState.method,
     filterRemoved: jobState.filterRemoved ?? 0,
+    appliedFilters: Array.isArray(jobState.appliedFilters) ? jobState.appliedFilters.slice() : [],
     status: jobState.status || null
   };
 }
@@ -1514,6 +1530,7 @@ async function applyAccountSwitch(detected) {
     savedAt: null,
     reason: null,
     filterRemoved: 0,
+    appliedFilters: [],
     status: null
   };
   await restoreAllListState();
@@ -1648,6 +1665,9 @@ async function setListType(nextType) {
       if (!activeUser || !savedUser || savedUser === activeUser) {
         jobState.reason = saved.jobState.reason ?? jobState.reason;
         jobState.filterRemoved = saved.jobState.filterRemoved ?? 0;
+        jobState.appliedFilters = Array.isArray(saved.jobState.appliedFilters)
+          ? saved.jobState.appliedFilters.slice()
+          : [];
         jobState.totalFollowing = saved.jobState.totalFollowing ?? jobState.totalFollowing;
         jobState.totalFollowers = saved.jobState.totalFollowers ?? jobState.totalFollowers;
         jobState.username = saved.jobState.username ?? jobState.username;
@@ -1783,6 +1803,282 @@ function buildCsv(users) {
       .join(',')
   ).join('\n');
   return header + rows + '\n';
+}
+
+function parseImportCsvRows(text) {
+  const rows = [];
+  let i = 0;
+  const len = text.length;
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+
+  const pushField = () => { row.push(field); field = ''; };
+  const pushRow = () => { if (row.length) rows.push(row); row = []; };
+
+  while (i < len) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (i + 1 < len && text[i + 1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      pushField();
+    } else if (c === '\n' || c === '\r') {
+      pushField();
+      pushRow();
+      if (c === '\r' && i + 1 < len && text[i + 1] === '\n') i++;
+    } else {
+      field += c;
+    }
+    i++;
+  }
+  pushField();
+  if (row.length || field) pushRow();
+  return rows;
+}
+
+function findImportColumnIndex(headers, patterns) {
+  for (let i = 0; i < headers.length; i += 1) {
+    const h = (headers[i] || '').toLowerCase().trim();
+    if (patterns.some((re) => re.test(h))) return i;
+  }
+  return -1;
+}
+
+function parseImportOptionalCount(value) {
+  if (value == null || value === '') return null;
+  const cleaned = String(value).replace(/,/g, '').trim();
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : null;
+}
+
+function parseImportCsvBool(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (v === 'true' || v === '1' || v === 'yes') return true;
+  if (v === 'false' || v === '0' || v === 'no') return false;
+  return null;
+}
+
+function parseImportLastTweetAt(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function normalizeImportedUser(fields, type) {
+  const username = String(fields.username || '').trim().replace(/^@+/, '');
+  if (!username || !/^[a-zA-Z0-9_]{1,30}$/.test(username)) return null;
+
+  const user = { username };
+  if (fields.display_name) user.display_name = fields.display_name;
+  if (fields.friends_count != null) user.friends_count = fields.friends_count;
+  if (fields.followers_count != null) user.followers_count = fields.followers_count;
+  if (fields.tweet_count != null) user.tweet_count = fields.tweet_count;
+  if (fields.created_at) user.created_at = fields.created_at;
+  if (fields.bio) user.bio = fields.bio;
+  if (fields.is_blue != null) user.is_blue = fields.is_blue;
+  if (fields.default_avatar != null) user.default_avatar = fields.default_avatar;
+  if (fields.you_follow != null) user.you_follow = fields.you_follow;
+  if (fields.follows_you != null) user.follows_you = fields.follows_you;
+  if (fields.last_active_ms != null) user.last_active_ms = fields.last_active_ms;
+
+  if (type === 'following' && user.you_follow == null) user.you_follow = true;
+  if (type === 'followers' && user.follows_you == null) user.follows_you = true;
+
+  return user;
+}
+
+function extractUsersFromImportCsv(text, type = 'following') {
+  const rows = parseImportCsvRows(String(text || '').trim());
+  if (!rows.length) return [];
+
+  let headerRow = null;
+  let data = rows;
+  const first = rows[0].map((c) => (c || '').toLowerCase().trim());
+  const likelyHeader = first.some((h) =>
+    /user|handle|screen|name|login|display|follow|friend|count|bio|blue|avatar|tweet|created|last/.test(h)
+  );
+  if (likelyHeader) {
+    headerRow = first;
+    data = rows.slice(1);
+  }
+
+  let usernameIdx = 0;
+  let displayIdx = -1;
+  let friendsIdx = -1;
+  let followersIdx = -1;
+  let tweetIdx = -1;
+  let createdIdx = -1;
+  let bioIdx = -1;
+  let blueIdx = -1;
+  let avatarIdx = -1;
+  let youFollowIdx = -1;
+  let followsYouIdx = -1;
+  let lastTweetIdx = -1;
+
+  if (headerRow) {
+    const uIdx = findImportColumnIndex(headerRow, [
+      /^username$/,
+      /^user$/,
+      /^handle$/,
+      /^screen.?name$/,
+      /^login$/,
+      /^screen_name$/
+    ]);
+    if (uIdx !== -1) usernameIdx = uIdx;
+    displayIdx = findImportColumnIndex(headerRow, [/^display.?name$/, /^name$/, /^display_name$/]);
+    if (displayIdx === usernameIdx) displayIdx = -1;
+    friendsIdx = findImportColumnIndex(headerRow, [
+      /^friends_count$/,
+      /^following_count$/,
+      /^following$/,
+      /^friends$/
+    ]);
+    followersIdx = findImportColumnIndex(headerRow, [/^followers_count$/, /^followers$/]);
+    tweetIdx = findImportColumnIndex(headerRow, [/^tweet_count$/, /^tweets$/, /^statuses_count$/]);
+    createdIdx = findImportColumnIndex(headerRow, [/^created_at$/, /^account_created$/]);
+    bioIdx = findImportColumnIndex(headerRow, [/^bio$/, /^description$/]);
+    blueIdx = findImportColumnIndex(headerRow, [/^is_blue$/, /^verified$/, /^blue$/]);
+    avatarIdx = findImportColumnIndex(headerRow, [/^default_avatar$/, /^default_profile_image$/]);
+    youFollowIdx = findImportColumnIndex(headerRow, [/^you_follow$/, /^following_you_follow$/]);
+    followsYouIdx = findImportColumnIndex(headerRow, [/^follows_you$/, /^follows_me$/]);
+    lastTweetIdx = findImportColumnIndex(headerRow, [/^last_tweet_at$/, /^last_active$/, /^last_post$/]);
+  }
+
+  const users = [];
+  for (const r of data) {
+    const fields = {
+      username: (r[usernameIdx] || r[0] || '').trim(),
+      display_name: displayIdx >= 0 ? (r[displayIdx] || '').trim() : '',
+      friends_count: friendsIdx >= 0 ? parseImportOptionalCount(r[friendsIdx]) : null,
+      followers_count: followersIdx >= 0 ? parseImportOptionalCount(r[followersIdx]) : null,
+      tweet_count: tweetIdx >= 0 ? parseImportOptionalCount(r[tweetIdx]) : null,
+      created_at: createdIdx >= 0 ? (r[createdIdx] || '').trim() : '',
+      bio: bioIdx >= 0 ? (r[bioIdx] || '').trim() : '',
+      is_blue: blueIdx >= 0 ? parseImportCsvBool(r[blueIdx]) : null,
+      default_avatar: avatarIdx >= 0 ? parseImportCsvBool(r[avatarIdx]) : null,
+      you_follow: youFollowIdx >= 0 ? parseImportCsvBool(r[youFollowIdx]) : null,
+      follows_you: followsYouIdx >= 0 ? parseImportCsvBool(r[followsYouIdx]) : null,
+      last_active_ms: lastTweetIdx >= 0 ? parseImportLastTweetAt(r[lastTweetIdx]) : null
+    };
+    const user = normalizeImportedUser(fields, type);
+    if (user) users.push(user);
+  }
+
+  return users;
+}
+
+function mergeImportedUserLists(existing, incoming) {
+  const order = [];
+  const bucket = {};
+  for (const user of existing) {
+    const key = (user.username || '').toLowerCase();
+    if (!key) continue;
+    bucket[key] = { ...user };
+    order.push(key);
+  }
+
+  let added = 0;
+  for (const user of incoming) {
+    const key = (user.username || '').toLowerCase();
+    if (!key) continue;
+    if (bucket[key]) {
+      mergeUserFields(bucket[key], user);
+    } else {
+      bucket[key] = { ...user };
+      order.push(key);
+      added += 1;
+    }
+  }
+
+  return { list: order.map((k) => bucket[k]), added };
+}
+
+function isCsvImportBlocked() {
+  if (activeFetch?.running) return true;
+  if (activeEnrich?.running) return true;
+  if (jobState.isScraping && !LIST_TYPE_IDLE_REASONS.has(jobState.reason)) return true;
+  return false;
+}
+
+async function loadListFromCsv(type, csvText, options = {}) {
+  if (!LIST_CONFIG[type]) {
+    return { ok: false, error: 'Invalid list type.' };
+  }
+  if (isCsvImportBlocked()) {
+    return { ok: false, error: 'Wait until collection or filtering finishes before importing.' };
+  }
+
+  await ensureRestored();
+  await hydrateSubscriptionFromStorage(jobState.username);
+
+  const parsed = extractUsersFromImportCsv(csvText, type);
+  if (!parsed.length) {
+    return {
+      ok: false,
+      error: 'No valid usernames found. Use an X Cleaner export or one handle per line.'
+    };
+  }
+
+  const mode = options.mode === 'append' ? 'append' : 'replace';
+  const cap = subscriptionInfo.fetchLimit;
+  let nextList;
+  let appended = 0;
+
+  if (mode === 'append') {
+    const merged = mergeImportedUserLists(curList(type), parsed);
+    nextList = merged.list;
+    appended = merged.added;
+  } else {
+    nextList = parsed.map((user) => ({ ...user }));
+  }
+
+  let truncated = 0;
+  if (cap != null && nextList.length > cap) {
+    truncated = nextList.length - cap;
+    nextList = nextList.slice(0, cap);
+  }
+
+  const nextRaw = nextList.map((user) => ({ ...user }));
+  setCurList(nextList, type);
+  setCurRaw(nextRaw, type);
+  listType = type;
+  jobState.listType = type;
+  jobState.appliedFilters = [];
+  jobState.filterRemoved = 0;
+  jobState.isScraping = false;
+  jobState.isEnriching = false;
+  jobState.reason = 'complete';
+  jobState.count = nextList.length;
+  jobState.rawCount = nextRaw.length;
+  restoredTypes[type] = true;
+
+  const cfg = listCfg(type);
+  let status = mode === 'append'
+    ? `Appended CSV — ${nextList.length.toLocaleString()} ${cfg.label.toLowerCase()} (${parsed.length.toLocaleString()} in file, ${appended.toLocaleString()} new).`
+    : `Loaded CSV — ${nextList.length.toLocaleString()} ${cfg.label.toLowerCase()} (replaced).`;
+  if (truncated > 0) {
+    status += ` Free tier capped at ${XC_FREE_FETCH_LIMIT} (${truncated.toLocaleString()} skipped).`;
+  }
+  jobState.status = status;
+
+  schedulePersist(true, type);
+  notifyProgress({ status, reason: 'complete' });
+  return normalizeClientState({
+    ok: true,
+    ...getStatus(),
+    importMode: mode,
+    importParsed: parsed.length,
+    importLoaded: nextList.length,
+    importTruncated: truncated
+  });
 }
 
 async function sendHudMessage(tabId, payload, retries = 1) {
@@ -4019,6 +4315,7 @@ async function filterList(options = {}) {
   if (!removeBlue && !removeInactive && !removeMutuals && !botCheck) {
     setCurList(curRaw(type).slice(), type);
     jobState.filterRemoved = 0;
+    jobState.appliedFilters = [];
     jobState.reason = curList(type).length ? 'complete' : jobState.reason;
     jobState.filterPhase = null;
     notifyProgress({ status: `${curList(type).length.toLocaleString()} accounts ready (filters cleared).` });
@@ -4034,6 +4331,8 @@ async function filterList(options = {}) {
 
   let working = curRaw(type).slice();
   const parts = [];
+  const appliedFilters = [];
+  jobState.appliedFilters = appliedFilters;
   jobState.reason = 'filtering';
   jobState.isEnriching = false;
   jobState.enrichProcessed = 0;
@@ -4064,7 +4363,7 @@ async function filterList(options = {}) {
     working = excludeMutuals(working, type, ctx);
     const mutualsRemoved = beforeMutuals - working.length;
     if (mutualsRemoved > 0) {
-      parts.push(`mutuals (${mutualsRemoved.toLocaleString()})`);
+      parts.push(`non-mutuals (${mutualsRemoved.toLocaleString()} mutuals removed)`);
     }
     jobState.filterPhase = 'mutuals';
     notifyProgress({
@@ -4075,6 +4374,7 @@ async function filterList(options = {}) {
         : `Remove mutuals: 0 removed (${beforeMutuals.toLocaleString()} accounts — none matched mutuals)`
     });
     if (!working.length) return finishEmptyFilter(type);
+    appliedFilters.push('non_mutuals');
   }
 
   if (removeBlue) {
@@ -4095,7 +4395,7 @@ async function filterList(options = {}) {
     jobState.filterPhase = 'blue';
     jobState.reason = 'filtering';
     const removed = before - working.length;
-    if (removed > 0) parts.push(`verified (${removed.toLocaleString()})`);
+    if (removed > 0) parts.push(`non-blue (${removed.toLocaleString()} verified removed)`);
     const blueHint = removed === 0 && before > 0
       ? ` (0/${before.toLocaleString()} flagged verified — open your ${listCfg(type).label.toLowerCase()} tab on X, then filter again)`
       : '';
@@ -4106,6 +4406,7 @@ async function filterList(options = {}) {
       status: `Remove verified: ${working.length.toLocaleString()} remaining (−${removed.toLocaleString()})${blueHint}`
     });
     if (!working.length) return finishEmptyFilter(type);
+    appliedFilters.push('non_blue');
   }
 
   if (removeInactive) {
@@ -4199,6 +4500,7 @@ async function filterList(options = {}) {
         status: `Last post (${inactiveMonths} mo): ${working.length.toLocaleString()} unfollow candidates (−${activeRemoved.toLocaleString()} active)`
       });
       if (!working.length) return finishEmptyFilter(type);
+      appliedFilters.push('inactive');
     }
   }
 
@@ -4315,11 +4617,13 @@ async function filterList(options = {}) {
         status: `Bot check: ${working.length.toLocaleString()} potential bots kept (−${nonBotRemoved.toLocaleString()} non-bot${youFollowHint})`
       });
       if (!working.length) return finishEmptyFilter(type);
+      appliedFilters.push('bot');
     }
   }
 
   setCurList(working, type);
   jobState.filterRemoved = curRaw(type).length - curList(type).length;
+  jobState.appliedFilters = appliedFilters.slice();
   jobState.reason = 'filtered';
   jobState.filterPhase = null;
   jobState.isEnriching = false;
@@ -5458,16 +5762,18 @@ function listFilterWasApplied(type = listType) {
 }
 
 function isExportFiltered(type = listType) {
-  if (!listFilterWasApplied(type)) return false;
-
-  const count = curList(type).length;
-  const profileTotal = totalForType(type);
-  if (profileTotal != null) {
-    return count < profileTotal;
+  if (Array.isArray(jobState.appliedFilters) && jobState.appliedFilters.length > 0) {
+    return true;
   }
+  return listFilterWasApplied(type);
+}
 
-  const rawCount = curRaw(type).length;
-  return rawCount > 0 && count < rawCount;
+function buildExportFilterSuffix(type = listType) {
+  const filters = Array.isArray(jobState.appliedFilters)
+    ? jobState.appliedFilters.filter(Boolean)
+    : [];
+  if (!filters.length) return '';
+  return `_${filters.join('_')}`;
 }
 
 async function exportCSV() {
@@ -5493,8 +5799,8 @@ async function exportCSV() {
   const owner = jobState.username || 'user';
   const cfg = listCfg();
   const date = new Date().toISOString().slice(0, 10);
-  const filteredSuffix = isExportFiltered() ? '_filtered' : '';
-  const filename = `x_${cfg.path}_${owner}_${date}${filteredSuffix}.csv`;
+  const filterSuffix = buildExportFilterSuffix();
+  const filename = `x_${cfg.path}_${owner}_${date}${filterSuffix}.csv`;
   const csvContent = buildCsv(curList());
 
   await executeOnTab(jobTabId, injectedXCleanerApiCall, [{
@@ -5633,6 +5939,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         break;
       case 'exportCSV':
         sendResponse(await exportCSV());
+        break;
+      case 'loadListCsv':
+        sendResponse(await loadListFromCsv(message.listType || listType, message.csvText || '', {
+          mode: message.mode
+        }));
         break;
       case 'setListType':
         sendResponse(await setListType(message.listType));

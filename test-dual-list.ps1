@@ -25,7 +25,7 @@ foreach ($f in $required) {
 
 # Manifest JSON
 $manifest = Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
-Assert 'manifest version 0.85' ($manifest.version -eq '0.85')
+Assert 'manifest version 0.86' ($manifest.version -eq '0.86')
 Assert 'background service worker' ($manifest.background.service_worker -eq 'background.js')
 
 # Action wiring (popup/background/content agree)
@@ -37,7 +37,7 @@ $api = Get-Content (Join-Path $root 'api-fetch.js') -Raw
 Assert 'background handles setListType' ($bg -match "case 'setListType'")
 Assert 'background handles runExportFlow listType' ($bg -match 'message\.listType')
 Assert 'popup sends setListType' ($popup -match "sendBackground\('setListType'")
-Assert 'popup sends listType on start' ($popup -match "runExportFlow', \{ listType \}")
+Assert 'popup sends listType on start' ($popup -match "sendBackground\('runExportFlow',\s*\{[\s\S]*?listType")
 Assert 'content HUD setListType' ($content -match "action: 'setListType'")
 Assert 'api readNativeList generalized' ($api -match 'function readNativeList')
 Assert 'api waitForNativeList generalized' ($api -match 'function waitForNativeList')
@@ -72,6 +72,16 @@ Assert 'background openSubscribe action' ($bg -match "case 'openSubscribe'")
 Assert 'HUD subscribe button' ($content -match 'xcleaner-subscribe')
 Assert 'HUD refresh subscription button' ($content -match 'xcleaner-sub-refresh')
 Assert 'export gated in background' ($bg -match 'subscriptionInfo\.canExport')
+
+# CSV import
+Assert 'background parseImportCsvRows' ($bg -match 'function parseImportCsvRows')
+Assert 'background loadListFromCsv' ($bg -match 'async function loadListFromCsv')
+Assert 'background loadListCsv action' ($bg -match "case 'loadListCsv'")
+Assert 'free import cap uses XC_FREE_FETCH_LIMIT' ($bg -match 'subscriptionInfo\.fetchLimit')
+Assert 'popup load following csv' ($popup -match "sendBackground\('loadListCsv'")
+Assert 'popup import mode replace/append' ($popup -match 'importModeReplace')
+Assert 'HUD load following csv' ($content -match "action: 'loadListCsv'")
+Assert 'HUD import replace/append' ($content -match 'xcleaner-import-replace')
 
 Write-Host ""
 Write-Host "Results: $passed passed, $failed failed"

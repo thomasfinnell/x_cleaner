@@ -340,6 +340,45 @@ function ensureHud() {
       #${HUD_ID} .xc-sub-refresh { background: #536471; color: #fff; }
       #${HUD_ID} .xc-subscribe { background: #1d9bf0; color: #fff; }
       #${HUD_ID} button:disabled { opacity: 0.55; cursor: not-allowed; }
+      #${HUD_ID} .xc-import {
+        margin: 8px 0 0;
+        padding: 8px;
+        border: 1px solid #2f3336;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+      #${HUD_ID} .xc-import-title {
+        font-size: 11px;
+        font-weight: 700;
+        color: #8b98a5;
+        margin-bottom: 6px;
+      }
+      #${HUD_ID} .xc-import label {
+        display: block;
+        font-size: 11px;
+        margin: 3px 0;
+        color: #cfd9de;
+      }
+      #${HUD_ID} .xc-import-actions {
+        display: flex;
+        gap: 6px;
+        margin-top: 6px;
+      }
+      #${HUD_ID} .xc-import-actions button {
+        flex: 1;
+        margin: 0;
+        padding: 7px 6px;
+        font-size: 11px;
+        background: #536471;
+        color: #fff;
+      }
+      #${HUD_ID} .xc-import-hint {
+        margin-top: 6px;
+        font-size: 10px;
+        color: #8b98a5;
+        line-height: 1.35;
+        min-height: 12px;
+      }
     </style>
     <div class="xc-header">
       <div class="xc-title">X Cleaner</div>
@@ -378,7 +417,7 @@ function ensureHud() {
         </span>
         <span>months</span>
       </label>
-      <label title="Followers only: keep potential bots you do not follow. Skips accounts you follow (you_follow from Followers REST, or Following list if fetched). Signals: &lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits.">
+      <label title="Followers only: keep potential bots you do not follow. Skips accounts you follow (you_follow from Followers REST, or Following list if fetched). Signals: &lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits, followers &gt;2× following.">
         <input type="checkbox" id="xcleaner-bot-check"> Bot check
       </label>
       <button class="xc-filter-btn" id="xcleaner-filter" type="button">Filter</button>
@@ -391,6 +430,18 @@ function ensureHud() {
       </div>
     </div>
     <button class="xc-export" id="xcleaner-export" title="Requires @d2fl subscription">Export CSV</button>
+    <div class="xc-import">
+      <div class="xc-import-title">Load CSV</div>
+      <label><input type="radio" name="xc-import-mode" id="xcleaner-import-replace" value="replace" checked> Replace list</label>
+      <label><input type="radio" name="xc-import-mode" id="xcleaner-import-append" value="append"> Append (dedupe)</label>
+      <div class="xc-import-actions">
+        <button type="button" id="xcleaner-load-following">Load Following</button>
+        <button type="button" id="xcleaner-load-followers">Load Followers</button>
+      </div>
+      <input id="xcleaner-import-following-input" type="file" accept=".csv,text/csv" hidden>
+      <input id="xcleaner-import-followers-input" type="file" accept=".csv,text/csv" hidden>
+      <div class="xc-import-hint" id="xcleaner-import-info">X Cleaner export or one handle per line. Free tier: 200 records max.</div>
+    </div>
   `;
 
   document.documentElement.appendChild(hud);
@@ -484,6 +535,62 @@ function ensureHud() {
     if (result?.error) {
       hud.querySelector('#xcleaner-status').textContent = result.error;
     }
+  });
+
+  const selectedHudImportMode = () => (
+    hud.querySelector('#xcleaner-import-replace')?.checked ? 'replace' : 'append'
+  );
+
+  async function handleHudCsvImport(listType, file) {
+    if (!file) return;
+    const statusEl = hud.querySelector('#xcleaner-status');
+    const infoEl = hud.querySelector('#xcleaner-import-info');
+    const loadFollowingBtn = hud.querySelector('#xcleaner-load-following');
+    const loadFollowersBtn = hud.querySelector('#xcleaner-load-followers');
+    loadFollowingBtn.disabled = true;
+    loadFollowersBtn.disabled = true;
+    statusEl.textContent = `Loading ${listLabel(listType).toLowerCase()} CSV...`;
+    try {
+      const csvText = await file.text();
+      const result = await sendToBackground({
+        action: 'loadListCsv',
+        listType,
+        csvText,
+        mode: selectedHudImportMode()
+      });
+      if (result?.ok !== false && (result.ok || result.count > 0)) {
+        updateHud(result);
+        if (infoEl) {
+          infoEl.textContent = result.status || `Loaded ${(result.importLoaded || result.count || 0).toLocaleString()} ${listLabel(listType).toLowerCase()}.`;
+        }
+        return;
+      }
+      statusEl.textContent = result?.error || 'CSV import failed.';
+    } catch (error) {
+      statusEl.textContent = String(error?.message || error || 'CSV import failed.');
+    } finally {
+      loadFollowingBtn.disabled = false;
+      loadFollowersBtn.disabled = false;
+    }
+  }
+
+  hud.querySelector('#xcleaner-load-following')?.addEventListener('click', () => {
+    hud.querySelector('#xcleaner-import-following-input')?.click();
+  });
+  hud.querySelector('#xcleaner-load-followers')?.addEventListener('click', () => {
+    hud.querySelector('#xcleaner-import-followers-input')?.click();
+  });
+  hud.querySelector('#xcleaner-import-following-input')?.addEventListener('change', async () => {
+    const input = hud.querySelector('#xcleaner-import-following-input');
+    const file = input?.files?.[0];
+    if (input) input.value = '';
+    await handleHudCsvImport('following', file);
+  });
+  hud.querySelector('#xcleaner-import-followers-input')?.addEventListener('change', async () => {
+    const input = hud.querySelector('#xcleaner-import-followers-input');
+    const file = input?.files?.[0];
+    if (input) input.value = '';
+    await handleHudCsvImport('followers', file);
   });
 
   return hud;
@@ -656,6 +763,11 @@ function updateHud(state = {}) {
   exportBtn.classList.toggle('export-locked', count > 0 && !canExport);
   exportBtn.title = canExport ? 'Download CSV' : 'Export requires @d2fl subscription';
   filterBtn.disabled = count === 0 || busy || filterBusy;
+  const importBusy = busy || filterBusy;
+  const loadFollowingBtn = hud.querySelector('#xcleaner-load-following');
+  const loadFollowersBtn = hud.querySelector('#xcleaner-load-followers');
+  if (loadFollowingBtn) loadFollowingBtn.disabled = importBusy;
+  if (loadFollowersBtn) loadFollowersBtn.disabled = importBusy;
 
   if (state.error) {
     statusEl.textContent = state.error;
