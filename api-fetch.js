@@ -341,7 +341,7 @@ async function getXSessionCookies() {
   let ct0 = null;
   let authToken = null;
 
-  for (const url of ['https://x.com', 'https://twitter.com']) {
+  for (const url of ['https://x.com']) {
     try {
       const cookies = await chrome.cookies.getAll({ url });
       for (const cookie of cookies) {

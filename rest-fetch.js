@@ -12,21 +12,16 @@ const XC_REST_LOOKUP_DELAY_MS = 350;
 const XC_REST_RATE_LIMIT_BACKOFF_MS = 60000;
 const XC_REST_MAX_PAGES = 500;
 
+const XC_REST_API_ORIGIN = 'https://api.x.com/1.1';
 const XC_REST_LIST_ENDPOINTS = {
-  following: {
-    x: 'https://api.x.com/1.1/friends/list.json',
-    twitter: 'https://api.twitter.com/1.1/friends/list.json'
-  },
-  followers: {
-    x: 'https://api.x.com/1.1/followers/list.json',
-    twitter: 'https://api.twitter.com/1.1/followers/list.json'
-  }
+  following: `${XC_REST_API_ORIGIN}/friends/list.json`,
+  followers: `${XC_REST_API_ORIGIN}/followers/list.json`
 };
 
 async function xcRestCollectAllCookies() {
   const jar = {};
-  const urls = ['https://x.com', 'https://twitter.com', 'https://api.x.com', 'https://api.twitter.com'];
-  const domains = ['.x.com', 'x.com', '.twitter.com', 'twitter.com'];
+  const urls = ['https://x.com', 'https://api.x.com'];
+  const domains = ['.x.com', 'x.com'];
 
   for (const url of urls) {
     try {
@@ -330,14 +325,11 @@ function xcRestMapVerifyCredentials(response) {
 
 async function xcRestVerifyCredentials(options = {}) {
   const query = '?skip_status=true&include_email=false';
-  const urls = [
-    `https://api.x.com/1.1/account/verify_credentials.json${query}`,
-    `https://api.twitter.com/1.1/account/verify_credentials.json${query}`
-  ];
+  const url = `${XC_REST_API_ORIGIN}/account/verify_credentials.json${query}`;
   const attempts = [];
   let lastError = null;
 
-  const tryRequest = async (url, requestOptions = {}) => {
+  const tryRequest = async (requestOptions = {}) => {
     const response = await xcRestMakeApiRequest(url, 'GET', null, {
       ...options,
       ...requestOptions
@@ -345,32 +337,29 @@ async function xcRestVerifyCredentials(options = {}) {
     return xcRestMapVerifyCredentials(response);
   };
 
-  for (const url of urls) {
-    const label = url.includes('twitter.com') ? 'twitter.com' : 'x.com';
-    try {
-      return await tryRequest(url);
-    } catch (error) {
-      attempts.push(`${label}: ${error.message}`);
-      lastError = error;
+  try {
+    return await tryRequest();
+  } catch (error) {
+    attempts.push(`x.com: ${error.message}`);
+    lastError = error;
 
-      if (error.status === 401 && options.tabId) {
+    if (error.status === 401 && options.tabId) {
+      try {
+        await chrome.storage.local.remove(XC_REST_BEARER_STORAGE_KEY);
+      } catch (storageError) {}
+      const freshBearer = await xcRestReadBearerFromTab(options.tabId);
+      if (freshBearer) {
         try {
-          await chrome.storage.local.remove(XC_REST_BEARER_STORAGE_KEY);
-        } catch (storageError) {}
-        const freshBearer = await xcRestReadBearerFromTab(options.tabId);
-        if (freshBearer) {
-          try {
-            return await tryRequest(url, { bearer: freshBearer });
-          } catch (retryError) {
-            attempts.push(`${label} (fresh bearer): ${retryError.message}`);
-            lastError = retryError;
-          }
+          return await tryRequest({ bearer: freshBearer });
+        } catch (retryError) {
+          attempts.push(`x.com (fresh bearer): ${retryError.message}`);
+          lastError = retryError;
         }
       }
     }
   }
 
-  const err = new Error(lastError?.message || 'verify_credentials failed for all API hosts');
+  const err = new Error(lastError?.message || 'verify_credentials failed');
   err.status = lastError?.status;
   err.attempts = attempts;
   err.attemptSummary = attempts.join(' | ');
@@ -437,16 +426,7 @@ function injectedRestUsersLookup(request) {
 
   const ct0Match = cookieHeader.match(/(?:^|;\s*)ct0=([^;]+)/);
   const ct0 = ct0Match ? decodeURIComponent(ct0Match[1]) : '';
-  let endpoints = [
-    'https://api.twitter.com/1.1/users/lookup.json',
-    'https://api.x.com/1.1/users/lookup.json'
-  ];
-
-  if (request.preferredTabHost === 'x.com') {
-    endpoints = endpoints.slice().sort((a) => (a.includes('api.x.com') ? -1 : 1));
-  } else if (request.preferredTabHost === 'twitter.com') {
-    endpoints = endpoints.slice().sort((a) => (a.includes('api.twitter.com') ? -1 : 1));
-  }
+  const endpoints = [`${XC_REST_API_ORIGIN}/users/lookup.json`];
 
   const query = new URLSearchParams({
     screen_name: handles.join(','),
@@ -466,7 +446,7 @@ function injectedRestUsersLookup(request) {
   const attempts = [];
 
   const fetchOne = async (base) => {
-    const label = base.includes('twitter.com') ? 'tab@twitter.com' : 'tab@x.com';
+    const label = 'tab@x.com';
     const resp = await fetch(`${base}?${query.toString()}`, {
       method: 'GET',
       headers,
@@ -502,7 +482,7 @@ function injectedRestUsersLookup(request) {
           };
         }
       } catch (error) {
-        attempts.push(`${base.includes('twitter.com') ? 'tab@twitter.com' : 'tab@x.com'}: ${error.message}`);
+        attempts.push(`tab@x.com: ${error.message}`);
       }
     }
     return {
@@ -618,47 +598,39 @@ async function xcRestUsersLookupBatch(screenNames, options = {}) {
     screen_name: handles.join(','),
     include_entities: 'false'
   });
-  const urls = [
-    `https://api.twitter.com/1.1/users/lookup.json?${query.toString()}`,
-    `https://api.x.com/1.1/users/lookup.json?${query.toString()}`
-  ];
+  const url = `${XC_REST_API_ORIGIN}/users/lookup.json?${query.toString()}`;
+  const label = 'worker@x.com';
 
-  let lastError = null;
-  for (const url of urls) {
-    const label = url.includes('twitter.com') ? 'worker@twitter.com' : 'worker@x.com';
-    try {
-      const body = await xcRestMakeApiRequest(url, 'GET', null, options);
-      const listType = options.listType || 'followers';
-      const parsed = xcRestParseUsersLookupFields(body, listType);
-      attempts.push({
-        strategy: label,
-        users: handles.length,
-        matched: Object.keys(parsed.lastActive).length,
-        blueMatched: Object.keys(parsed.blueByName).length,
-        profileMatched: Object.keys(parsed.profilesByName).length
-      });
-      return {
-        ok: true,
-        lastActive: parsed.lastActive,
-        blueByName: parsed.blueByName,
-        profilesByName: parsed.profilesByName,
-        attempts,
-        strategy: label
-      };
-    } catch (error) {
-      attempts.push(`${label}: ${error.message}`);
-      lastError = error;
-      if (error.status === 429) {
-        error.attempts = attempts;
-        throw error;
-      }
+  try {
+    const body = await xcRestMakeApiRequest(url, 'GET', null, options);
+    const listType = options.listType || 'followers';
+    const parsed = xcRestParseUsersLookupFields(body, listType);
+    attempts.push({
+      strategy: label,
+      users: handles.length,
+      matched: Object.keys(parsed.lastActive).length,
+      blueMatched: Object.keys(parsed.blueByName).length,
+      profileMatched: Object.keys(parsed.profilesByName).length
+    });
+    return {
+      ok: true,
+      lastActive: parsed.lastActive,
+      blueByName: parsed.blueByName,
+      profilesByName: parsed.profilesByName,
+      attempts,
+      strategy: label
+    };
+  } catch (error) {
+    attempts.push(`${label}: ${error.message}`);
+    if (error.status === 429) {
+      error.attempts = attempts;
+      throw error;
     }
+    const err = new Error(error.message || 'users/lookup failed');
+    err.status = error.status;
+    err.attempts = attempts;
+    throw err;
   }
-
-  const err = new Error(lastError?.message || 'users/lookup failed for all API hosts');
-  err.status = lastError?.status;
-  err.attempts = attempts;
-  throw err;
 }
 
 async function xcRestUsersShow(screenName, options = {}) {
@@ -668,14 +640,11 @@ async function xcRestUsersShow(screenName, options = {}) {
   }
 
   const query = `?screen_name=${encodeURIComponent(handle)}&skip_status=true`;
-  const urls = [
-    `https://api.twitter.com/1.1/users/show.json${query}`,
-    `https://api.x.com/1.1/users/show.json${query}`
-  ];
+  const url = `${XC_REST_API_ORIGIN}/users/show.json${query}`;
   const attempts = [];
   let lastError = null;
 
-  const tryRequest = async (url, requestOptions = {}) => {
+  const tryRequest = async (requestOptions = {}) => {
     const response = await xcRestMakeApiRequest(url, 'GET', null, {
       ...options,
       ...requestOptions
@@ -683,45 +652,41 @@ async function xcRestUsersShow(screenName, options = {}) {
     return xcRestMapUsersShow(response);
   };
 
-  for (const url of urls) {
-    const label = url.includes('twitter.com') ? 'twitter.com' : 'x.com';
-    try {
-      return await tryRequest(url);
-    } catch (error) {
-      attempts.push(`${label}: ${error.message}`);
-      lastError = error;
+  try {
+    return await tryRequest();
+  } catch (error) {
+    attempts.push(`x.com: ${error.message}`);
+    lastError = error;
 
-      if (error.status === 401 && options.tabId) {
+    if (error.status === 401 && options.tabId) {
+      try {
+        await chrome.storage.local.remove(XC_REST_BEARER_STORAGE_KEY);
+      } catch (storageError) {}
+      const freshBearer = await xcRestReadBearerFromTab(options.tabId);
+      if (freshBearer) {
         try {
-          await chrome.storage.local.remove(XC_REST_BEARER_STORAGE_KEY);
-        } catch (storageError) {}
-        const freshBearer = await xcRestReadBearerFromTab(options.tabId);
-        if (freshBearer) {
-          try {
-            return await tryRequest(url, { bearer: freshBearer });
-          } catch (retryError) {
-            attempts.push(`${label} (fresh bearer): ${retryError.message}`);
-            lastError = retryError;
-          }
+          return await tryRequest({ bearer: freshBearer });
+        } catch (retryError) {
+          attempts.push(`x.com (fresh bearer): ${retryError.message}`);
+          lastError = retryError;
         }
       }
     }
   }
 
-  const err = new Error(lastError?.message || 'users/show failed for all API hosts');
+  const err = new Error(lastError?.message || 'users/show failed');
   err.status = lastError?.status;
   err.attempts = attempts;
   err.attemptSummary = attempts.join(' | ');
   throw err;
 }
 
-function xcRestListBaseUrl(listType, useTwitterDomain = false) {
-  const endpoints = XC_REST_LIST_ENDPOINTS[listType] || XC_REST_LIST_ENDPOINTS.following;
-  return useTwitterDomain ? endpoints.twitter : endpoints.x;
+function xcRestListBaseUrl(listType) {
+  return XC_REST_LIST_ENDPOINTS[listType] || XC_REST_LIST_ENDPOINTS.following;
 }
 
-function xcRestBuildListUrl(listType, params, useTwitterDomain = false) {
-  const baseUrl = xcRestListBaseUrl(listType, useTwitterDomain);
+function xcRestBuildListUrl(listType, params) {
+  const baseUrl = xcRestListBaseUrl(listType);
   const query = new URLSearchParams();
   query.set('count', String(params.count || XC_REST_PAGE_SIZE));
   query.set('cursor', String(params.cursor ?? '-1'));
@@ -808,21 +773,7 @@ function injectedRestListFetch(request) {
 
   const ct0Match = cookieHeader.match(/(?:^|;\s*)ct0=([^;]+)/);
   const ct0 = ct0Match ? decodeURIComponent(ct0Match[1]) : '';
-  let endpoints = listType === 'followers'
-    ? [
-      'https://api.twitter.com/1.1/followers/list.json',
-      'https://api.x.com/1.1/followers/list.json'
-    ]
-    : [
-      'https://api.twitter.com/1.1/friends/list.json',
-      'https://api.x.com/1.1/friends/list.json'
-    ];
-
-  if (request.preferredTabHost === 'x.com') {
-    endpoints = endpoints.slice().sort((a) => (a.includes('api.x.com') ? -1 : 1));
-  } else if (request.preferredTabHost === 'twitter.com') {
-    endpoints = endpoints.slice().sort((a) => (a.includes('api.twitter.com') ? -1 : 1));
-  }
+  const endpoints = [XC_REST_LIST_ENDPOINTS[listType] || XC_REST_LIST_ENDPOINTS.following];
 
   const query = new URLSearchParams({
     count: String(count),
@@ -848,7 +799,7 @@ function injectedRestListFetch(request) {
   const attempts = [];
 
   const fetchOne = async (base) => {
-    const label = base.includes('twitter.com') ? 'tab@twitter.com' : 'tab@x.com';
+    const label = 'tab@x.com';
     const resp = await fetch(`${base}?${query.toString()}`, {
       method: 'GET',
       headers,
@@ -881,7 +832,7 @@ function injectedRestListFetch(request) {
           };
         }
       } catch (error) {
-        attempts.push(`${base.includes('twitter.com') ? 'tab@twitter.com' : 'tab@x.com'}: ${error.message}`);
+        attempts.push(`tab@x.com: ${error.message}`);
       }
     }
     return {
@@ -959,7 +910,7 @@ async function xcRestFetchListPageFromTab(tabId, params, options = {}) {
 }
 
 async function xcRestFetchListPageOnce(params, options = {}) {
-  const url = xcRestBuildListUrl(params.listType, params, !!params.useTwitterDomain);
+  const url = xcRestBuildListUrl(params.listType, params);
   const body = await xcRestMakeApiRequest(url, 'GET', null, options);
   const parsed = xcRestParseListResponse(body, params.listType);
   return {
@@ -971,9 +922,7 @@ async function xcRestFetchListPageOnce(params, options = {}) {
 
 function xcRestPinnedTabHost(pinnedStrategy) {
   if (!pinnedStrategy || !String(pinnedStrategy).startsWith('tab@')) return null;
-  if (pinnedStrategy.includes('twitter.com')) return 'twitter.com';
-  if (pinnedStrategy.includes('x.com')) return 'x.com';
-  return null;
+  return 'x.com';
 }
 
 async function xcRestFetchListPage(screenName, listType, cursor = '-1', options = {}) {
@@ -1033,34 +982,23 @@ async function xcRestFetchListPage(screenName, listType, cursor = '-1', options 
     bearer: options.bearer || (await xcRestResolveBearer(tabId, { requireCaptured: true }))
   };
 
-  // api.x.com often 404s v1.1 account endpoints — prefer api.twitter.com first.
-  const domains = options.useTwitterDomainOnly || options.useTwitterDomain
-    ? [true]
-    : options.skipTwitterDomain
-      ? [false]
-      : [true, false];
-
-  for (const useTwitterDomain of domains) {
-    if (screenName) {
-      strategies.push({
-        strategy: useTwitterDomain ? 'screen_name@twitter.com' : 'screen_name@x.com',
-        listType,
-        screenName,
-        cursor,
-        count: pageSize,
-        useTwitterDomain
-      });
-    }
-    if (userId) {
-      strategies.push({
-        strategy: useTwitterDomain ? 'user_id@twitter.com' : 'user_id@x.com',
-        listType,
-        userId,
-        cursor,
-        count: pageSize,
-        useTwitterDomain
-      });
-    }
+  if (screenName) {
+    strategies.push({
+      strategy: 'screen_name@x.com',
+      listType,
+      screenName,
+      cursor,
+      count: pageSize
+    });
+  }
+  if (userId) {
+    strategies.push({
+      strategy: 'user_id@x.com',
+      listType,
+      userId,
+      cursor,
+      count: pageSize
+    });
   }
 
   let lastEmpty = null;

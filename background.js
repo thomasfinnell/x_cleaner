@@ -46,6 +46,8 @@ const MIN_FILTER_MONTHS = 1;
 const MAX_FILTER_MONTHS = 24;
 const ENRICH_BATCH_SIZE = XC_REST_LOOKUP_BATCH_SIZE;
 const ENRICH_BATCH_DELAY_MS = XC_REST_LOOKUP_DELAY_MS;
+const ENRICH_RATE_LIMIT_MAX_RETRIES = 8;
+const ENRICH_BEARER_WAIT_MS = 12000;
 const SNIFFER_ENRICH_PASSES = 4;
 const SNIFFER_ENRICH_SCROLL = 1100;
 const SNIFFER_ENRICH_DELAY_MS = 450;
@@ -71,7 +73,7 @@ const XC_PRE_LIST_FETCH_SETTLE_MS = 1500;
 const XC_POST_SNIFFER_SETTLE_MS = 800;
 
 // Set false to hide the scrollable status log in the HUD/popup.
-const XC_DEBUG_STATUS_LOG = true;
+const XC_DEBUG_STATUS_LOG = false;
 const XC_DEBUG_STATUS_LOG_MAX_LINES = 50;
 const XC_DEBUG_STATUS_LOG_STORAGE_KEY = 'xc_debug_status_log';
 
@@ -81,6 +83,7 @@ const restoredTypes = { following: false, followers: false };
 let restorePromise = null;
 const persistDebounceTimers = { following: null, followers: null };
 const lastPersistedCounts = { following: 0, followers: 0 };
+const persistGuard = { following: 0, followers: 0 };
 let enrichArchiveStore = null;
 let enrichArchiveSaveTimer = null;
 const freshStartBackupTypes = new Set();
@@ -89,6 +92,47 @@ let gentleScrollStepCount = 0;
 
 function listCfg(type = listType) {
   return LIST_CONFIG[type] || LIST_CONFIG.following;
+}
+
+function normalizeAccountHandle(username) {
+  return String(username || '').toLowerCase().replace(/^@+/, '').trim();
+}
+
+function persistStorageKey(type, username) {
+  const cfg = listCfg(type);
+  const handle = normalizeAccountHandle(username);
+  if (!handle) return cfg.persistKey;
+  return `${cfg.persistKey}@${handle}`;
+}
+
+async function readPersistData(type, username) {
+  const cfg = listCfg(type);
+  const handle = normalizeAccountHandle(username || jobState.username);
+  const accountKey = handle ? persistStorageKey(type, handle) : null;
+  const keys = accountKey ? [accountKey, cfg.persistKey] : [cfg.persistKey];
+  const res = await chrome.storage.local.get(keys);
+
+  if (accountKey && res[accountKey]) {
+    return { data: res[accountKey], key: accountKey };
+  }
+
+  const legacy = res[cfg.persistKey];
+  if (!legacy) return { data: null, key: null };
+
+  const savedUser = normalizeAccountHandle(legacy.jobState?.username);
+  if (handle && savedUser && savedUser !== handle) {
+    return { data: null, key: null };
+  }
+
+  if (handle && savedUser === handle && accountKey) {
+    try {
+      await chrome.storage.local.set({ [accountKey]: legacy });
+      await chrome.storage.local.remove(cfg.persistKey);
+    } catch (error) {}
+    return { data: legacy, key: accountKey };
+  }
+
+  return { data: legacy, key: cfg.persistKey };
 }
 
 function curList(type = listType) {
@@ -162,7 +206,7 @@ async function sniffCreatorSubscriptions(tabId, options = {}) {
 }
 
 function isXTabUrl(url) {
-  return /^https:\/\/(x\.com|twitter\.com)\//.test(url || '');
+  return /^https:\/\/x\.com\//.test(url || '');
 }
 
 async function resolveActiveUsername(explicitHandle) {
@@ -338,8 +382,12 @@ async function sleepAfterScrollStep(type = listType, context = 'tail') {
   return scrollJitterMs(type === 'followers' ? 14000 : 11000, 0.35);
 }
 
-async function maybeGentleDwellPause() {
+async function maybeGentleDwellPause(type = listType) {
   if (fastScrollEnabled) return;
+  const cfg = listCfg(type);
+  const totalList = jobState[cfg.totalKey] ?? null;
+  const gap = totalList != null ? totalList - curList(type).length : null;
+  if (gap != null && gap > 0 && gap <= 15) return;
   if (gentleScrollStepCount % 10 !== 0) return;
   const dwellMs = XC_GENTLE_DWELL_BASE_MS
     + Math.floor(Math.random() * (XC_GENTLE_DWELL_JITTER_MS * 2 + 1))
@@ -370,12 +418,18 @@ async function scrollListStep(tabId) {
     passes: gentleScrollStepCount,
     status: `Gentle scroll #${gentleScrollStepCount}: ${scrollResult?.pattern || 'unknown'}${regionNote}${movedNote}`
   });
-  await maybeGentleDwellPause();
+  await maybeGentleDwellPause(listType);
 }
 
-async function scrollListToLoad(tabId) {
-  if (fastScrollEnabled) {
+async function scrollListToLoad(tabId, options = {}) {
+  const gap = options.gap ?? null;
+  const aggressive = !!options.aggressive || (gap != null && gap > 0 && gap <= 25);
+  if (fastScrollEnabled || aggressive) {
     await executeOnTab(tabId, injectedScrollListToLoad);
+    if (!fastScrollEnabled && aggressive) {
+      await sleep(scrollJitterMs(1800, 0.25));
+      await executeOnTab(tabId, injectedScrollListToLoad);
+    }
     return;
   }
   for (let i = 0; i < 2; i += 1) {
@@ -397,7 +451,82 @@ async function pacedNudgeTabScroll(tabId, amount = 900) {
   await gentleScrollStepFromTab(tabId, gentleScrollStepCount);
   gentleScrollStepCount += 1;
   await sleep(await sleepAfterScrollStep(listType, 'nudge'));
-  await maybeGentleDwellPause();
+  await maybeGentleDwellPause(listType);
+}
+
+async function ensureProfileUserId(tabId, profile) {
+  if (profile?.userId) return profile.userId;
+  try {
+    const catalog = await prefetchQueryCatalog(false);
+    profile.userId = await resolveUserIdFromScreenName(profile.username, catalog, tabId);
+  } catch (error) {}
+  return profile?.userId || null;
+}
+
+async function observeRecoverShortfall(tabId, profile, type, seen, totalList) {
+  const cfg = listCfg(type);
+  let gap = totalList != null ? totalList - curList(type).length : null;
+  if (!gap || gap <= 0 || gap > 25) return 0;
+
+  let totalAdded = 0;
+  const noteProgress = (status, method = 'observe') => {
+    appendDebugStatusLog({ reason: 'collecting', method, status });
+    notifyProgress({ reason: 'collecting', method, status });
+  };
+
+  noteProgress(
+    `Observe tail recovery — ${gap.toLocaleString()} short (sniffer cursors + scroll, no REST bulk)...`
+  );
+
+  await ensureProfileUserId(tabId, profile);
+  await scrollListToTop(tabId);
+  await sleep(scrollJitterMs(fastScrollEnabled ? 800 : 2500, 0.2));
+  await scrollListToLoad(tabId, { gap, aggressive: true });
+  await sleep(scrollJitterMs(fastScrollEnabled ? 1200 : 3000, 0.2));
+
+  try {
+    const drained = await readNativeListQueueDrainFromTab(tabId, cfg.opName);
+    if (drained?.users?.length) {
+      const queueAdded = addNativeUsers({ users: drained.users }, seen, profile.username, type);
+      totalAdded += queueAdded;
+      trimListToFetchLimit(type);
+      if (queueAdded > 0) {
+        noteProgress(
+          `Observe queue drain — ${curList(type).length.toLocaleString()} / ${totalList.toLocaleString()} (+${queueAdded})`,
+          'native-sniffer'
+        );
+      }
+    }
+  } catch (error) {}
+
+  totalAdded += await fetchListTailGap(tabId, profile, type, seen, totalList);
+
+  gap = totalList != null ? totalList - curList(type).length : null;
+  if (gap > 0 && gap <= 20 && listFetchNeedsMore(type, totalList) && profile.userId) {
+    noteProgress(`Observe tail — GraphQL continuation (${gap.toLocaleString()} short)...`, 'graphql');
+    totalAdded += await continueListFetchWithGraphql(
+      tabId,
+      profile,
+      type,
+      seen,
+      effectiveFetchTarget(totalList),
+      totalList
+    );
+  }
+
+  gap = totalList != null ? totalList - curList(type).length : null;
+  if (gap > 0 && gap <= 15 && listFetchNeedsMore(type, totalList)) {
+    noteProgress(`Observe tail — REST cursor recovery (${gap.toLocaleString()} short)...`, 'observe');
+    totalAdded += await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList);
+  }
+
+  gap = totalList != null ? totalList - curList(type).length : null;
+  if (gap > 0 && gap <= 10 && listFetchNeedsMore(type, totalList)) {
+    noteProgress(`Observe tail — targeted REST lookup (${gap.toLocaleString()} short, not bulk)...`, 'observe');
+    totalAdded += await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+  }
+
+  return totalAdded;
 }
 
 function fetchModeLabel(mode) {
@@ -772,6 +901,27 @@ function finalizeFreshStartBackup(type = listType) {
   return remaining;
 }
 
+function finalizeFreshStartForStop() {
+  for (const type of [...freshStartBackupTypes]) {
+    finalizeFreshStartBackup(type);
+  }
+}
+
+async function persistFreshStartStopState() {
+  finalizeFreshStartForStop();
+  const type = listType;
+  if (!curList(type).length && !curRaw(type).length) {
+    await clearListPersist(type);
+    if (type === listType) {
+      jobState.count = 0;
+      jobState.rawCount = 0;
+      jobState.savedAt = null;
+    }
+    return;
+  }
+  await persistListState(type);
+}
+
 function applyArchivedEnrichmentToList(type) {
   return hydrateListFromStoredEnrichment(type);
 }
@@ -904,8 +1054,10 @@ async function enrichSparseProfilesViaLookup(tabId, users, type, onProgress) {
     await xcRestPrepareSession(tabId);
   }
 
+  let rateLimitRetries = 0;
   for (let i = 0; i < needsLookup.length; i += ENRICH_BATCH_SIZE) {
     if (activeEnrich?.cancelled) break;
+    throwIfCancelled();
 
     const batch = needsLookup.slice(i, i + ENRICH_BATCH_SIZE);
     const handles = batch
@@ -920,7 +1072,9 @@ async function enrichSparseProfilesViaLookup(tabId, users, type, onProgress) {
         tabRetries: 2,
         requireCaptured: true
       });
+      throwIfCancelled();
 
+      rateLimitRetries = 0;
       if (res?.ok && res.profilesByName) {
         for (const user of batch) {
           const key = (user.username || '').toLowerCase();
@@ -934,8 +1088,18 @@ async function enrichSparseProfilesViaLookup(tabId, users, type, onProgress) {
         }
       }
     } catch (error) {
+      if (isCancelledError(error)) throw error;
       console.warn('[X Cleaner] REST profile lookup batch failed', error);
       if (error.status === 429) {
+        rateLimitRetries += 1;
+        if (rateLimitRetries > ENRICH_RATE_LIMIT_MAX_RETRIES) {
+          appendDebugStatusLog({
+            status: `Profile lookup rate limited — stopped after ${processed.toLocaleString()} / ${total.toLocaleString()} checked`,
+            method: jobState.method || 'filter',
+            reason: 'enriching'
+          });
+          break;
+        }
         if (onProgress) onProgress({ processed, total, waiting: true });
         await sleep(XC_REST_RATE_LIMIT_BACKOFF_MS);
         if (activeEnrich?.cancelled) break;
@@ -1421,14 +1585,19 @@ function countLastActiveLookupNeeded(users, cache, now = Date.now(), type = list
   return needed;
 }
 
-async function enrichLastActiveForUsers(tabId, users, onProgress) {
+async function enrichLastActiveForUsers(tabId, users, type = listType, onProgress) {
+  if (typeof type === 'function') {
+    onProgress = type;
+    type = listType;
+  }
+
   const cache = await loadActivityCache();
   const now = Date.now();
   const enriched = users.map((user) => ({ ...user }));
 
   const needsLookup = [];
   for (const user of enriched) {
-    if (hydrateLastActiveFromStoredSources(user, listType, cache, now)) continue;
+    if (hydrateLastActiveFromStoredSources(user, type, cache, now)) continue;
     needsLookup.push(user);
   }
 
@@ -1437,11 +1606,14 @@ async function enrichLastActiveForUsers(tabId, users, onProgress) {
   if (onProgress) onProgress({ processed, total, fromCache: needsLookup.length === 0 });
 
   if (tabId && needsLookup.length > 0) {
+    await xcRestWaitForBearer(tabId, { maxMs: ENRICH_BEARER_WAIT_MS });
     await xcRestPrepareSession(tabId);
   }
 
+  let rateLimitRetries = 0;
   for (let i = 0; i < needsLookup.length; i += ENRICH_BATCH_SIZE) {
     if (activeEnrich?.cancelled) break;
+    throwIfCancelled();
 
     const batch = needsLookup.slice(i, i + ENRICH_BATCH_SIZE);
     const handles = batch
@@ -1451,11 +1623,14 @@ async function enrichLastActiveForUsers(tabId, users, onProgress) {
     try {
       const res = await xcRestUsersLookupBatch(handles, {
         tabId,
+        listType: type,
         preferTabContext: true,
         tabRetries: 2,
         requireCaptured: true
       });
+      throwIfCancelled();
 
+      rateLimitRetries = 0;
       if (res?.ok && res.lastActive) {
         for (const [sn, ts] of Object.entries(res.lastActive)) {
           cache[sn] = { last_active_ms: ts, fetched_at: now };
@@ -1468,13 +1643,23 @@ async function enrichLastActiveForUsers(tabId, users, onProgress) {
         }
         for (const [sn, isBlue] of Object.entries(res.blueByName)) {
           if (!isBlue) continue;
-          const rawRow = findRawUserByHandle(listType, sn);
+          const rawRow = findRawUserByHandle(type, sn);
           if (rawRow) rawRow.is_blue = true;
         }
       }
     } catch (error) {
+      if (isCancelledError(error)) throw error;
       console.warn('[X Cleaner] REST users/lookup batch failed', error);
       if (error.status === 429) {
+        rateLimitRetries += 1;
+        if (rateLimitRetries > ENRICH_RATE_LIMIT_MAX_RETRIES) {
+          appendDebugStatusLog({
+            status: `Last-tweet lookup rate limited — stopped after ${processed.toLocaleString()} / ${total.toLocaleString()} checked`,
+            method: jobState.method || 'filter',
+            reason: 'enriching'
+          });
+          break;
+        }
         if (onProgress) onProgress({ processed, total, waiting: true });
         await sleep(XC_REST_RATE_LIMIT_BACKOFF_MS);
         if (activeEnrich?.cancelled) break;
@@ -1562,10 +1747,17 @@ function serializeJobStateForPersist(type = listType) {
 }
 
 async function persistListState(type = listType) {
+  const guardAtStart = persistGuard[type];
   const cfg = listCfg(type);
   const fullList = fullListForType(type);
+  const storageKey = persistStorageKey(type, jobState.username);
+
   if (!fullList.length) {
-    await chrome.storage.local.remove(cfg.persistKey);
+    if (guardAtStart !== persistGuard[type]) return;
+    await chrome.storage.local.remove(storageKey);
+    if (storageKey !== cfg.persistKey) {
+      await chrome.storage.local.remove(cfg.persistKey);
+    }
     return;
   }
 
@@ -1577,13 +1769,18 @@ async function persistListState(type = listType) {
     accountListRaw: fullList,
     jobState: {
       ...serializeJobStateForPersist(type),
+      username: jobState.username || null,
       count: curList(type).length,
       rawCount: fullList.length
     }
   };
 
   try {
-    await chrome.storage.local.set({ [cfg.persistKey]: payload });
+    if (guardAtStart !== persistGuard[type]) return;
+    await chrome.storage.local.set({ [storageKey]: payload });
+    if (storageKey !== cfg.persistKey) {
+      await chrome.storage.local.remove(cfg.persistKey);
+    }
     lastPersistedCounts[type] = fullList.length;
     if (type === listType) {
       jobState.savedAt = payload.savedAt;
@@ -1622,6 +1819,8 @@ function schedulePersist(force = false, type = listType) {
 
 async function clearListPersist(type = listType) {
   const cfg = listCfg(type);
+  const storageKey = persistStorageKey(type, jobState.username);
+  persistGuard[type] += 1;
   clearTimeout(persistDebounceTimers[type]);
   persistDebounceTimers[type] = null;
   lastPersistedCounts[type] = 0;
@@ -1629,11 +1828,14 @@ async function clearListPersist(type = listType) {
   if (type === listType) {
     jobState.savedAt = null;
   }
-  await chrome.storage.local.remove(cfg.persistKey);
+  await chrome.storage.local.remove(storageKey);
+  if (storageKey !== cfg.persistKey) {
+    await chrome.storage.local.remove(cfg.persistKey);
+  }
 }
 
-async function purgePersistForOtherUsers(activeUsername) {
-  const activeUser = (activeUsername || '').toLowerCase().replace(/^@+/, '');
+async function cleanupLegacyGlobalPersist(activeUsername) {
+  const activeUser = normalizeAccountHandle(activeUsername);
   if (!activeUser) return;
 
   await purgeEnrichArchiveForOtherUsers(activeUser);
@@ -1642,10 +1844,21 @@ async function purgePersistForOtherUsers(activeUsername) {
     const cfg = listCfg(type);
     const res = await chrome.storage.local.get(cfg.persistKey);
     const data = res[cfg.persistKey];
-    const savedUser = (data?.jobState?.username || '').toLowerCase().replace(/^@+/, '');
+    if (!data) continue;
+
+    const savedUser = normalizeAccountHandle(data?.jobState?.username);
+    if (savedUser === activeUser) {
+      const accountKey = persistStorageKey(type, activeUser);
+      try {
+        await chrome.storage.local.set({ [accountKey]: data });
+        await chrome.storage.local.remove(cfg.persistKey);
+      } catch (error) {}
+      continue;
+    }
+
     if (savedUser && savedUser !== activeUser) {
       await chrome.storage.local.remove(cfg.persistKey);
-      console.log(`[X Cleaner] Removed cached ${cfg.label.toLowerCase()} for @${savedUser} (active @${activeUser})`);
+      console.log(`[X Cleaner] Removed legacy cached ${cfg.label.toLowerCase()} for @${savedUser} (active @${activeUser})`);
     }
   }
 }
@@ -1663,7 +1876,6 @@ function clearInMemoryLists() {
 
 async function applyAccountSwitch(detected) {
   clearInMemoryLists();
-  await purgePersistForOtherUsers(detected);
   jobState = {
     ...jobState,
     username: detected,
@@ -1675,7 +1887,8 @@ async function applyAccountSwitch(detected) {
     reason: null,
     filterRemoved: 0,
     appliedFilters: [],
-    status: null
+    status: null,
+    debugStatusLog: []
   };
   await restoreAllListState();
 }
@@ -1684,8 +1897,8 @@ async function alignAccountForJob(detected) {
   const next = String(detected || '').replace(/^@+/, '');
   if (!next) return;
 
-  const prev = (jobState.username || '').toLowerCase();
-  const nextLower = next.toLowerCase();
+  const prev = normalizeAccountHandle(jobState.username);
+  const nextLower = normalizeAccountHandle(next);
 
   if (prev && prev !== nextLower) {
     await applyAccountSwitch(next);
@@ -1693,7 +1906,7 @@ async function alignAccountForJob(detected) {
   }
 
   jobState.username = next;
-  await purgePersistForOtherUsers(next);
+  await cleanupLegacyGlobalPersist(next);
   if (!curList('following').length && !curList('followers').length) {
     await restoreAllListState();
   }
@@ -1701,19 +1914,20 @@ async function alignAccountForJob(detected) {
 
 async function restoreListState(type, options = {}) {
   if (curList(type).length || activeFetch?.running) return false;
+  if (freshStartBackupTypes.has(type)) return false;
 
   const cfg = listCfg(type);
 
   try {
-    const res = await chrome.storage.local.get(cfg.persistKey);
-    const data = res[cfg.persistKey];
+    const activeUser = normalizeAccountHandle(options.username || jobState.username);
+    const { data } = await readPersistData(type, activeUser);
+    if (!data) return false;
+
     const raw = data.accountListRaw || data.followingListRaw || data?.accountList || data?.followingList;
     if (!raw?.length) return false;
 
-    const activeUser = (options.username || jobState.username || '').toLowerCase().replace(/^@+/, '');
-    const savedUser = (data.jobState?.username || '').toLowerCase().replace(/^@+/, '');
+    const savedUser = normalizeAccountHandle(data.jobState?.username);
     if (activeUser && savedUser && activeUser !== savedUser) {
-      await chrome.storage.local.remove(cfg.persistKey);
       return false;
     }
     if (!jobState.username && savedUser) {
@@ -1785,6 +1999,9 @@ async function setListType(nextType) {
     return { ok: false, error: 'Wait until collection finishes before switching lists.' };
   }
 
+  if (!jobState.isScraping && !activeFetch?.running) {
+    await syncActiveAccountFromTab({ refreshSub: false });
+  }
   await ensureRestored();
   listType = nextType;
   jobState.listType = nextType;
@@ -1792,13 +2009,14 @@ async function setListType(nextType) {
     jobState.isScraping = false;
     jobState.isEnriching = false;
   }
-  await restoreListState(nextType);
-  jobState.count = curList().length;
-  jobState.rawCount = curRaw().length || curList().length;
+  if (!curList(nextType).length) {
+    await restoreListState(nextType);
+  }
+  jobState.count = curList(nextType).length;
+  jobState.rawCount = curRaw(nextType).length || curList(nextType).length;
 
   const cfg = listCfg();
-  const savedRes = await chrome.storage.local.get(cfg.persistKey);
-  const saved = savedRes[cfg.persistKey];
+  const { data: saved } = await readPersistData(nextType, jobState.username);
   if (saved?.savedAt) {
     jobState.savedAt = saved.savedAt;
     if (saved.jobState) {
@@ -1957,8 +2175,13 @@ function mapListPreviewRow(user) {
 
 async function getListPreview(requestedType = listType) {
   const type = LIST_CONFIG[requestedType] ? requestedType : listType;
+  if (!jobState.isScraping && !activeFetch?.running) {
+    await syncActiveAccountFromTab({ refreshSub: false });
+  }
   await ensureRestored();
-  await restoreListState(type);
+  if (!curList(type).length) {
+    await restoreListState(type);
+  }
   const cfg = listCfg(type);
   const users = curList(type).slice(0, 5);
   return {
@@ -2295,16 +2518,18 @@ async function sendHudMessage(tabId, payload, retries = 1) {
 async function ensureContentScriptReady(tabId) {
   if (!tabId) return false;
 
-  for (let attempt = 0; attempt < 10; attempt += 1) {
+  let injected = false;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
     try {
       const response = await chrome.tabs.sendMessage(tabId, { action: 'ping' });
       if (response?.ok) return true;
     } catch (error) {
-      if (attempt === 2 || attempt === 5) {
+      if (!injected && attempt >= 9) {
+        injected = true;
         try {
           await chrome.scripting.executeScript({
             target: { tabId },
-            files: ['content.js']
+            files: ['list-preview.js', 'content.js']
           });
         } catch (injectError) {}
       }
@@ -2412,6 +2637,25 @@ function formatDebugStatusLine(state = {}) {
   return line ? `[${ts}] ${line}` : null;
 }
 
+function snapshotDebugStatusLog() {
+  if (!XC_DEBUG_STATUS_LOG) return [];
+  return Array.isArray(jobState.debugStatusLog)
+    ? jobState.debugStatusLog.slice(-XC_DEBUG_STATUS_LOG_MAX_LINES)
+    : [];
+}
+
+function assignJobState(next = {}, options = {}) {
+  const preserveLog = options.preserveLog !== false;
+  const prevLog = preserveLog ? snapshotDebugStatusLog() : [];
+  const nextLog = Array.isArray(next.debugStatusLog) ? next.debugStatusLog : null;
+  jobState = {
+    ...next,
+    debugStatusLog: nextLog?.length
+      ? nextLog.slice(-XC_DEBUG_STATUS_LOG_MAX_LINES)
+      : prevLog
+  };
+}
+
 function resetDebugStatusLog(initialEntry = null) {
   if (!XC_DEBUG_STATUS_LOG) {
     jobState.debugStatusLog = [];
@@ -2506,6 +2750,7 @@ function notifyProgress(extra = {}) {
       following: listStore.following.list.length,
       followers: listStore.followers.list.length
     },
+    listStats: buildListStats(),
     mutuals: computeMutuals(),
     ...subscriptionPayload(),
     ...debugStatusPayload()
@@ -2523,7 +2768,40 @@ function notifyProgress(extra = {}) {
   schedulePersist();
 }
 
+let accountSyncDebounceTimer = null;
+
+function scheduleAccountSyncFromTab(tabId) {
+  if (jobState.isScraping || activeFetch?.running) return;
+  clearTimeout(accountSyncDebounceTimer);
+  accountSyncDebounceTimer = setTimeout(() => {
+    syncActiveAccountFromTab({ tabId, refreshSub: false })
+      .then((result) => {
+        if (result?.switched) notifyProgress();
+      })
+      .catch(() => {});
+  }, 350);
+}
+
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  chrome.tabs.get(activeInfo.tabId)
+    .then((tab) => {
+      if (!tab?.id || !isXTabUrl(tab.url)) return;
+      jobTabId = tab.id;
+      scheduleAccountSyncFromTab(tab.id);
+    })
+    .catch(() => {});
+});
+
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'complete') {
+    chrome.tabs.get(tabId)
+      .then((tab) => {
+        if (!tab?.url || !isXTabUrl(tab.url)) return;
+        scheduleAccountSyncFromTab(tabId);
+      })
+      .catch(() => {});
+  }
+
   if (tabId !== jobTabId || changeInfo.status !== 'complete') return;
   if (!jobState.username && !jobState.isScraping) return;
 
@@ -2537,7 +2815,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 async function findLastActiveXTab() {
   const tabs = await chrome.tabs.query({
-    url: ['https://x.com/*', 'https://twitter.com/*']
+    url: ['https://x.com/*']
   });
 
   if (!tabs.length) return null;
@@ -2608,13 +2886,19 @@ async function syncActiveAccountFromTab(options = {}) {
 
   if (switched) {
     await applyAccountSwitch(detected);
+    notifyProgress({
+      status: `Switched to @${detected} — showing cached lists for this account.`
+    });
   } else if (!jobState.username) {
     jobState.username = detected;
-    await purgePersistForOtherUsers(detected);
+    await cleanupLegacyGlobalPersist(detected);
     await restoreAllListState();
   } else {
     jobState.username = detected;
-    await purgePersistForOtherUsers(detected);
+    await cleanupLegacyGlobalPersist(detected);
+    if (!curList('following').length && !curList('followers').length) {
+      await restoreAllListState();
+    }
   }
 
   if (refreshSub) {
@@ -4225,6 +4509,7 @@ async function runObserveListFetch(tabId, profile, type = listType) {
   let stalePasses = 0;
   let passes = 0;
   let batchesWithAdds = 0;
+  let tailRecoveryAttempts = 0;
   const fetchTarget = effectiveFetchTarget(effectiveTotal);
 
   try {
@@ -4243,6 +4528,17 @@ async function runObserveListFetch(tabId, profile, type = listType) {
       const nativeAdded = addNativeUsers(native, seen, resolvedUsername, type);
       added += nativeAdded;
       if (native.seq) lastSeq = Math.max(lastSeq, native.seq);
+    }
+
+    if (passes <= 1 && effectiveTotal != null && listFetchNeedsMore(type, effectiveTotal)) {
+      try {
+        const drained = await readNativeListQueueDrainFromTab(tabId, cfg.opName);
+        if (drained?.users?.length) {
+          parsedLastBatch += drained.users.length;
+          added += addNativeUsers({ users: drained.users }, seen, resolvedUsername, type);
+          trimListToFetchLimit(type);
+        }
+      } catch (error) {}
     }
 
     try {
@@ -4317,13 +4613,28 @@ async function runObserveListFetch(tabId, profile, type = listType) {
       continue;
     }
 
+    if (
+      stillShort &&
+      gap != null &&
+      gap <= 15 &&
+      stalePasses >= 4 &&
+      tailRecoveryAttempts < 2
+    ) {
+      tailRecoveryAttempts += 1;
+      const recovered = await observeRecoverShortfall(tabId, profile, type, seen, effectiveTotal);
+      if (recovered > 0) {
+        stalePasses = 0;
+        continue;
+      }
+    }
+
     if (stillShort && gap != null && gap <= 25 && (stalePasses >= 2 || passes % 4 === 0)) {
       appendDebugStatusLog({
         reason: 'scroll-step',
         method: 'observe',
         status: `Observe tail nudge — scroll-to-load (${gap} short)`
       });
-      await scrollListToLoad(tabId);
+      await scrollListToLoad(tabId, { gap, aggressive: true });
     } else {
       await scrollListStep(tabId);
     }
@@ -4331,21 +4642,7 @@ async function runObserveListFetch(tabId, profile, type = listType) {
   }
 
   if (!activeFetch?.cancelled && listFetchNeedsMore(type, effectiveTotal)) {
-    const tailGap = effectiveTotal != null ? effectiveTotal - curList(type).length : null;
-    if (tailGap != null && tailGap > 0 && tailGap <= 25) {
-      appendDebugStatusLog({
-        reason: 'collecting',
-        method: 'observe',
-        status: `Observe tail recovery — scroll to top then sweep (${tailGap} short)`
-      });
-      await scrollListToTop(tabId);
-      await sleep(scrollJitterMs(2500, 0.2));
-    }
-    await recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen, effectiveTotal);
-  }
-
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, effectiveTotal)) {
-    await fetchListTailDom(tabId, profile, type, seen, effectiveTotal);
+    await observeRecoverShortfall(tabId, profile, type, seen, effectiveTotal);
   }
 
   try {
@@ -4354,16 +4651,25 @@ async function runObserveListFetch(tabId, profile, type = listType) {
 
   snapshotListRaw(type);
   jobState.isScraping = false;
-  jobState.reason = activeFetch?.cancelled ? 'stopped' : (curList(type).length > 0 ? 'complete' : 'observe-empty');
   jobState.method = 'observe';
   jobState.count = curList(type).length;
-  const shortBy = effectiveTotal != null ? Math.max(0, effectiveTotal - curList(type).length) : 0;
-  jobState.status = curList(type).length > 0
-    ? shortBy > 0
-      ? `Observe complete — ${curList(type).length.toLocaleString()} / ${effectiveTotal.toLocaleString()} ${cfg.label.toLowerCase()} (short by ${shortBy})`
-      : `Observe complete — ${curList(type).length.toLocaleString()} ${cfg.label.toLowerCase()}`
-    : 'Observe returned 0 — scroll the list manually, then retry';
-  notifyProgress({ status: jobState.status });
+  if (activeFetch?.cancelled) {
+    jobState.reason = 'stopped';
+    if (!String(jobState.status || '').toLowerCase().includes('stopped')) {
+      jobState.status = 'Stopped.';
+    }
+    appendDebugStatusLog({ status: jobState.status, reason: 'stopped' });
+  } else {
+    jobState.reason = curList(type).length > 0 ? 'complete' : 'observe-empty';
+    const shortBy = effectiveTotal != null ? Math.max(0, effectiveTotal - curList(type).length) : 0;
+    jobState.status = curList(type).length > 0
+      ? shortBy > 0
+        ? `Observe complete — ${curList(type).length.toLocaleString()} / ${effectiveTotal.toLocaleString()} ${cfg.label.toLowerCase()} (short by ${shortBy}; profile count may include hidden/deactivated accounts)`
+        : `Observe complete — ${curList(type).length.toLocaleString()} ${cfg.label.toLowerCase()}`
+      : 'Observe returned 0 — scroll the list manually, then retry';
+  }
+  persistDebugStatusLog();
+  notifyProgress({ status: jobState.status, reason: jobState.reason, isScraping: false });
   schedulePersist(true, type);
 }
 
@@ -4371,7 +4677,7 @@ async function runObserveExportFlowJob(tab, type, username) {
   const cfg = listCfg(type);
   const fetchMode = 'auto';
 
-  jobState = {
+  assignJobState({
     username: username || null,
     listType: type,
     totalFollowing: null,
@@ -4381,7 +4687,7 @@ async function runObserveExportFlowJob(tab, type, username) {
     reason: 'loading-profile',
     method: 'observe',
     fetchMode
-  };
+  });
 
   await ensureSnifferInstalled(tab.id);
 
@@ -4828,6 +5134,10 @@ async function filterList(options = {}) {
 
   if (options.handoffAfterHud) {
     void filterList({ ...options, handoffAfterHud: false }).catch((error) => {
+      if (isCancelledError(error)) {
+        void finishStoppedJob('Stopped.', { notifyHud: false });
+        return;
+      }
       jobState.reason = 'error';
       const errorText = String(error?.message || error);
       notifyProgress({ status: errorText, error: errorText, reason: 'error' });
@@ -4839,7 +5149,9 @@ async function filterList(options = {}) {
   }
 
   const filterHudReady = handoff.hudReady;
+  throwIfCancelled();
 
+  try {
   const removeBlue = !!options.removeBlue;
   const removeInactive = !!options.removeInactive;
   const removeMutuals = !!options.removeMutuals;
@@ -4873,6 +5185,7 @@ async function filterList(options = {}) {
   jobState.enrichTotal = 0;
 
   if (removeMutuals) {
+    throwIfCancelled();
     await ensureRestored();
     const ctx = buildMutualFilterContext(type);
     const otherCfg = listCfg(ctx.otherType);
@@ -4912,6 +5225,7 @@ async function filterList(options = {}) {
   }
 
   if (removeBlue) {
+    throwIfCancelled();
     const blueMerged = await refreshBlueFlagsFromSniffer(type);
     if (blueMerged > 0) {
       syncWorkingFromRaw(working, type);
@@ -4944,101 +5258,103 @@ async function filterList(options = {}) {
   }
 
   if (removeInactive) {
-    if (type !== 'following') {
+    throwIfCancelled();
+    if (!(await ensureJobTabId())) {
+      return { ok: false, error: 'No X tab available for activity lookup.' };
+    }
+
+    const inactiveLabel = listCfg(type).label.toLowerCase();
+    syncWorkingFromRaw(working, type);
+    const activityCache = await loadActivityCache();
+    const now = Date.now();
+    for (const user of working) {
+      hydrateLastActiveFromStoredSources(user, type, activityCache, now);
+    }
+    const lookupNeeded = countLastActiveLookupNeeded(working, activityCache, now, type);
+
+    if (lookupNeeded > 0) {
+      setCurList(working, type);
+      activeEnrich = { running: true, cancelled: false };
+      jobState.isEnriching = true;
+      jobState.reason = 'enriching';
+      jobState.filterPhase = 'inactive';
+      jobState.enrichTotal = lookupNeeded;
+      jobState.enrichProcessed = 0;
       notifyProgress({
-        status: 'Last post filter applies to Following — skipped on Followers.'
+        reason: 'enriching',
+        isEnriching: true,
+        enrichProcessed: 0,
+        enrichTotal: lookupNeeded,
+        status: `REST lookup: last tweet for ${lookupNeeded.toLocaleString()} ${inactiveLabel} (${inactiveMonths} mo threshold)...`
       });
     } else {
-      if (!(await ensureJobTabId())) {
-        return { ok: false, error: 'No X tab available for activity lookup.' };
-      }
-
-      syncWorkingFromRaw(working, type);
-      const activityCache = await loadActivityCache();
-      const now = Date.now();
-      for (const user of working) {
-        hydrateLastActiveFromStoredSources(user, type, activityCache, now);
-      }
-      const lookupNeeded = countLastActiveLookupNeeded(working, activityCache, now, type);
-
-      if (lookupNeeded > 0) {
-        setCurList(working, type);
-        activeEnrich = { running: true, cancelled: false };
-        jobState.isEnriching = true;
-        jobState.reason = 'enriching';
-        jobState.filterPhase = 'inactive';
-        jobState.enrichTotal = lookupNeeded;
-        jobState.enrichProcessed = 0;
-        notifyProgress({
-          reason: 'enriching',
-          isEnriching: true,
-          enrichProcessed: 0,
-          enrichTotal: lookupNeeded,
-          status: `REST lookup: last tweet for ${lookupNeeded.toLocaleString()} following (${inactiveMonths} mo threshold)...`
-        });
-      } else {
-        notifyProgress({
-          reason: 'filtering',
-          filterPhase: 'inactive',
-          status: `Last post (${inactiveMonths} mo): using saved tweet dates — no new lookups`
-        });
-      }
-
-      let enrichCancelled = false;
-      try {
-        working = await enrichLastActiveForUsers(jobTabId, working, (progress) => {
-          if (progress.fromCache) return;
-          const status = progress.waiting
-            ? `Waiting… checked ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`
-            : `REST last-tweet lookup ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
-          notifyProgress({
-            reason: 'enriching',
-            isEnriching: true,
-            enrichProcessed: progress.processed,
-            enrichTotal: progress.total,
-            status
-          });
-        });
-        enrichCancelled = !!activeEnrich?.cancelled;
-      } finally {
-        activeEnrich = null;
-        jobState.isEnriching = false;
-      }
-
-      if (enrichCancelled) {
-        syncLastActiveIntoRaw(working, type);
-        setCurList(working, type);
-        schedulePersist(true, type);
-        return finishStoppedJob();
-      }
-
-      syncLastActiveIntoRaw(working, type);
-      schedulePersist(true, type);
-
-      const beforeInactive = working.length;
-      // Keep inactive accounts only — export list = unfollow candidates (drop active).
-      working = working.filter((user) => isInactiveAccount(user.last_active_ms, inactiveMonths));
-      setCurList(working, type);
-      const activeRemoved = beforeInactive - working.length;
-      if (activeRemoved > 0) {
-        parts.push(`active (${activeRemoved.toLocaleString()})`);
-      }
-      jobState.filterRemoved = curRaw(type).length - working.length;
-      jobState.filterPhase = 'inactive';
       notifyProgress({
         reason: 'filtering',
         filterPhase: 'inactive',
-        isEnriching: false,
-        enrichProcessed: beforeInactive,
-        enrichTotal: beforeInactive,
-        status: `Last post (${inactiveMonths} mo): ${working.length.toLocaleString()} unfollow candidates (−${activeRemoved.toLocaleString()} active)`
+        status: `Last post (${inactiveMonths} mo): using saved tweet dates — no new lookups`
       });
-      if (!working.length) return finishEmptyFilter(type);
-      appliedFilters.push('inactive');
     }
+
+    let enrichCancelled = false;
+    try {
+      working = await enrichLastActiveForUsers(jobTabId, working, type, (progress) => {
+        if (progress.fromCache) return;
+        const status = progress.waiting
+          ? `Waiting… checked ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`
+          : `REST last-tweet lookup ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
+        notifyProgress({
+          reason: 'enriching',
+          isEnriching: true,
+          enrichProcessed: progress.processed,
+          enrichTotal: progress.total,
+          status
+        });
+      });
+      enrichCancelled = !!activeEnrich?.cancelled;
+    } finally {
+      activeEnrich = null;
+      jobState.isEnriching = false;
+    }
+
+    if (enrichCancelled) {
+      syncLastActiveIntoRaw(working, type);
+      setCurList(working, type);
+      schedulePersist(true, type);
+      return await finishStoppedJob();
+    }
+
+    syncLastActiveIntoRaw(working, type);
+    schedulePersist(true, type);
+
+    const beforeInactive = working.length;
+    const datedCount = working.filter((user) => user.last_active_ms != null).length;
+    // Keep inactive accounts only — export list = accounts with no recent posts.
+    working = working.filter((user) => isInactiveAccount(user.last_active_ms, inactiveMonths));
+    setCurList(working, type);
+    const activeRemoved = beforeInactive - working.length;
+    if (activeRemoved > 0) {
+      parts.push(`active (${activeRemoved.toLocaleString()})`);
+    }
+    if (datedCount < beforeInactive) {
+      parts.push(`no date (${(beforeInactive - datedCount).toLocaleString()} skipped)`);
+    }
+    jobState.filterRemoved = curRaw(type).length - working.length;
+    jobState.filterPhase = 'inactive';
+    const candidateLabel = type === 'following' ? 'unfollow candidates' : 'inactive accounts';
+    notifyProgress({
+      reason: 'filtering',
+      filterPhase: 'inactive',
+      isEnriching: false,
+      enrichProcessed: beforeInactive,
+      enrichTotal: beforeInactive,
+      status: `Last post (${inactiveMonths} mo): ${working.length.toLocaleString()} ${candidateLabel} (−${activeRemoved.toLocaleString()} active${datedCount < beforeInactive ? `, ${(beforeInactive - datedCount).toLocaleString()} without tweet date` : ''})`
+    });
+    if (!working.length) return finishEmptyFilter(type);
+    appliedFilters.push('inactive');
   }
 
   if (botCheck) {
+    throwIfCancelled();
     if (type !== 'followers') {
       notifyProgress({
         status: 'Bot check applies to Followers — skipped on Following.'
@@ -5125,7 +5441,7 @@ async function filterList(options = {}) {
         if (enrichCancelled) {
           working = candidates;
           setCurList(working, type);
-          return finishStoppedJob();
+          return await finishStoppedJob();
         }
       }
 
@@ -5175,6 +5491,14 @@ async function filterList(options = {}) {
     rawCount: curRaw(type).length,
     removed: jobState.filterRemoved
   };
+  } catch (error) {
+    activeEnrich = null;
+    jobState.isEnriching = false;
+    if (isCancelledError(error)) {
+      return await finishStoppedJob('Stopped.', { notifyHud: false });
+    }
+    throw error;
+  }
 }
 
 async function resolveUsernameForFetch(tabId, fallbackUsername = null) {
@@ -5854,6 +6178,9 @@ async function runExportFlow(requestedType = listType, options = {}) {
   if (activeFetch?.running) {
     return { ok: false, error: 'Collection already running.' };
   }
+  if (activeFetch?.cancelled) {
+    activeFetch = null;
+  }
 
   if (options.fastScroll != null) {
     await setFastScrollPref(!!options.fastScroll);
@@ -5875,6 +6202,9 @@ async function runExportFlow(requestedType = listType, options = {}) {
   listType = type;
   jobState.listType = type;
   jobState.fetchMode = fetchMode;
+  jobState.isScraping = true;
+  jobState.reason = 'collecting';
+  jobState.method = null;
 
   let username = await detectHandle(tab.id);
   await alignAccountForJob(username || '');
@@ -5938,7 +6268,7 @@ async function runExportFlow(requestedType = listType, options = {}) {
     }
     void runExportFlowJob(tab, type, options, username).catch((error) => {
       if (isCancelledError(error)) {
-        finishStoppedJob();
+        void finishStoppedJob();
         return;
       }
       jobState.isScraping = false;
@@ -5980,7 +6310,10 @@ async function runExportFlowJob(tab, type, options, username) {
     notifyProgress({
       status: useObservePath
         ? 'Gentle mode — observe collection (no REST bulk)...'
-        : 'Fast mode — REST collection...'
+        : 'Fast mode — REST collection...',
+      reason: 'collecting',
+      isScraping: true,
+      method: useObservePath ? 'observe' : 'rest-v1.1'
     });
 
     if (useObservePath) {
@@ -6244,7 +6577,7 @@ async function runExportFlowJob(tab, type, options, username) {
     };
   } catch (error) {
     if (isCancelledError(error)) {
-      return finishStoppedJob();
+      return await finishStoppedJob();
     }
     jobState.isScraping = false;
     jobState.reason = 'error';
@@ -6264,6 +6597,36 @@ async function runExportFlowJob(tab, type, options, username) {
   }
 }
 
+function jobLooksBusy() {
+  return !!(
+    activeFetch?.running
+    || activeEnrich?.running
+    || jobState.isScraping
+    || jobState.isEnriching
+    || jobState.reason === 'filtering'
+    || jobState.reason === 'enriching'
+    || jobState.reason === 'loading-profile'
+    || jobState.reason === 'profile-loaded'
+    || jobState.reason === 'waiting-native'
+    || jobState.reason === 'collecting'
+  );
+}
+
+function cancelActiveWork() {
+  if (activeFetch) {
+    activeFetch.cancelled = true;
+    activeFetch.running = false;
+  }
+  if (activeEnrich?.running || jobState.isEnriching || jobState.reason === 'enriching' || jobState.reason === 'filtering') {
+    activeEnrich = { running: false, cancelled: true };
+  } else if (activeEnrich) {
+    activeEnrich.cancelled = true;
+  }
+  jobState.isScraping = false;
+  jobState.isEnriching = false;
+  jobState.filterPhase = null;
+}
+
 function isJobCancelled() {
   return !!(activeFetch?.cancelled || activeEnrich?.cancelled);
 }
@@ -6280,58 +6643,64 @@ function isCancelledError(error) {
   return error?.code === 'XC_CANCELLED' || isJobCancelled();
 }
 
-function finishStoppedJob(status = 'Stopped.') {
+async function finishStoppedJob(status = 'Stopped.', options = {}) {
+  cancelActiveWork();
+  await restoreDebugStatusLogFromStorage();
+  jobState.reason = 'stopped';
+  jobState.status = status;
   jobState.isScraping = false;
   jobState.isEnriching = false;
-  jobState.filterPhase = null;
-  jobState.reason = 'stopped';
-  notifyProgress({ status, reason: 'stopped' });
+  await persistFreshStartStopState();
+  appendDebugStatusLog({ status, reason: 'stopped' });
+  notifyProgress({ status, reason: 'stopped', isScraping: false, isEnriching: false });
   persistDebugStatusLog();
-  schedulePersist(true);
+  activeFetch = null;
+  activeEnrich = null;
+  if (options.notifyHud !== false && jobTabId) {
+    sendHudMessage(jobTabId, {
+      action: 'updateHud',
+      ...buildHudState({ status, reason: 'stopped', isScraping: false, isEnriching: false })
+    }).catch(() => {});
+  }
   return {
     ok: true,
     ...jobState,
     count: curList().length,
     reason: 'stopped',
+    isScraping: false,
+    isEnriching: false,
     ...debugStatusPayload()
   };
 }
 
-async function stopScrape() {
-  let hadActiveWork = false;
-
-  if (activeFetch) {
-    activeFetch.cancelled = true;
-    hadActiveWork = true;
-  }
-
-  if (activeEnrich) {
-    activeEnrich.cancelled = true;
-    hadActiveWork = true;
-  }
-
-  if (
-    jobState.isScraping ||
-    jobState.isEnriching ||
-    jobState.reason === 'filtering' ||
-    jobState.reason === 'enriching' ||
-    jobState.reason === 'loading-profile' ||
-    jobState.reason === 'profile-loaded' ||
-    jobState.reason === 'waiting-native' ||
-    jobState.reason === 'collecting'
-  ) {
-    hadActiveWork = true;
-  }
+async function stopScrape(status = 'Stopped.', options = {}) {
+  const hadActiveWork = jobLooksBusy() || !!activeFetch || !!activeEnrich;
+  cancelActiveWork();
 
   if (hadActiveWork) {
-    return finishStoppedJob();
+    return await finishStoppedJob(status, options);
   }
 
-  jobState.isScraping = false;
-  jobState.isEnriching = false;
+  await restoreDebugStatusLogFromStorage();
   jobState.reason = 'stopped';
-  notifyProgress();
-  return { ok: true, ...jobState, count: curList().length, reason: 'stopped' };
+  appendDebugStatusLog({ status, reason: 'stopped' });
+  notifyProgress({ status, reason: 'stopped', isScraping: false, isEnriching: false });
+  persistDebugStatusLog();
+  activeFetch = null;
+  activeEnrich = null;
+  return {
+    ok: true,
+    ...jobState,
+    count: curList().length,
+    reason: 'stopped',
+    isScraping: false,
+    isEnriching: false,
+    ...debugStatusPayload()
+  };
+}
+
+async function dismissHud() {
+  return await stopScrape('HUD closed — work stopped.', { notifyHud: false });
 }
 
 function listFilterWasApplied(type = listType) {
@@ -6402,6 +6771,9 @@ async function exportCSV() {
 }
 
 async function getStatusAsync() {
+  if (!jobState.isScraping && !activeFetch?.running) {
+    await syncActiveAccountFromTab({ refreshSub: false });
+  }
   await ensureRestored();
   await restoreDebugStatusLogFromStorage();
   if (jobState.username) {
@@ -6566,6 +6938,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         break;
       case 'stopScrape':
         sendResponse(await stopScrape());
+        break;
+      case 'dismissHud':
+        sendResponse(await dismissHud());
         break;
       case 'exportCSV':
         sendResponse(await exportCSV());

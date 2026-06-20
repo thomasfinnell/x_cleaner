@@ -1,16 +1,68 @@
 // list-preview.js — spreadsheet-style preview of first 5 records (popup + HUD)
 
-const XC_LIST_PREVIEW_OVERLAY_ID = 'xc-list-preview-overlay';
-const XC_LIST_PREVIEW_MAX_ROWS = 5;
+if (!globalThis.__xcListPreviewReady) {
+  globalThis.__xcListPreviewReady = true;
+}
+
+var XC_LIST_PREVIEW_OVERLAY_ID = 'xc-list-preview-overlay';
+var XC_LIST_PREVIEW_MAX_ROWS = 5;
+
+function xcPickDebugStatusLog(incoming, cached) {
+  const next = Array.isArray(incoming) ? incoming : [];
+  const prev = Array.isArray(cached) ? cached : [];
+  return next.length >= prev.length ? next : prev;
+}
 
 function xcCountForListType(state = {}, type = 'following') {
   const stats = state.listStats || {};
   const stored = state.storedCounts || {};
   const typeStats = type === 'followers' ? stats.followers : stats.following;
-  if (typeStats && typeStats.count != null) return typeStats.count;
+  const activeType = state.listType || type;
+  const candidates = [
+    typeStats?.count,
+    typeStats?.rawCount,
+    stored[type],
+    activeType === type ? state.count : null,
+    activeType === type ? state.rawCount : null
+  ];
+  let best = 0;
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > best) best = n;
+  }
+  if (best > 0) return best;
+  if (typeStats?.count != null) return typeStats.count;
   if (stored[type] != null) return stored[type];
-  if (state.listType === type && state.count != null) return state.count;
+  if (activeType === type && state.count != null) return state.count;
   return 0;
+}
+
+function xcRawCountForListType(state = {}, type = 'following') {
+  const stats = state.listStats || {};
+  const typeStats = type === 'followers' ? stats.followers : stats.following;
+  const activeType = state.listType || type;
+  const rawFromStats = Number(typeStats?.rawCount);
+  if (Number.isFinite(rawFromStats) && rawFromStats > 0) return rawFromStats;
+  if (activeType === type) {
+    const rawFromState = Number(state.rawCount);
+    if (Number.isFinite(rawFromState) && rawFromState > 0) return rawFromState;
+  }
+  const countFromStats = Number(typeStats?.count);
+  if (Number.isFinite(countFromStats) && countFromStats > 0) return countFromStats;
+  if (activeType === type) {
+    const countFromState = Number(state.count);
+    if (Number.isFinite(countFromState) && countFromState > 0) return countFromState;
+  }
+  return Number.isFinite(rawFromStats) && rawFromStats > 0 ? rawFromStats : 0;
+}
+
+function xcCanViewListPreview(state = {}, type = 'following') {
+  if (xcCountForListType(state, type) > 0) return true;
+  const stored = state.storedCounts || {};
+  if ((stored.following || 0) > 0 || (stored.followers || 0) > 0) return true;
+  if ((state.count || 0) > 0) return true;
+  if (state.canExport === false) return true;
+  return false;
 }
 
 function xcFormatPreviewCell(value) {
@@ -241,3 +293,10 @@ async function xcOpenListPreview(fetchPreview, listType) {
   }
   xcShowListPreviewModal(document, payload);
 }
+
+globalThis.xcCountForListType = xcCountForListType;
+globalThis.xcRawCountForListType = xcRawCountForListType;
+globalThis.xcCanViewListPreview = xcCanViewListPreview;
+globalThis.xcOpenListPreview = xcOpenListPreview;
+globalThis.xcShowListPreviewModal = xcShowListPreviewModal;
+globalThis.xcPickDebugStatusLog = xcPickDebugStatusLog;

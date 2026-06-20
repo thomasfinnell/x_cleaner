@@ -1,3 +1,17 @@
+(function positionDebugPanel() {
+  if (new URLSearchParams(location.search).get('panel') !== '1') return;
+  const place = () => {
+    try {
+      const margin = 16;
+      const width = window.outerWidth || 440;
+      const left = Math.max(0, (screen.availWidth || screen.width || 1280) - width - margin);
+      window.moveTo(left, 72);
+    } catch (error) {}
+  };
+  place();
+  window.addEventListener('load', place);
+})();
+
 const manifest = chrome.runtime.getManifest();
 const appTitleEl = document.getElementById('appTitle');
 if (appTitleEl && manifest?.version) {
@@ -86,6 +100,7 @@ const FREE_FETCH_LIMIT = 200;
 
 let pollTimer = null;
 let currentListType = 'following';
+let pendingListType = null;
 let lastDebugStatusLog = [];
 let lastDebugStatusLogEnabled = true;
 
@@ -106,19 +121,17 @@ function listLabel(type = currentListType) {
 }
 
 function isListTypeLocked(state = {}) {
-  if (state.listTypeLocked != null) return !!state.listTypeLocked;
-  if (!state.isScraping) return false;
-  const idleReasons = new Set([
-    'filtered',
-    'complete',
-    'stopped',
-    'exported',
-    'error',
-    'end-of-list',
-    'filtering',
-    'enriching'
-  ]);
-  return !idleReasons.has(state.reason);
+  return !!state.listTypeLocked;
+}
+
+function syncListTypeUi(type = 'following') {
+  if (type === 'followers') {
+    modeFollowersEl.checked = true;
+  } else {
+    modeFollowingEl.checked = true;
+  }
+  followingCardEl?.classList.toggle('active', type !== 'followers');
+  followersCardEl?.classList.toggle('active', type === 'followers');
 }
 
 function formatTotal(state) {
@@ -165,12 +178,16 @@ function renderDebugStatusLog(state = {}) {
   const enabled = state.debugStatusLogEnabled != null
     ? !!state.debugStatusLogEnabled
     : lastDebugStatusLogEnabled;
-  const incoming = Array.isArray(state.debugStatusLog) ? state.debugStatusLog : null;
-  if (incoming?.length) {
-    lastDebugStatusLog = incoming;
+  const merged = typeof xcPickDebugStatusLog === 'function'
+    ? xcPickDebugStatusLog(state.debugStatusLog, lastDebugStatusLog)
+    : (Array.isArray(state.debugStatusLog) && state.debugStatusLog.length
+      ? state.debugStatusLog
+      : lastDebugStatusLog);
+  if (merged.length) {
+    lastDebugStatusLog = merged;
     lastDebugStatusLogEnabled = enabled;
   }
-  const lines = incoming?.length ? incoming : lastDebugStatusLog;
+  const lines = merged;
   const showLog = enabled;
   statusLogEl.classList.toggle('is-visible', showLog);
   statusLogLabelEl.classList.toggle('is-visible', showLog);
@@ -244,9 +261,6 @@ function renderListCards(state) {
     followersCountEl.textContent = `${(followers.count || 0).toLocaleString()} / ${formatListTotal(followers.total)}`;
   }
 
-  followingCardEl?.classList.toggle('active', activeType !== 'followers');
-  followersCardEl?.classList.toggle('active', activeType === 'followers');
-
   const mutualLine = mutualsSummaryLine(state.mutuals);
   mutualsEl.textContent = mutualLine || '';
 }
@@ -282,13 +296,8 @@ function renderProgress(state) {
   const count = state.count || 0;
   const rawCount = state.rawCount || count;
   const username = state.username;
-  currentListType = state.listType || selectedListType();
-
-  if (currentListType === 'followers') {
-    modeFollowersEl.checked = true;
-  } else {
-    modeFollowingEl.checked = true;
-  }
+  currentListType = state.listType || currentListType || selectedListType();
+  syncListTypeUi(pendingListType || currentListType);
 
   accountEl.textContent = username ? `@${username}` : '@—';
   const limitNote = state.isSubscribed
@@ -320,11 +329,17 @@ function renderProgress(state) {
   if (fastScrollEl) fastScrollEl.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
   const canExport = !!state.canExport;
-  const previewCount = activeListCount(state);
+  const previewType = pendingListType || selectedListType();
+  const previewCount = xcCountForListType(state, previewType);
+  const canView = canViewListPreview(state, previewType);
   if (viewBtn) {
-    viewBtn.disabled = previewCount === 0;
-    viewBtn.title = previewCount > 0
-      ? `Preview first 5 ${listLabel(state.listType || currentListType).toLowerCase()} records`
+    viewBtn.disabled = !canView;
+    viewBtn.title = canView
+      ? previewCount > 0
+        ? busy
+          ? `Preview first 5 ${listLabel(previewType).toLowerCase()} (${previewCount.toLocaleString()} loaded so far)`
+          : `Preview first 5 ${listLabel(previewType).toLowerCase()} records`
+        : `Preview first 5 ${listLabel(previewType).toLowerCase()} (free — up to 5 rows)`
       : 'Collect or import a list first';
   }
   exportBtn.disabled = count === 0 || !canExport;
@@ -332,8 +347,17 @@ function renderProgress(state) {
   exportBtn.title = canExport
     ? 'Download CSV'
     : 'Export requires @d2fl subscription';
+  const filterSourceCount = typeof xcRawCountForListType === 'function'
+    ? xcRawCountForListType(state, previewType)
+    : (state.rawCount || count);
+  const canFilter = filterSourceCount > 0;
   filterBtn.disabled =
-    count === 0 || busy || !!state.isEnriching || state.reason === 'filtering';
+    !canFilter || busy || !!state.isEnriching || state.reason === 'filtering';
+  filterBtn.title = canFilter
+    ? count === 0
+      ? `Re-filter from ${filterSourceCount.toLocaleString()} collected ${listLabel(previewType).toLowerCase()} (current filter removed all)`
+      : `Filter ${listLabel(previewType).toLowerCase()} (${count.toLocaleString()} shown / ${filterSourceCount.toLocaleString()} collected)`
+    : 'Collect or import a list first';
   const importBusy = busy || !!state.isEnriching || state.reason === 'filtering';
   if (loadFollowingBtn) loadFollowingBtn.disabled = importBusy;
   if (loadFollowersBtn) loadFollowersBtn.disabled = importBusy;
@@ -434,13 +458,45 @@ function updateUI(state = {}) {
   renderDebugStatusLog(merged);
 }
 
+function shouldKeepStatusPolling(state = {}) {
+  if (!state) return false;
+  if (state.isScraping) return true;
+  const activeReasons = new Set([
+    'start',
+    'collecting',
+    'loading-profile',
+    'profile-loaded',
+    'waiting-native',
+    'filtering',
+    'enriching'
+  ]);
+  return activeReasons.has(state.reason);
+}
+
+function canViewListPreview(state = {}, type = 'following') {
+  if (typeof xcCanViewListPreview === 'function') {
+    return xcCanViewListPreview(state, type);
+  }
+  const count = typeof xcCountForListType === 'function'
+    ? xcCountForListType(state, type)
+    : (state.count || 0);
+  if (count > 0) return true;
+  const stored = state.storedCounts || {};
+  if ((stored.following || 0) > 0 || (stored.followers || 0) > 0) return true;
+  if (state.canExport === false) return true;
+  return false;
+}
+
 async function refreshStatus() {
+  await sendBackground('syncFromFocusedTab', { refreshSub: false });
   const result = await sendBackground('getStatus');
-  if (
-    result?.ok !== false &&
-    (result.ok || result.count > 0 || result.username || result.isScraping || result.reason === 'filtered')
-  ) {
+  if (result?.ok !== false) {
     updateUI(result);
+    if (shouldKeepStatusPolling(result)) {
+      startPolling();
+    } else if (['complete', 'stopped', 'exported', 'filtered', 'error', 'observe-empty', 'rest-empty'].includes(result.reason)) {
+      stopPolling();
+    }
   }
 }
 
@@ -457,18 +513,25 @@ function stopPolling() {
 }
 
 async function switchListType(nextType) {
-  if (nextType === currentListType) return;
+  if (nextType === (pendingListType || currentListType)) return;
+  pendingListType = nextType;
+  syncListTypeUi(nextType);
   const result = await sendBackground('setListType', { listType: nextType });
+  pendingListType = null;
   if (result?.ok !== false) {
+    currentListType = result.listType || nextType;
     updateUI(result);
   } else if (result?.error) {
     setStatus(result.error, true);
-    if (nextType === 'followers') {
-      modeFollowingEl.checked = true;
-    } else {
-      modeFollowersEl.checked = true;
-    }
+    syncListTypeUi(currentListType);
   }
+}
+
+function wireListCardSwitch(cardEl, nextType) {
+  cardEl?.addEventListener('click', () => {
+    if (modeFollowingEl.disabled || modeFollowersEl.disabled) return;
+    switchListType(nextType);
+  });
 }
 
 modeFollowingEl.addEventListener('change', () => {
@@ -478,6 +541,9 @@ modeFollowingEl.addEventListener('change', () => {
 modeFollowersEl.addEventListener('change', () => {
   if (modeFollowersEl.checked) switchListType('followers');
 });
+
+wireListCardSwitch(followingCardEl, 'following');
+wireListCardSwitch(followersCardEl, 'followers');
 
 function showFastScrollWarning() {
   if (!fastScrollToastEl) return;
@@ -531,6 +597,8 @@ startBtn.addEventListener('click', async () => {
 stopBtn.addEventListener('click', async () => {
   const result = await sendBackground('stopScrape');
   if (result) updateUI(result);
+  const refreshed = await sendBackground('getStatus');
+  if (refreshed) updateUI(refreshed);
   if (!lastDebugStatusLogEnabled) closePopup();
 });
 
@@ -635,9 +703,9 @@ importFollowersInput?.addEventListener('change', async () => {
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type !== 'scrapeStatus') return;
   updateUI(message);
-  if (message.isScraping) {
+  if (shouldKeepStatusPolling(message)) {
     startPolling();
-  } else {
+  } else if (['complete', 'stopped', 'exported', 'filtered', 'error', 'observe-empty', 'rest-empty'].includes(message.reason)) {
     stopPolling();
   }
 });
@@ -682,7 +750,8 @@ sendBackground('getJobState').then((state) => {
   if (state?.fastScroll != null && fastScrollEl) {
     fastScrollEl.checked = !!state.fastScroll;
   }
-  if (state?.isScraping) startPolling();
+  if (state) updateUI(state);
+  if (shouldKeepStatusPolling(state)) startPolling();
 });
 
 window.addEventListener('unload', stopPolling);
