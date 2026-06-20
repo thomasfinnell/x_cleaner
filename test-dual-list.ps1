@@ -114,6 +114,10 @@ Assert 'list mutation observer drain' ($api -match 'function injectedDrainObserv
 Assert 'light dom collect helper' ($api -match 'function injectedCollectVisibleListUsersLight')
 Assert 'observe scroll mode label' ($bg -match 'observe \+ gentle scroll')
 Assert 'debug status log enabled' ($bg -match 'XC_DEBUG_STATUS_LOG = true')
+Assert 'popup status log element' ($popupHtml -match 'id="statusLog"')
+Assert 'HUD status log element' ($content -match 'id="xcleaner-status-log"')
+Assert 'popup version from manifest' ($popup -match 'getManifest\(\)')
+Assert 'persistent popup when debug log' ($bg -match 'configureActionPopupForDebugLog')
 Assert 'popup observe method label' ($popup -match "state\.method === 'observe'")
 
 Write-Host ""

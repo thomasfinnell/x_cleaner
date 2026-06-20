@@ -1,3 +1,9 @@
+const manifest = chrome.runtime.getManifest();
+const appTitleEl = document.getElementById('appTitle');
+if (appTitleEl && manifest?.version) {
+  appTitleEl.textContent = `X Cleaner v${manifest.version}`;
+}
+
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const exportBtn = document.getElementById('exportBtn');
@@ -160,11 +166,11 @@ function renderDebugStatusLog(state = {}) {
     lastDebugStatusLogEnabled = enabled;
   }
   const lines = incoming?.length ? incoming : lastDebugStatusLog;
-  const showLog = enabled && lines.length > 0;
+  const showLog = enabled;
   statusLogEl.classList.toggle('is-visible', showLog);
   statusLogLabelEl.classList.toggle('is-visible', showLog);
   if (!showLog) {
-    if (!enabled) statusLogEl.textContent = '';
+    statusLogEl.textContent = '';
     return;
   }
   statusLogEl.textContent = lines.length ? lines.join('\n') : '(waiting for status updates...)';

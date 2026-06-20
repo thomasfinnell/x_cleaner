@@ -6398,14 +6398,55 @@ async function bootstrapSubscription() {
   }
 }
 
+function configureActionPopupForDebugLog() {
+  try {
+    if (XC_DEBUG_STATUS_LOG) {
+      chrome.action.setPopup({ popup: '' });
+    } else {
+      chrome.action.setPopup({ popup: 'popup.html' });
+    }
+  } catch (error) {}
+}
+
+async function openPersistentPopupWindow() {
+  const base = chrome.runtime.getURL('popup.html');
+  const url = `${base}?panel=1`;
+  try {
+    const wins = await chrome.windows.getAll({ populate: true });
+    for (const win of wins) {
+      const match = (win.tabs || []).find((tab) => tab.url && tab.url.startsWith(base));
+      if (match) {
+        await chrome.windows.update(win.id, { focused: true });
+        return;
+      }
+    }
+    await chrome.windows.create({
+      url,
+      type: 'popup',
+      width: 440,
+      height: 760,
+      focused: true
+    });
+  } catch (error) {}
+}
+
+chrome.action.onClicked.addListener(() => {
+  if (!XC_DEBUG_STATUS_LOG) return;
+  openPersistentPopupWindow();
+});
+
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('X Cleaner v0.85 installed (REST tab-context session)');
+  configureActionPopupForDebugLog();
+  console.log('X Cleaner installed');
   bootstrapSubscription().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  configureActionPopupForDebugLog();
   bootstrapSubscription().catch(() => {});
 });
+
+configureActionPopupForDebugLog();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'scrapeStatus') {

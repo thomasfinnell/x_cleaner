@@ -7,6 +7,7 @@ const FILTER_MONTHS_DEFAULT = 6;
 const INACTIVE_MONTHS_PREF_KEY = 'xc_inactive_months_pref';
 const FAST_SCROLL_PREF_KEY = 'xc_fast_scroll_pref';
 const FAST_SCROLL_WARN = 'Fast mode uses REST bulk + aggressive scrolling and may trigger reduced reach or a shadowban on X. Leave unchecked for observe-only gentle pacing (scroll + sniffer + DOM, no REST bulk).';
+const EXT_VERSION = chrome.runtime.getManifest().version || '';
 
 function isExtensionContextValid() {
   try {
@@ -128,9 +129,53 @@ function selectedHudListType() {
   return followers?.checked ? 'followers' : 'following';
 }
 
+function wireHudStatusLogClick(hud) {
+  const hudStatusLogEl = hud.querySelector('#xcleaner-status-log');
+  if (!hudStatusLogEl || hudStatusLogEl.dataset.copyWired === '1') return;
+  hudStatusLogEl.dataset.copyWired = '1';
+  hudStatusLogEl.addEventListener('click', async () => {
+    const text = hudStatusLogEl.textContent || '';
+    if (!text || text.startsWith('(waiting')) return;
+    const statusEl = hud.querySelector('#xcleaner-status');
+    try {
+      await navigator.clipboard.writeText(text);
+      if (statusEl) statusEl.textContent = 'Status log copied to clipboard.';
+    } catch (error) {
+      if (statusEl) statusEl.textContent = 'Could not copy log — select text and copy manually.';
+    }
+  });
+}
+
+function ensureHudStatusLogElements(hud) {
+  if (hud.querySelector('#xcleaner-status-log')) {
+    wireHudStatusLogClick(hud);
+    return;
+  }
+  const statusEl = hud.querySelector('#xcleaner-status');
+  if (!statusEl) return;
+  const label = document.createElement('div');
+  label.className = 'xc-status-log-label';
+  label.id = 'xcleaner-status-log-label';
+  label.textContent = 'Status log';
+  const log = document.createElement('div');
+  log.className = 'xc-status-log';
+  log.id = 'xcleaner-status-log';
+  log.title = 'Click to copy status log';
+  statusEl.insertAdjacentElement('afterend', label);
+  label.insertAdjacentElement('afterend', log);
+  wireHudStatusLogClick(hud);
+}
+
 function ensureHud() {
   let hud = document.getElementById(HUD_ID);
-  if (hud) return hud;
+  if (hud) {
+    const titleEl = hud.querySelector('.xc-title');
+    if (titleEl && EXT_VERSION) {
+      titleEl.textContent = `X Cleaner v${EXT_VERSION}`;
+    }
+    ensureHudStatusLogElements(hud);
+    return hud;
+  }
 
   hud = document.createElement('div');
   hud.id = HUD_ID;
@@ -429,7 +474,7 @@ function ensureHud() {
       }
     </style>
     <div class="xc-header">
-      <div class="xc-title">X Cleaner</div>
+      <div class="xc-title">X Cleaner${EXT_VERSION ? ` v${EXT_VERSION}` : ''}</div>
       <button class="xc-close" id="xcleaner-close" type="button" title="Close panel" aria-label="Close panel">×</button>
     </div>
     <label class="xc-fast-scroll" title="Fast uses aggressive scrolling and may reduce reach on X">
@@ -455,6 +500,8 @@ function ensureHud() {
     <div class="xc-account" id="xcleaner-account">@—</div>
     <div class="xc-mutuals" id="xcleaner-mutuals"></div>
     <div class="xc-status" id="xcleaner-status">Ready</div>
+    <div class="xc-status-log-label" id="xcleaner-status-log-label">Status log</div>
+    <div class="xc-status-log" id="xcleaner-status-log" title="Click to copy status log"></div>
     <div class="xc-fresh-start">
       <label for="xcleaner-fresh-start">
         <input type="checkbox" id="xcleaner-fresh-start">
@@ -508,6 +555,8 @@ function ensureHud() {
 
   document.documentElement.appendChild(hud);
   wireHudFilterMonthSteppers(hud);
+
+  wireHudStatusLogClick(hud);
 
   const fastScrollEl = hud.querySelector('#xcleaner-fast-scroll');
   const fastScrollToastEl = hud.querySelector('#xcleaner-fast-toast');
@@ -747,13 +796,13 @@ function renderDebugStatusLog(hud, state = {}) {
   const labelEl = hud.querySelector('#xcleaner-status-log-label');
   if (!logEl || !labelEl) return;
 
-  const enabled = state.debugStatusLogEnabled !== false;
+  const enabled = !!state.debugStatusLogEnabled;
   const lines = Array.isArray(state.debugStatusLog) ? state.debugStatusLog : [];
-  const showLog = enabled && lines.length > 0;
+  const showLog = enabled;
   logEl.classList.toggle('is-visible', showLog);
   labelEl.classList.toggle('is-visible', showLog);
   if (!showLog) {
-    if (!enabled) logEl.textContent = '';
+    logEl.textContent = '';
     return;
   }
 
@@ -967,7 +1016,7 @@ function syncHudFromBackground() {
       state.reason === 'filtering' ||
       state.reason === 'enriching' ||
       state.isEnriching ||
-      (state.debugStatusLogEnabled && (state.debugStatusLog || []).length > 0)
+      state.debugStatusLogEnabled
     ) {
       updateHud(state);
     }
