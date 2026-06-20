@@ -516,9 +516,10 @@ startBtn.addEventListener('click', async () => {
   setStatus(result?.error || 'Could not start collection — keep an x.com tab open and try again.', true);
 });
 
-stopBtn.addEventListener('click', () => {
-  sendBackground('stopScrape');
-  closePopup();
+stopBtn.addEventListener('click', async () => {
+  const result = await sendBackground('stopScrape');
+  if (result) updateUI(result);
+  if (!lastDebugStatusLogEnabled) closePopup();
 });
 
 filterBtn.addEventListener('click', async () => {

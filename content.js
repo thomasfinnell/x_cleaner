@@ -8,6 +8,8 @@ const INACTIVE_MONTHS_PREF_KEY = 'xc_inactive_months_pref';
 const FAST_SCROLL_PREF_KEY = 'xc_fast_scroll_pref';
 const FAST_SCROLL_WARN = 'Fast mode uses REST bulk + aggressive scrolling and may trigger reduced reach or a shadowban on X. Leave unchecked for observe-only gentle pacing (scroll + sniffer + DOM, no REST bulk).';
 const EXT_VERSION = chrome.runtime.getManifest().version || '';
+let lastHudDebugStatusLog = [];
+let lastHudDebugStatusLogEnabled = true;
 
 function isExtensionContextValid() {
   try {
@@ -608,11 +610,18 @@ function ensureHud() {
     statusEl.textContent = forceRefresh
       ? `Fresh start — clearing cached ${listLabel(listType).toLowerCase()}...`
       : `Starting ${listLabel(listType).toLowerCase()} collection...`;
-    sendToBackground({ action: 'runExportFlow', listType, forceRefresh, fastScroll });
+    sendToBackground({
+      action: 'runExportFlow',
+      listType,
+      forceRefresh,
+      fastScroll,
+      fetchMode: 'auto'
+    });
   });
 
-  hud.querySelector('#xcleaner-stop').addEventListener('click', () => {
-    sendToBackground({ action: 'stopScrape' });
+  hud.querySelector('#xcleaner-stop').addEventListener('click', async () => {
+    const result = await sendToBackground({ action: 'stopScrape' });
+    if (result) updateHud(result);
   });
 
   hud.querySelector('#xcleaner-export').addEventListener('click', () => {
@@ -796,8 +805,18 @@ function renderDebugStatusLog(hud, state = {}) {
   const labelEl = hud.querySelector('#xcleaner-status-log-label');
   if (!logEl || !labelEl) return;
 
-  const enabled = !!state.debugStatusLogEnabled;
-  const lines = Array.isArray(state.debugStatusLog) ? state.debugStatusLog : [];
+  if (state.debugStatusLogEnabled != null) {
+    lastHudDebugStatusLogEnabled = !!state.debugStatusLogEnabled;
+  }
+  if (Array.isArray(state.debugStatusLog) && state.debugStatusLog.length) {
+    lastHudDebugStatusLog = state.debugStatusLog;
+  }
+  const enabled = state.debugStatusLogEnabled != null
+    ? !!state.debugStatusLogEnabled
+    : lastHudDebugStatusLogEnabled;
+  const lines = Array.isArray(state.debugStatusLog) && state.debugStatusLog.length
+    ? state.debugStatusLog
+    : lastHudDebugStatusLog;
   const showLog = enabled;
   logEl.classList.toggle('is-visible', showLog);
   labelEl.classList.toggle('is-visible', showLog);

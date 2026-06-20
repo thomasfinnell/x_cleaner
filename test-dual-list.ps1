@@ -92,6 +92,8 @@ Assert 'popup fast checkbox' ($popupHtml -match 'id="fastScroll"')
 Assert 'HUD fast checkbox' ($content -match 'xcleaner-fast-scroll')
 Assert 'popup fast scroll warning' ($popup -match 'shadowban')
 Assert 'runExportFlow passes fastScroll' ($popup -match 'fastScroll')
+Assert 'background forwards fastScroll on runExportFlow' ($bg -match 'fastScroll: message\.fastScroll')
+Assert 'gentle path decision logged' ($bg -match 'useObservePath')
 
 # Dual list cards + switch lock
 Assert 'background buildListStats' ($bg -match 'function buildListStats')

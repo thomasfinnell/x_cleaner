@@ -5922,7 +5922,22 @@ async function runExportFlowJob(tab, type, options, username) {
   try {
     activeFetch = { running: true, cancelled: false };
 
-    if (!fastScrollEnabled && fetchMode === 'auto') {
+    const useObservePath = !fastScrollEnabled && fetchMode === 'auto';
+    appendDebugStatusLog({
+      reason: 'start',
+      fetchMode,
+      method: useObservePath ? 'observe' : 'rest-v1.1',
+      status: useObservePath
+        ? 'Gentle mode — observe path (no REST bulk)'
+        : 'Fast mode — auto REST → GraphQL → sniffer'
+    });
+    notifyProgress({
+      status: useObservePath
+        ? 'Gentle mode — observe collection (no REST bulk)...'
+        : 'Fast mode — REST collection...'
+    });
+
+    if (useObservePath) {
       return await runObserveExportFlowJob(tab, type, username);
     }
 
@@ -6498,7 +6513,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse(await runExportFlow(message.listType || listType, {
           fetchMode: message.fetchMode,
           forceRefresh: !!message.forceRefresh,
-          handoffAfterHud: !!message.handoffAfterHud
+          handoffAfterHud: !!message.handoffAfterHud,
+          fastScroll: message.fastScroll
         }));
         break;
       case 'stopScrape':
