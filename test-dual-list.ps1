@@ -25,7 +25,7 @@ foreach ($f in $required) {
 
 # Manifest JSON
 $manifest = Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
-Assert 'manifest version 0.92' ($manifest.version -eq '0.92')
+Assert 'manifest version 0.93' ($manifest.version -eq '0.93')
 Assert 'background service worker' ($manifest.background.service_worker -eq 'background.js')
 
 # Action wiring (popup/background/content agree)
@@ -118,6 +118,8 @@ Assert 'popup status log element' ($popupHtml -match 'id="statusLog"')
 Assert 'HUD status log element' ($content -match 'id="xcleaner-status-log"')
 Assert 'popup version from manifest' ($popup -match 'getManifest\(\)')
 Assert 'persistent popup when debug log' ($bg -match 'configureActionPopupForDebugLog')
+Assert 'gentle scroll inlined findRegion' ($api -match 'function injectedGentleScrollStep[\s\S]*?const findRegion = \(\) =>')
+Assert 'observe keeps scrolling when short' ($bg -match 'stillShort && gap')
 Assert 'popup observe method label' ($popup -match "state\.method === 'observe'")
 
 Write-Host ""

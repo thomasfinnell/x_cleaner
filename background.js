@@ -362,11 +362,13 @@ async function scrollListStep(tabId) {
   }
   const scrollResult = await gentleScrollStepFromTab(tabId, gentleScrollStepCount);
   gentleScrollStepCount += 1;
+  const movedNote = scrollResult?.moved === false ? ' (no movement)' : '';
+  const regionNote = scrollResult?.region ? ` @${scrollResult.region}` : '';
   appendDebugStatusLog({
     reason: 'scroll-step',
     method: jobState.method || 'observe',
     passes: gentleScrollStepCount,
-    status: `Gentle scroll #${gentleScrollStepCount}: ${scrollResult?.pattern || 'step'}${scrollResult?.moved === false ? ' (no movement)' : ''}`
+    status: `Gentle scroll #${gentleScrollStepCount}: ${scrollResult?.pattern || 'unknown'}${regionNote}${movedNote}`
   });
   await maybeGentleDwellPause();
 }
@@ -4249,9 +4251,13 @@ async function runObserveListFetch(tabId, profile, type = listType) {
     }
 
     const collected = curList(type).length;
+    const gap = effectiveTotal != null ? effectiveTotal - collected : null;
     const staleLimit = nativeStalePassLimit(type, effectiveTotal, collected);
-    if (atTail && stalePasses >= 3) break;
-    if (collected > 0 && stalePasses >= staleLimit) break;
+    const stillShort = listFetchNeedsMore(type, effectiveTotal);
+    if (atTail && stalePasses >= 3 && !stillShort) break;
+    if (atTail && stillShort && gap != null && gap <= 25 && stalePasses >= 20) break;
+    if (collected > 0 && stalePasses >= staleLimit && !stillShort) break;
+    if (collected > 0 && stillShort && gap != null && gap <= 25 && stalePasses >= 25) break;
     if (passes > 1500) break;
 
     const onListPage = await tabIsOnListPage(tabId, resolvedUsername, cfg.path);
@@ -4265,11 +4271,30 @@ async function runObserveListFetch(tabId, profile, type = listType) {
       continue;
     }
 
-    await scrollListStep(tabId);
+    if (stillShort && gap != null && gap <= 25 && (stalePasses >= 2 || passes % 4 === 0)) {
+      appendDebugStatusLog({
+        reason: 'scroll-step',
+        method: 'observe',
+        status: `Observe tail nudge — scroll-to-load (${gap} short)`
+      });
+      await scrollListToLoad(tabId);
+    } else {
+      await scrollListStep(tabId);
+    }
     await sleep(await sleepAfterScrollStep(type, 'native-loop'));
   }
 
   if (!activeFetch?.cancelled && listFetchNeedsMore(type, effectiveTotal)) {
+    const tailGap = effectiveTotal != null ? effectiveTotal - curList(type).length : null;
+    if (tailGap != null && tailGap > 0 && tailGap <= 25) {
+      appendDebugStatusLog({
+        reason: 'collecting',
+        method: 'observe',
+        status: `Observe tail recovery — scroll to top then sweep (${tailGap} short)`
+      });
+      await scrollListToTop(tabId);
+      await sleep(scrollJitterMs(2500, 0.2));
+    }
     await recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen, effectiveTotal);
   }
 

@@ -942,7 +942,64 @@ function injectedStartListObserver(screenName) {
     'ads', 'business', 'developers', 'xai', 'create', owner
   ].filter(Boolean));
 
-  const root = injectedFindListRoot();
+  const findListRoot = () => {
+    const labels = ['Timeline: Followers', 'Timeline: Following', 'Followers', 'Following'];
+    for (const label of labels) {
+      const el = document.querySelector(`[aria-label="${label}"]`);
+      if (el) return el;
+    }
+    const main = document.querySelector('main');
+    if (!main) return null;
+    let best = null;
+    let bestCells = 0;
+    main.querySelectorAll('section[role="region"], div[role="region"]').forEach((region) => {
+      const count = region.querySelectorAll('[data-testid="UserCell"]').length;
+      if (count > bestCells) {
+        bestCells = count;
+        best = region;
+      }
+    });
+    return best || main;
+  };
+
+  const parseUserCell = (cell) => {
+    if (!cell) return null;
+    let handle = null;
+    const nameLink = cell.querySelector('[data-testid="User-Name"] a[href^="/"]');
+    if (nameLink) {
+      const href = (nameLink.getAttribute('href') || '').split('?')[0];
+      const match = href.match(/^\/([^/]+)$/);
+      if (match) handle = match[1];
+    }
+    if (!handle) {
+      const profileLink = cell.querySelector('a[href^="/"][role="link"]');
+      if (profileLink) {
+        const href = (profileLink.getAttribute('href') || '').split('?')[0];
+        const match = href.match(/^\/([^/]+)$/);
+        if (match) handle = match[1];
+      }
+    }
+    if (!handle) return null;
+    const key = String(handle).toLowerCase();
+    if (!key || skip.has(key)) return null;
+    const displayEl = cell.querySelector('[data-testid="User-Name"] span');
+    return {
+      username: handle,
+      display_name: displayEl ? String(displayEl.textContent || '').trim() : '',
+      friends_count: null,
+      followers_count: null,
+      tweet_count: null,
+      created_at: '',
+      bio: '',
+      is_blue: !!(
+        cell.querySelector('[data-testid="icon-verified"]')
+        || cell.querySelector('svg[aria-label*="Verified"]')
+      ),
+      default_avatar: false
+    };
+  };
+
+  const root = findListRoot();
   if (!root) return { ok: false, error: 'list root not found' };
 
   const state = {
@@ -952,7 +1009,7 @@ function injectedStartListObserver(screenName) {
   };
 
   const ingestCell = (cell) => {
-    const user = injectedParseUserCellFromDom(cell, owner, skip);
+    const user = parseUserCell(cell);
     if (!user) return;
     const key = user.username.toLowerCase();
     if (state.seen.has(key)) return;
@@ -1007,13 +1064,65 @@ function injectedCollectVisibleListUsersLight(screenName) {
     'ads', 'business', 'developers', 'xai', 'create', owner
   ].filter(Boolean));
 
-  const root = injectedFindListRoot();
+  const findListRoot = () => {
+    const labels = ['Timeline: Followers', 'Timeline: Following', 'Followers', 'Following'];
+    for (const label of labels) {
+      const el = document.querySelector(`[aria-label="${label}"]`);
+      if (el) return el;
+    }
+    const main = document.querySelector('main');
+    if (!main) return null;
+    let best = null;
+    let bestCells = 0;
+    main.querySelectorAll('section[role="region"], div[role="region"]').forEach((region) => {
+      const count = region.querySelectorAll('[data-testid="UserCell"]').length;
+      if (count > bestCells) {
+        bestCells = count;
+        best = region;
+      }
+    });
+    return best || main;
+  };
+
+  const parseUserCell = (cell) => {
+    if (!cell) return null;
+    let handle = null;
+    const nameLink = cell.querySelector('[data-testid="User-Name"] a[href^="/"]');
+    if (nameLink) {
+      const href = (nameLink.getAttribute('href') || '').split('?')[0];
+      const match = href.match(/^\/([^/]+)$/);
+      if (match) handle = match[1];
+    }
+    if (!handle) {
+      const profileLink = cell.querySelector('a[href^="/"][role="link"]');
+      if (profileLink) {
+        const href = (profileLink.getAttribute('href') || '').split('?')[0];
+        const match = href.match(/^\/([^/]+)$/);
+        if (match) handle = match[1];
+      }
+    }
+    if (!handle) return null;
+    const key = String(handle).toLowerCase();
+    if (!key || skip.has(key)) return null;
+    return {
+      username: handle,
+      display_name: '',
+      friends_count: null,
+      followers_count: null,
+      tweet_count: null,
+      created_at: '',
+      is_blue: false,
+      default_avatar: false
+    };
+  };
+
+  const root = findListRoot();
   if (!root) return { users: [] };
 
   const users = [];
   const seen = new Set();
   root.querySelectorAll('[data-testid="UserCell"]').forEach((cell) => {
-    const user = injectedParseUserCellFromDom(cell, owner, skip);
+    const user = parseUserCell(cell);
     if (!user) return;
     const key = user.username.toLowerCase();
     if (seen.has(key)) return;
@@ -1056,15 +1165,38 @@ function findListScrollRegion() {
 function injectedGentleScrollStep(patternIndex = 0) {
   const patterns = ['page', 'wheel', 'page', 'micro'];
   const pattern = patterns[Math.abs(Math.floor(patternIndex)) % patterns.length];
-  const region = findListScrollRegion();
-  if (!region) return { pattern, moved: false };
+
+  const findRegion = () => {
+    const labels = ['Timeline: Followers', 'Timeline: Following', 'Followers', 'Following'];
+    for (const label of labels) {
+      const el = document.querySelector(`[aria-label="${label}"]`);
+      if (el) return { el, label };
+    }
+    const column = document.querySelector('[data-testid="primaryColumn"]');
+    if (column) return { el: column, label: 'primaryColumn' };
+    const main = document.querySelector('main');
+    if (main) return { el: main, label: 'main' };
+    return { el: null, label: 'none' };
+  };
+
+  const { el: region, label: regionLabel } = findRegion();
+  if (!region) return { pattern, moved: false, region: regionLabel };
+
+  const nudgeWindow = () => {
+    const step = Math.max(180, Math.floor((window.innerHeight || 640) * 0.45));
+    const before = window.scrollY || document.documentElement.scrollTop || 0;
+    window.scrollBy({ top: step, behavior: 'auto' });
+    const after = window.scrollY || document.documentElement.scrollTop || 0;
+    return after > before;
+  };
 
   try {
     if (pattern === 'page') {
       const step = Math.max(180, Math.floor(region.clientHeight * 0.85));
       const before = region.scrollTop;
       region.scrollTop = Math.min(region.scrollTop + step, region.scrollHeight);
-      return { pattern, moved: region.scrollTop > before };
+      const moved = region.scrollTop > before || nudgeWindow();
+      return { pattern, moved, region: regionLabel };
     }
 
     if (pattern === 'wheel') {
@@ -1081,7 +1213,8 @@ function injectedGentleScrollStep(patternIndex = 0) {
           cancelable: true
         }));
       }
-      return { pattern, moved };
+      if (!moved) moved = nudgeWindow();
+      return { pattern, moved, region: regionLabel };
     }
 
     if (pattern === 'micro') {
@@ -1089,11 +1222,12 @@ function injectedGentleScrollStep(patternIndex = 0) {
       const step = Math.max(180, Math.floor(region.clientHeight * 0.85));
       const before = region.scrollTop;
       region.scrollTop = Math.min(region.scrollTop + step, region.scrollHeight);
-      return { pattern, moved: region.scrollTop > before };
+      const moved = region.scrollTop > before || nudgeWindow();
+      return { pattern, moved, region: regionLabel };
     }
   } catch (error) {}
 
-  return { pattern, moved: false };
+  return { pattern, moved: nudgeWindow(), region: regionLabel };
 }
 
 async function gentleScrollStepFromTab(tabId, patternIndex = 0) {
