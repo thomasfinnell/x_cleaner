@@ -398,6 +398,35 @@ function ensureHud() {
         line-height: 1.4;
       }
       #${HUD_ID} .xc-fast-toast[hidden] { display: none; }
+      #${HUD_ID} .xc-list-cards {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        margin: 0 0 8px;
+      }
+      #${HUD_ID} .xc-list-card {
+        border: 1px solid #2f3336;
+        border-radius: 8px;
+        padding: 7px 8px;
+        background: rgba(255, 255, 255, 0.04);
+      }
+      #${HUD_ID} .xc-list-card.active {
+        border-color: #1d9bf0;
+        background: rgba(29, 155, 240, 0.12);
+        box-shadow: inset 0 0 0 1px #1d9bf0;
+      }
+      #${HUD_ID} .xc-list-card-title {
+        font-size: 10px;
+        font-weight: 700;
+        color: #8b98a5;
+        margin-bottom: 3px;
+      }
+      #${HUD_ID} .xc-list-card-count {
+        font-size: 16px;
+        font-weight: 700;
+        color: #fff;
+        line-height: 1.2;
+      }
     </style>
     <div class="xc-header">
       <div class="xc-title">X Cleaner</div>
@@ -408,13 +437,22 @@ function ensureHud() {
       Fast
     </label>
     <div class="xc-fast-toast" id="xcleaner-fast-toast" hidden></div>
-    <div class="xc-method" id="xcleaner-method">Native sniffer (captures X's own requests)</div>
     <div class="xc-toggle">
       <label><input type="radio" name="xc-list-type" id="xcleaner-mode-following" value="following" checked>Following</label>
       <label><input type="radio" name="xc-list-type" id="xcleaner-mode-followers" value="followers">Followers</label>
     </div>
+    <div class="xc-list-cards">
+      <div class="xc-list-card active" id="xcleaner-following-card" data-type="following">
+        <div class="xc-list-card-title">Following</div>
+        <div class="xc-list-card-count" id="xcleaner-following-count">0 / —</div>
+      </div>
+      <div class="xc-list-card" id="xcleaner-followers-card" data-type="followers">
+        <div class="xc-list-card-title">Followers</div>
+        <div class="xc-list-card-count" id="xcleaner-followers-count">0 / —</div>
+      </div>
+    </div>
+    <div class="xc-method" id="xcleaner-method">Native sniffer (captures X's own requests)</div>
     <div class="xc-account" id="xcleaner-account">@—</div>
-    <div class="xc-progress" id="xcleaner-progress">0 / —</div>
     <div class="xc-mutuals" id="xcleaner-mutuals"></div>
     <div class="xc-status" id="xcleaner-status">Ready</div>
     <div class="xc-fresh-start">
@@ -723,6 +761,12 @@ function renderDebugStatusLog(hud, state = {}) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+function hudFormatListTotal(total) {
+  if (total == null || total === '') return '—';
+  const num = Number(total);
+  return Number.isFinite(num) ? num.toLocaleString() : '—';
+}
+
 function updateHud(state = {}) {
   if (isHudDismissed()) return;
 
@@ -746,27 +790,26 @@ function updateHud(state = {}) {
 
   hud.querySelector('#xcleaner-account').textContent =
     state.username ? `@${state.username}` : '@—';
-  const rawCount = state.rawCount || count;
-  if (state.isEnriching && state.enrichTotal) {
-    hud.querySelector('#xcleaner-progress').textContent =
-      `${(state.enrichProcessed || 0).toLocaleString()} / ${state.enrichTotal.toLocaleString()} checked`;
-  } else if (state.reason === 'filtering' || state.reason === 'filtered') {
-    hud.querySelector('#xcleaner-progress').textContent =
-      `${count.toLocaleString()} / ${rawCount.toLocaleString()}`;
-  } else {
-    hud.querySelector('#xcleaner-progress').textContent =
-      `${count.toLocaleString()} / ${formatTotalForState(state)}`;
-  }
+
+  const stats = state.listStats || {};
+  const stored = state.storedCounts || {};
+  const following = stats.following || {
+    count: stored.following || 0,
+    total: state.totalFollowing ?? null
+  };
+  const followers = stats.followers || {
+    count: stored.followers || 0,
+    total: state.totalFollowers ?? null
+  };
+  hud.querySelector('#xcleaner-following-count').textContent =
+    `${(following.count || 0).toLocaleString()} / ${hudFormatListTotal(following.total)}`;
+  hud.querySelector('#xcleaner-followers-count').textContent =
+    `${(followers.count || 0).toLocaleString()} / ${hudFormatListTotal(followers.total)}`;
+  hud.querySelector('#xcleaner-following-card')?.classList.toggle('active', type !== 'followers');
+  hud.querySelector('#xcleaner-followers-card')?.classList.toggle('active', type === 'followers');
 
   const mutualsEl = hud.querySelector('#xcleaner-mutuals');
   const mutuals = state.mutuals;
-  const stored = state.storedCounts || {};
-  const activeType = state.listType || 'following';
-  const activeLabel = listLabel(activeType);
-  const otherLabel = activeType === 'followers' ? 'Following' : 'Followers';
-  const otherCount = activeType === 'followers' ? stored.following : stored.followers;
-  const activeCount = state.count || (activeType === 'followers' ? stored.followers : stored.following) || 0;
-
   let mutualLine = '';
   if (mutuals) {
     mutualLine = `Mutuals: ${(mutuals.mutualCount || 0).toLocaleString()}`;
@@ -781,24 +824,7 @@ function updateHud(state = {}) {
       mutualLine += ` (${mutuals.followingCount.toLocaleString()} following ∩ ${mutuals.followersCount.toLocaleString()} followers)`;
     }
   }
-
-  if ((state.reason === 'complete' || state.reason === 'stopped') && activeCount > 0) {
-    let line = `${activeLabel}: ${activeCount.toLocaleString()} collected`;
-    if (otherCount > 0) {
-      line += ` • ${otherLabel}: ${otherCount.toLocaleString()} saved (prior)`;
-    }
-    if (mutualLine) line += ` • ${mutualLine}`;
-    mutualsEl.textContent = line;
-  } else if (state.isScraping && activeCount > 0 && mutualLine) {
-    mutualsEl.textContent = mutualLine;
-  } else if (mutualLine && (mutuals?.hasBoth || mutuals?.hasRelationshipData)) {
-    mutualsEl.textContent = mutualLine;
-  } else {
-    const parts = [];
-    if (stored.following > 0) parts.push(`${stored.following.toLocaleString()} following saved`);
-    if (stored.followers > 0) parts.push(`${stored.followers.toLocaleString()} followers saved`);
-    mutualsEl.textContent = parts.join(' • ');
-  }
+  mutualsEl.textContent = mutualLine || '';
 
   const startBtn = hud.querySelector('#xcleaner-start');
   const freshStartEl = hud.querySelector('#xcleaner-fresh-start');

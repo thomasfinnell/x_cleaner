@@ -414,9 +414,33 @@ const LIST_TYPE_IDLE_REASONS = new Set([
 ]);
 
 function isListTypeSwitchLocked(state = jobState) {
-  if (activeFetch?.running) return true;
-  if (!state.isScraping) return false;
-  return !LIST_TYPE_IDLE_REASONS.has(state.reason);
+  if (activeFetch?.running || activeEnrich?.running) return true;
+  return false;
+}
+
+function buildListStats() {
+  return {
+    following: {
+      count: listStore.following.list.length,
+      rawCount: listStore.following.raw.length || listStore.following.list.length,
+      total: jobState.totalFollowing ?? null
+    },
+    followers: {
+      count: listStore.followers.list.length,
+      rawCount: listStore.followers.raw.length || listStore.followers.list.length,
+      total: jobState.totalFollowers ?? null
+    }
+  };
+}
+
+async function withFastScrollRecoveryBoost(fn) {
+  const prev = fastScrollEnabled;
+  fastScrollEnabled = true;
+  try {
+    return await fn();
+  } finally {
+    fastScrollEnabled = prev;
+  }
 }
 
 function normalizeClientState(state) {
@@ -449,6 +473,7 @@ function buildHudState(extra = {}) {
     fetchMode: jobState.fetchMode || XC_FETCH_MODE_DEFAULT,
     fastScroll: fastScrollEnabled,
     fastScrollLabel: scrollModeLabel(),
+    listStats: buildListStats(),
     ...subscriptionPayload(),
     ...debugStatusPayload(),
     ...extra
@@ -3139,6 +3164,16 @@ async function recoverShortfallChain(tabId, profile, type, seen, totalList, opti
     if (workerAdded > 0) notes.push(`worker:+${workerAdded}`);
   }
 
+  if (listFetchNeedsMore(type, totalList)) {
+    const gap = totalList != null ? totalList - curList(type).length : null;
+    const runTailGap = async () => fetchListTailGap(tabId, profile, type, seen, totalList);
+    const tailGapAdded = gap != null && gap > 0 && gap <= 20
+      ? await withFastScrollRecoveryBoost(runTailGap)
+      : await runTailGap();
+    totalAdded += tailGapAdded;
+    if (tailGapAdded > 0) notes.push(`tail-gap:+${tailGapAdded}`);
+  }
+
   return {
     totalAdded,
     summary: notes.length ? notes.join(', ') : ''
@@ -5359,10 +5394,26 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
     : (result.shortfall || 0);
 
   if (shortBy > 0 && shortBy <= 100 && tabId) {
-    const chain = await recoverShortfallChain(tabId, profile, type, seen, totalList, { skipWarmup: true });
+    const runChain = () => recoverShortfallChain(tabId, profile, type, seen, totalList, { skipWarmup: true });
+    const chain = shortBy <= 20
+      ? await withFastScrollRecoveryBoost(runChain)
+      : await runChain();
     if (chain.totalAdded > 0) {
       shortBy = totalList != null ? Math.max(0, totalList - curList(type).length) : 0;
       const tailNote = `shortfall (${chain.summary})`;
+      result.attemptSummary = result.attemptSummary
+        ? `${result.attemptSummary} | ${tailNote}`
+        : tailNote;
+    }
+  }
+
+  if (shortBy > 0 && shortBy <= 20 && tabId && listFetchNeedsMore(type, totalList)) {
+    const tailAdded = await withFastScrollRecoveryBoost(
+      () => fetchListTailGap(tabId, profile, type, seen, totalList)
+    );
+    if (tailAdded > 0) {
+      shortBy = Math.max(0, totalList - curList(type).length);
+      const tailNote = `final tail-gap:+${tailAdded}`;
       result.attemptSummary = result.attemptSummary
         ? `${result.attemptSummary} | ${tailNote}`
         : tailNote;
@@ -5974,6 +6025,7 @@ async function getStatusAsync() {
     fetchModeLabel: fetchModeLabel(fetchMode),
     fastScroll: fastScrollEnabled,
     fastScrollLabel: scrollModeLabel(),
+    listStats: buildListStats(),
     ...subscriptionPayload(),
     ...debugStatusPayload()
   });
@@ -6000,6 +6052,7 @@ function getStatus() {
     fetchModeLabel: fetchModeLabel(jobState.fetchMode || XC_FETCH_MODE_DEFAULT),
     fastScroll: fastScrollEnabled,
     fastScrollLabel: scrollModeLabel(),
+    listStats: buildListStats(),
     ...subscriptionPayload(),
     ...debugStatusPayload()
   });

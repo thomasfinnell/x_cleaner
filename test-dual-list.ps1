@@ -25,7 +25,7 @@ foreach ($f in $required) {
 
 # Manifest JSON
 $manifest = Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
-Assert 'manifest version 0.90' ($manifest.version -eq '0.90')
+Assert 'manifest version 0.91' ($manifest.version -eq '0.91')
 Assert 'background service worker' ($manifest.background.service_worker -eq 'background.js')
 
 # Action wiring (popup/background/content agree)
@@ -92,6 +92,16 @@ Assert 'popup fast checkbox' ($popupHtml -match 'id="fastScroll"')
 Assert 'HUD fast checkbox' ($content -match 'xcleaner-fast-scroll')
 Assert 'popup fast scroll warning' ($popup -match 'shadowban')
 Assert 'runExportFlow passes fastScroll' ($popup -match 'fastScroll')
+
+# Dual list cards + switch lock
+Assert 'background buildListStats' ($bg -match 'function buildListStats')
+Assert 'background listStats in status' ($bg -match 'listStats: buildListStats')
+Assert 'popup following card' ($popupHtml -match 'id="followingCard"')
+Assert 'popup followers card' ($popupHtml -match 'id="followersCard"')
+Assert 'HUD following card' ($content -match 'xcleaner-following-card')
+Assert 'HUD followers card' ($content -match 'xcleaner-followers-card')
+Assert 'list switch only locked during fetch' ($bg -match 'activeFetch\?\.running \|\| activeEnrich\?\.running')
+Assert 'small shortfall tail-gap recovery' ($bg -match 'fetchListTailGap')
 
 Write-Host ""
 Write-Host "Results: $passed passed, $failed failed"

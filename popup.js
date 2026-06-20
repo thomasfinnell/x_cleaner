@@ -43,6 +43,10 @@ const accountEl = document.getElementById('account');
 const methodEl = document.getElementById('method');
 const fetchModeSelect = document.getElementById('fetchModeSelect');
 const progressEl = document.getElementById('progress');
+const followingCardEl = document.getElementById('followingCard');
+const followersCardEl = document.getElementById('followersCard');
+const followingCountEl = document.getElementById('followingCount');
+const followersCountEl = document.getElementById('followersCount');
 const statusEl = document.getElementById('status');
 const statusLogEl = document.getElementById('statusLog');
 const statusLogLabelEl = document.getElementById('statusLogLabel');
@@ -200,40 +204,67 @@ function mutualsSummaryLine(mutuals) {
   return line;
 }
 
-function renderMutuals(state) {
-  const mutuals = state.mutuals;
+function formatListTotal(total) {
+  if (total == null || total === '') return '—';
+  const num = Number(total);
+  return Number.isFinite(num) ? num.toLocaleString() : '—';
+}
+
+function renderListCards(state) {
+  const stats = state.listStats || {};
   const stored = state.storedCounts || {};
   const activeType = state.listType || currentListType;
-  const activeLabel = listLabel(activeType);
-  const otherLabel = activeType === 'followers' ? 'Following' : 'Followers';
-  const otherCount = activeType === 'followers' ? stored.following : stored.followers;
-  const activeCount = state.count || (activeType === 'followers' ? stored.followers : stored.following) || 0;
-  const mutualLine = mutualsSummaryLine(mutuals);
 
-  if ((state.reason === 'complete' || state.reason === 'stopped') && activeCount > 0) {
-    let line = `${activeLabel}: ${activeCount.toLocaleString()} collected`;
-    if (otherCount > 0) {
-      line += ` • ${otherLabel}: ${otherCount.toLocaleString()} saved (prior session)`;
-    }
-    if (mutualLine) line += ` • ${mutualLine}`;
-    mutualsEl.textContent = line;
-    return;
+  const following = stats.following || {
+    count: stored.following || 0,
+    rawCount: stored.following || 0,
+    total: state.totalFollowing ?? null
+  };
+  const followers = stats.followers || {
+    count: stored.followers || 0,
+    rawCount: stored.followers || 0,
+    total: state.totalFollowers ?? null
+  };
+
+  if (followingCountEl) {
+    followingCountEl.textContent = `${(following.count || 0).toLocaleString()} / ${formatListTotal(following.total)}`;
+  }
+  if (followersCountEl) {
+    followersCountEl.textContent = `${(followers.count || 0).toLocaleString()} / ${formatListTotal(followers.total)}`;
   }
 
-  if (state.isScraping && activeCount > 0 && mutualLine) {
-    mutualsEl.textContent = mutualLine;
+  followingCardEl?.classList.toggle('active', activeType !== 'followers');
+  followersCardEl?.classList.toggle('active', activeType === 'followers');
+
+  const mutualLine = mutualsSummaryLine(state.mutuals);
+  mutualsEl.textContent = mutualLine || '';
+}
+
+function renderActiveProgress(state) {
+  const activeType = state.listType || currentListType;
+  const stats = state.listStats || {};
+  const activeStats = activeType === 'followers' ? stats.followers : stats.following;
+  const count = activeStats?.count ?? state.count ?? 0;
+  const rawCount = activeStats?.rawCount ?? state.rawCount ?? count;
+
+  if (state.isEnriching && state.enrichTotal) {
+    progressEl.textContent =
+      `${listLabel(activeType)}: checking ${(state.enrichProcessed || 0).toLocaleString()} / ${state.enrichTotal.toLocaleString()}`;
     return;
   }
-
-  if (!mutuals?.hasBoth && !mutuals?.hasRelationshipData) {
-    const parts = [];
-    if (stored.following > 0) parts.push(`${stored.following.toLocaleString()} following saved`);
-    if (stored.followers > 0) parts.push(`${stored.followers.toLocaleString()} followers saved`);
-    mutualsEl.textContent = parts.length ? parts.join(' • ') : '';
+  if (state.reason === 'filtering' || state.reason === 'filtered') {
+    progressEl.textContent = `${listLabel(activeType)} filter: ${count.toLocaleString()} / ${rawCount.toLocaleString()}`;
     return;
   }
-
-  mutualsEl.textContent = mutualLine;
+  if (state.isScraping && state.status) {
+    progressEl.textContent = state.status;
+    return;
+  }
+  if (state.status && (state.reason === 'complete' || state.reason === 'stopped')) {
+    progressEl.textContent = state.status;
+    return;
+  }
+  progressEl.textContent = '';
 }
 
 function renderProgress(state) {
@@ -264,17 +295,8 @@ function renderProgress(state) {
     fastScrollEl.checked = !!state.fastScroll;
   }
   renderSubscription(state);
-
-  if (state.isEnriching && state.enrichTotal) {
-    progressEl.textContent =
-      `${(state.enrichProcessed || 0).toLocaleString()} / ${state.enrichTotal.toLocaleString()} checked`;
-  } else if (state.reason === 'filtering' || state.reason === 'filtered') {
-    progressEl.textContent = `${count.toLocaleString()} / ${rawCount.toLocaleString()}`;
-  } else {
-    progressEl.textContent = `${count.toLocaleString()} / ${formatTotal(state)}`;
-  }
-
-  renderMutuals(state);
+  renderListCards(state);
+  renderActiveProgress(state);
 
   const busy = !!state.isScraping;
   const listLocked = isListTypeLocked(state);
