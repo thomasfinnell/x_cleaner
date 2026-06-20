@@ -360,6 +360,11 @@ function ensureHud() {
       }
       #${HUD_ID} .xc-stop { background: #536471; color: #fff; }
       #${HUD_ID} .xc-filter-btn { background: #536471; color: #fff; }
+      #${HUD_ID} .xc-view {
+        background: #38444d;
+        color: #fff;
+        border: 1px solid #536471;
+      }
       #${HUD_ID} .xc-export { background: #1d9bf0; color: #fff; }
       #${HUD_ID} .xc-export.export-locked { background: #536471; }
       #${HUD_ID} .xc-sub {
@@ -540,6 +545,7 @@ function ensureHud() {
         <button class="xc-subscribe" id="xcleaner-subscribe" type="button">Subscribe @d2fl</button>
       </div>
     </div>
+    <button class="xc-view" id="xcleaner-view" type="button" title="Preview first 5 records in the active list">View</button>
     <button class="xc-export" id="xcleaner-export" title="Requires @d2fl subscription">Export CSV</button>
     <div class="xc-import">
       <div class="xc-import-title">Load CSV</div>
@@ -622,6 +628,14 @@ function ensureHud() {
   hud.querySelector('#xcleaner-stop').addEventListener('click', async () => {
     const result = await sendToBackground({ action: 'stopScrape' });
     if (result) updateHud(result);
+  });
+
+  hud.querySelector('#xcleaner-view')?.addEventListener('click', () => {
+    const listType = selectedHudListType();
+    xcOpenListPreview(
+      (type) => sendToBackground({ action: 'getListPreview', listType: type }),
+      listType
+    );
   });
 
   hud.querySelector('#xcleaner-export').addEventListener('click', () => {
@@ -908,6 +922,7 @@ function updateHud(state = {}) {
   const startBtn = hud.querySelector('#xcleaner-start');
   const freshStartEl = hud.querySelector('#xcleaner-fresh-start');
   const stopBtn = hud.querySelector('#xcleaner-stop');
+  const viewBtn = hud.querySelector('#xcleaner-view');
   const exportBtn = hud.querySelector('#xcleaner-export');
   const filterBtn = hud.querySelector('#xcleaner-filter');
   const subStatusEl = hud.querySelector('#xcleaner-sub-status');
@@ -933,6 +948,14 @@ function updateHud(state = {}) {
   if (freshStartEl) freshStartEl.disabled = busy;
   if (fastScrollEl) fastScrollEl.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
+  const typeStats = type === 'followers' ? followers : following;
+  const previewCount = typeStats?.count ?? stored[type] ?? count;
+  if (viewBtn) {
+    viewBtn.disabled = previewCount === 0;
+    viewBtn.title = previewCount > 0
+      ? `Preview first 5 ${label} records`
+      : 'Collect or import a list first';
+  }
   exportBtn.disabled = count === 0 || busy || !canExport;
   exportBtn.classList.toggle('export-locked', count > 0 && !canExport);
   exportBtn.title = canExport ? 'Download CSV' : 'Export requires @d2fl subscription';

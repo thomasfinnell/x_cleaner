@@ -7,6 +7,7 @@ if (appTitleEl && manifest?.version) {
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const exportBtn = document.getElementById('exportBtn');
+const viewBtn = document.getElementById('viewBtn');
 const filterBtn = document.getElementById('filterBtn');
 const removeMutualsEl = document.getElementById('removeMutuals');
 const removeBlueEl = document.getElementById('removeBlue');
@@ -94,6 +95,15 @@ function selectedListType() {
 
 function selectedImportMode() {
   return importModeReplaceEl?.checked ? 'replace' : 'append';
+}
+
+function activeListCount(state = {}) {
+  const type = state.listType || currentListType || 'following';
+  const stats = state.listStats || {};
+  const typeStats = type === 'followers' ? stats.followers : stats.following;
+  if (typeStats?.count != null) return typeStats.count;
+  if (state.storedCounts?.[type] != null) return state.storedCounts[type];
+  return state.count || 0;
 }
 
 function listLabel(type = currentListType) {
@@ -315,6 +325,13 @@ function renderProgress(state) {
   if (fastScrollEl) fastScrollEl.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
   const canExport = !!state.canExport;
+  const previewCount = activeListCount(state);
+  if (viewBtn) {
+    viewBtn.disabled = previewCount === 0;
+    viewBtn.title = previewCount > 0
+      ? `Preview first 5 ${listLabel(state.listType || currentListType).toLowerCase()} records`
+      : 'Collect or import a list first';
+  }
   exportBtn.disabled = count === 0 || !canExport;
   exportBtn.classList.toggle('export-locked', count > 0 && !canExport);
   exportBtn.title = canExport
@@ -567,6 +584,11 @@ checkSubBtn.addEventListener('click', async () => {
 upgradeBtn.addEventListener('click', () => {
   sendBackground('openSubscribe');
   closePopup();
+});
+
+viewBtn?.addEventListener('click', () => {
+  if (viewBtn.disabled) return;
+  xcOpenListPreview((listType) => sendBackground('getListPreview', { listType }), selectedListType());
 });
 
 exportBtn.addEventListener('click', () => {

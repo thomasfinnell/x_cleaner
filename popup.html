@@ -9,6 +9,7 @@
     #startBtn { background: #111; color: #fff; }
     #stopBtn { background: #536471; color: #fff; }
     #exportBtn { background: #1d9bf0; color: #fff; display: block; }
+    #viewBtn { background: #eef2f6; color: #111; border: 1px solid #cfd9de; display: block; }
     #account { font-size: 13px; color: #444; margin-bottom: 8px; }
     #method { font-size: 11px; color: #666; margin-bottom: 8px; }
     .list-cards {
@@ -348,6 +349,7 @@
     </label>
     <button id="filterBtn" type="button">Filter</button>
   </fieldset>
+  <button id="viewBtn" type="button" title="Preview first 5 records in the active list">View</button>
   <button id="exportBtn" title="Requires @d2fl subscription">Export CSV</button>
   <fieldset class="import-box">
     <legend>Load CSV</legend>
@@ -367,6 +369,7 @@
   <div id="statusLogLabel">Status log</div>
   <div id="statusLog" title="Click to copy status log"></div>
   <div class="hint">Requires an open, logged-in x.com tab.</div>
+  <script src="list-preview.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

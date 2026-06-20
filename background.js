@@ -1925,6 +1925,53 @@ function formatCsvBool(value) {
   return '';
 }
 
+const LIST_PREVIEW_COLUMNS = [
+  { key: 'username', label: 'username' },
+  { key: 'display_name', label: 'display_name' },
+  { key: 'friends_count', label: 'friends_count' },
+  { key: 'followers_count', label: 'followers_count' },
+  { key: 'tweet_count', label: 'tweet_count' },
+  { key: 'created_at', label: 'created_at' },
+  { key: 'bio', label: 'bio' },
+  { key: 'is_blue', label: 'is_blue' },
+  { key: 'default_avatar', label: 'default_avatar' },
+  { key: 'you_follow', label: 'you_follow' },
+  { key: 'follows_you', label: 'follows_you' },
+  { key: 'last_tweet_at', label: 'last_tweet_at' }
+];
+
+function mapListPreviewRow(user) {
+  return {
+    username: user.username || '',
+    display_name: user.display_name ?? user.name ?? '',
+    friends_count: user.friends_count ?? '',
+    followers_count: user.followers_count ?? '',
+    tweet_count: user.tweet_count ?? '',
+    created_at: user.created_at ?? '',
+    bio: accountBio(user),
+    is_blue: user.is_blue ?? false,
+    default_avatar: user.default_avatar ?? false,
+    you_follow: formatCsvBool(user.you_follow),
+    follows_you: formatCsvBool(user.follows_you),
+    last_tweet_at: formatLastActiveField(user.last_active_ms)
+  };
+}
+
+async function getListPreview(requestedType = listType) {
+  const type = LIST_CONFIG[requestedType] ? requestedType : listType;
+  await restoreListState(type);
+  const cfg = listCfg(type);
+  const users = curList(type).slice(0, 5);
+  return {
+    ok: true,
+    listType: type,
+    listLabel: cfg.label,
+    total: curList(type).length,
+    columns: LIST_PREVIEW_COLUMNS,
+    rows: users.map(mapListPreviewRow)
+  };
+}
+
 function buildCsv(users) {
   const header =
     'username,display_name,friends_count,followers_count,tweet_count,created_at,bio,is_blue,default_avatar,you_follow,follows_you,last_tweet_at\n';
@@ -6522,6 +6569,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         break;
       case 'exportCSV':
         sendResponse(await exportCSV());
+        break;
+      case 'getListPreview':
+        sendResponse(await getListPreview(message.listType));
         break;
       case 'loadListCsv':
         sendResponse(await loadListFromCsv(message.listType || listType, message.csvText || '', {

@@ -17,7 +17,7 @@ function Assert($name, $condition) {
 # Required files
 $required = @(
   'manifest.json', 'background.js', 'popup.js', 'popup.html', 'content.js',
-  'api-fetch.js', 'xc-fetch-sniffer.js'
+  'list-preview.js', 'api-fetch.js', 'xc-fetch-sniffer.js'
 )
 foreach ($f in $required) {
   Assert "file exists: $f" (Test-Path (Join-Path $root $f))
@@ -123,6 +123,11 @@ Assert 'persistent popup when debug log' ($bg -match 'configureActionPopupForDeb
 Assert 'gentle scroll inlined findRegion' ($api -match 'function injectedGentleScrollStep[\s\S]*?const findRegion = \(\) =>')
 Assert 'observe keeps scrolling when short' ($bg -match 'stillShort && gap')
 Assert 'popup observe method label' ($popup -match "state\.method === 'observe'")
+Assert 'background getListPreview action' ($bg -match "case 'getListPreview'")
+Assert 'list preview modal helper' ((Get-Content (Join-Path $root 'list-preview.js') -Raw) -match 'xcShowListPreviewModal')
+Assert 'popup view button' ($popupHtml -match 'id="viewBtn"')
+Assert 'HUD view button' ($content -match 'id="xcleaner-view"')
+Assert 'manifest loads list-preview in content' (($manifest.content_scripts | ForEach-Object { $_.js }) -join ',' -match 'list-preview\.js')
 
 Write-Host ""
 Write-Host "Results: $passed passed, $failed failed"

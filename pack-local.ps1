@@ -25,6 +25,7 @@ $include = @(
   "background.js",
   "popup.html",
   "popup.js",
+  "list-preview.js",
   "content.js",
   "xc-fetch-sniffer.js",
   "xc-rest-bridge.js",
