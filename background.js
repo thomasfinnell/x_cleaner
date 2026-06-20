@@ -71,7 +71,7 @@ const XC_PRE_LIST_FETCH_SETTLE_MS = 1500;
 const XC_POST_SNIFFER_SETTLE_MS = 800;
 
 // Set false to hide the scrollable status log in the HUD/popup.
-const XC_DEBUG_STATUS_LOG = false;
+const XC_DEBUG_STATUS_LOG = true;
 const XC_DEBUG_STATUS_LOG_MAX_LINES = 50;
 const XC_DEBUG_STATUS_LOG_STORAGE_KEY = 'xc_debug_status_log';
 
@@ -353,10 +353,21 @@ async function maybeGentleDwellPause() {
 async function scrollListStep(tabId) {
   if (fastScrollEnabled) {
     await executeOnTab(tabId, injectedScrollListStep);
+    appendDebugStatusLog({
+      reason: 'scroll-step',
+      method: jobState.method || listType,
+      status: 'Fast scroll step (list column)'
+    });
     return;
   }
-  await gentleScrollStepFromTab(tabId, gentleScrollStepCount);
+  const scrollResult = await gentleScrollStepFromTab(tabId, gentleScrollStepCount);
   gentleScrollStepCount += 1;
+  appendDebugStatusLog({
+    reason: 'scroll-step',
+    method: jobState.method || 'observe',
+    passes: gentleScrollStepCount,
+    status: `Gentle scroll #${gentleScrollStepCount}: ${scrollResult?.pattern || 'step'}${scrollResult?.moved === false ? ' (no movement)' : ''}`
+  });
   await maybeGentleDwellPause();
 }
 
@@ -2384,9 +2395,11 @@ function shouldAppendDebugStatusLog(entry = {}) {
   if (entry.method === 'rest-v1.1' || entry.method === 'graphql-worker' || entry.method === 'graphql') {
     return true;
   }
+  if (entry.method === 'observe') return true;
   if (entry.method && entry.method !== 'native-sniffer') return true;
   if (entry.addedLastPage > 0) return true;
   if (entry.parsedLastPage > 0 && !entry.addedLastPage) return true;
+  if (entry.reason === 'scroll-step') return true;
   if (entry.reason === 'collecting' && entry.method === 'native-sniffer') return false;
   return !!status;
 }

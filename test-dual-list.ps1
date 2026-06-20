@@ -113,6 +113,7 @@ Assert 'list mutation observer start' ($api -match 'function injectedStartListOb
 Assert 'list mutation observer drain' ($api -match 'function injectedDrainObserveListUsers')
 Assert 'light dom collect helper' ($api -match 'function injectedCollectVisibleListUsersLight')
 Assert 'observe scroll mode label' ($bg -match 'observe \+ gentle scroll')
+Assert 'debug status log enabled' ($bg -match 'XC_DEBUG_STATUS_LOG = true')
 Assert 'popup observe method label' ($popup -match "state\.method === 'observe'")
 
 Write-Host ""
