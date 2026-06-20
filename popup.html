@@ -236,10 +236,33 @@
       line-height: 1.35;
       min-height: 14px;
     }
+    .fast-scroll-row {
+      display: block;
+      margin: 0 0 10px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #333;
+    }
+    .fast-toast {
+      margin: 0 0 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: #fff4e5;
+      border: 1px solid #f5c26b;
+      color: #7a4d00;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .fast-toast[hidden] { display: none; }
   </style>
 </head>
 <body>
-  <h2>X Cleaner v0.85</h2>
+  <h2>X Cleaner v0.90</h2>
+  <label class="fast-scroll-row" title="Fast uses aggressive scrolling and may reduce reach on X">
+    <input type="checkbox" id="fastScroll">
+    Fast
+  </label>
+  <div id="fastScrollToast" class="fast-toast" hidden></div>
   <div id="account">@—</div>
   <div class="list-toggle">
     <label><input type="radio" name="listType" id="modeFollowing" value="following" checked><span>Following</span></label>

@@ -1,6 +1,6 @@
 # X Cleaner Chrome Extension
 
-Version: 0.86
+Version: 0.90
 
 Export your X (Twitter) **Following** and **Followers** lists to CSV. Filter lists (mutuals, inactive, bots, etc.) and load CSV files for offline editing or handoff to [X Follower Remover](https://github.com/thomasfinnell/X-follower-Remover).
 
@@ -27,9 +27,10 @@ Do not drag a `.crx` onto Chrome — modern Chrome blocks sideloaded CRX files.
 
 1. Keep a logged-in x.com tab open
 2. Click the extension icon (or use the on-page HUD panel)
-3. Choose **Following** or **Followers**, then **Start Collection**
-4. Optionally run **Filter** (remove mutuals, blue checks, inactive accounts, bots)
-5. **Export CSV** when ready (requires @d2fl subscription), or use **Load CSV** to replace/append a list from a prior export
+3. Leave **Fast** unchecked for gentle overnight pacing (default). Check **Fast** only if you need speed and accept possible reduced reach on X.
+4. Choose **Following** or **Followers**, then **Start Collection**
+5. Optionally run **Filter** (remove mutuals, blue checks, inactive accounts, bots)
+6. **Export CSV** when ready (requires @d2fl subscription), or use **Load CSV** to replace/append a list from a prior export
 
 Free tier: fetch and CSV import are capped at 200 records. Subscribe to [@d2fl on X](https://x.com/d2fl/creator-subscriptions/subscribe) for unlimited fetch/export.
 

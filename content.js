@@ -5,6 +5,8 @@ const FILTER_MONTHS_MIN = 1;
 const FILTER_MONTHS_MAX = 24;
 const FILTER_MONTHS_DEFAULT = 6;
 const INACTIVE_MONTHS_PREF_KEY = 'xc_inactive_months_pref';
+const FAST_SCROLL_PREF_KEY = 'xc_fast_scroll_pref';
+const FAST_SCROLL_WARN = 'Fast mode uses aggressive scrolling and may trigger reduced reach or a shadowban on X. Leave unchecked for gentle overnight pacing.';
 
 function isExtensionContextValid() {
   try {
@@ -379,11 +381,33 @@ function ensureHud() {
         line-height: 1.35;
         min-height: 12px;
       }
+      #${HUD_ID} .xc-fast-scroll {
+        margin: 0 0 8px;
+        font-size: 11px;
+        font-weight: 700;
+        color: #cfd9de;
+      }
+      #${HUD_ID} .xc-fast-toast {
+        margin: 0 0 8px;
+        padding: 8px;
+        border-radius: 8px;
+        background: rgba(255, 196, 77, 0.15);
+        border: 1px solid rgba(245, 194, 107, 0.55);
+        color: #ffd400;
+        font-size: 10px;
+        line-height: 1.4;
+      }
+      #${HUD_ID} .xc-fast-toast[hidden] { display: none; }
     </style>
     <div class="xc-header">
       <div class="xc-title">X Cleaner</div>
       <button class="xc-close" id="xcleaner-close" type="button" title="Close panel" aria-label="Close panel">×</button>
     </div>
+    <label class="xc-fast-scroll" title="Fast uses aggressive scrolling and may reduce reach on X">
+      <input type="checkbox" id="xcleaner-fast-scroll">
+      Fast
+    </label>
+    <div class="xc-fast-toast" id="xcleaner-fast-toast" hidden></div>
     <div class="xc-method" id="xcleaner-method">Native sniffer (captures X's own requests)</div>
     <div class="xc-toggle">
       <label><input type="radio" name="xc-list-type" id="xcleaner-mode-following" value="following" checked>Following</label>
@@ -447,6 +471,44 @@ function ensureHud() {
   document.documentElement.appendChild(hud);
   wireHudFilterMonthSteppers(hud);
 
+  const fastScrollEl = hud.querySelector('#xcleaner-fast-scroll');
+  const fastScrollToastEl = hud.querySelector('#xcleaner-fast-toast');
+  let fastScrollToastTimer = null;
+
+  const showHudFastScrollWarning = () => {
+    if (!fastScrollToastEl) return;
+    fastScrollToastEl.textContent = FAST_SCROLL_WARN;
+    fastScrollToastEl.hidden = false;
+    clearTimeout(fastScrollToastTimer);
+    fastScrollToastTimer = setTimeout(() => {
+      fastScrollToastEl.hidden = true;
+    }, 8000);
+  };
+
+  const hideHudFastScrollWarning = () => {
+    if (!fastScrollToastEl) return;
+    fastScrollToastEl.hidden = true;
+    clearTimeout(fastScrollToastTimer);
+  };
+
+  if (isExtensionContextValid()) {
+    chrome.storage.local.get(FAST_SCROLL_PREF_KEY, (res) => {
+      if (chrome.runtime.lastError || !fastScrollEl) return;
+      fastScrollEl.checked = !!res[FAST_SCROLL_PREF_KEY];
+    });
+  }
+
+  fastScrollEl?.addEventListener('change', async () => {
+    const enabled = !!fastScrollEl.checked;
+    if (enabled) {
+      showHudFastScrollWarning();
+    } else {
+      hideHudFastScrollWarning();
+    }
+    const result = await sendToBackground({ action: 'setFastScroll', fastScroll: enabled });
+    if (result?.ok !== false) updateHud(result);
+  });
+
   hud.querySelector('#xcleaner-close').addEventListener('click', () => {
     hideHud();
   });
@@ -454,11 +516,12 @@ function ensureHud() {
   hud.querySelector('#xcleaner-start').addEventListener('click', () => {
     const listType = selectedHudListType();
     const forceRefresh = !!hud.querySelector('#xcleaner-fresh-start')?.checked;
+    const fastScroll = !!hud.querySelector('#xcleaner-fast-scroll')?.checked;
     const statusEl = hud.querySelector('#xcleaner-status');
     statusEl.textContent = forceRefresh
       ? `Fresh start — clearing cached ${listLabel(listType).toLowerCase()}...`
       : `Starting ${listLabel(listType).toLowerCase()} collection...`;
-    sendToBackground({ action: 'runExportFlow', listType, forceRefresh });
+    sendToBackground({ action: 'runExportFlow', listType, forceRefresh, fastScroll });
   });
 
   hud.querySelector('#xcleaner-stop').addEventListener('click', () => {
@@ -668,8 +731,13 @@ function updateHud(state = {}) {
   const type = state.listType || 'following';
   const label = listLabel(type).toLowerCase();
 
+  const scrollNote = state.fastScrollLabel || (state.fastScroll ? 'fast scroll' : 'gentle scroll');
   hud.querySelector('#xcleaner-method').textContent =
-    `Collect ${listLabel(type)} via native X responses`;
+    `Collect ${listLabel(type)} via native X responses, ${scrollNote}`;
+  const fastScrollEl = hud.querySelector('#xcleaner-fast-scroll');
+  if (fastScrollEl && state.fastScroll != null && fastScrollEl.checked !== !!state.fastScroll) {
+    fastScrollEl.checked = !!state.fastScroll;
+  }
   hud.querySelector('#xcleaner-mode-following').checked = type !== 'followers';
   hud.querySelector('#xcleaner-mode-followers').checked = type === 'followers';
   const listLocked = isListTypeLocked(state);
@@ -758,6 +826,7 @@ function updateHud(state = {}) {
   startBtn.style.display = busy ? 'none' : 'block';
   startBtn.disabled = filterBusy;
   if (freshStartEl) freshStartEl.disabled = busy;
+  if (fastScrollEl) fastScrollEl.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
   exportBtn.disabled = count === 0 || busy || !canExport;
   exportBtn.classList.toggle('export-locked', count > 0 && !canExport);

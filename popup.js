@@ -59,6 +59,12 @@ const importFollowingInput = document.getElementById('importFollowingInput');
 const importFollowersInput = document.getElementById('importFollowersInput');
 const importInfoEl = document.getElementById('importInfo');
 const importModeReplaceEl = document.getElementById('importModeReplace');
+const fastScrollEl = document.getElementById('fastScroll');
+const fastScrollToastEl = document.getElementById('fastScrollToast');
+
+const FAST_SCROLL_PREF_KEY = 'xc_fast_scroll_pref';
+const FAST_SCROLL_WARN = 'Fast mode uses aggressive scrolling and may trigger reduced reach or a shadowban on X. Leave unchecked for gentle overnight pacing.';
+let fastScrollToastTimer = null;
 
 function closePopup() {
   window.close();
@@ -252,7 +258,11 @@ function renderProgress(state) {
     : state.method === 'graphql-worker'
       ? 'GraphQL worker'
       : (state.method === 'native-sniffer' ? 'sniffer' : engineNote);
-  methodEl.textContent = `Collect ${listLabel()} via ${activeMethod} (${limitNote})`;
+  const scrollNote = state.fastScrollLabel || (state.fastScroll ? 'fast scroll' : 'gentle scroll');
+  methodEl.textContent = `Collect ${listLabel()} via ${activeMethod}, ${scrollNote} (${limitNote})`;
+  if (fastScrollEl && state.fastScroll != null && fastScrollEl.checked !== !!state.fastScroll) {
+    fastScrollEl.checked = !!state.fastScroll;
+  }
   renderSubscription(state);
 
   if (state.isEnriching && state.enrichTotal) {
@@ -272,6 +282,7 @@ function renderProgress(state) {
   modeFollowingEl.disabled = listLocked;
   modeFollowersEl.disabled = listLocked;
   if (freshStartEl) freshStartEl.disabled = busy;
+  if (fastScrollEl) fastScrollEl.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
   const canExport = !!state.canExport;
   exportBtn.disabled = count === 0 || !canExport;
@@ -426,16 +437,45 @@ modeFollowersEl.addEventListener('change', () => {
   if (modeFollowersEl.checked) switchListType('followers');
 });
 
+function showFastScrollWarning() {
+  if (!fastScrollToastEl) return;
+  fastScrollToastEl.textContent = FAST_SCROLL_WARN;
+  fastScrollToastEl.hidden = false;
+  clearTimeout(fastScrollToastTimer);
+  fastScrollToastTimer = setTimeout(() => {
+    fastScrollToastEl.hidden = true;
+  }, 8000);
+}
+
+function hideFastScrollWarning() {
+  if (!fastScrollToastEl) return;
+  fastScrollToastEl.hidden = true;
+  clearTimeout(fastScrollToastTimer);
+}
+
+fastScrollEl?.addEventListener('change', async () => {
+  const enabled = !!fastScrollEl.checked;
+  if (enabled) {
+    showFastScrollWarning();
+  } else {
+    hideFastScrollWarning();
+  }
+  const result = await sendBackground('setFastScroll', { fastScroll: enabled });
+  if (result?.ok !== false) updateUI(result);
+});
+
 startBtn.addEventListener('click', async () => {
   const listType = selectedListType();
   const forceRefresh = !!freshStartEl?.checked;
   const fetchMode = 'auto';
+  const fastScroll = !!fastScrollEl?.checked;
   startBtn.disabled = true;
   setStatus('Opening on-page panel on your X tab...');
   const result = await sendBackground('runExportFlow', {
     listType,
     fetchMode,
     forceRefresh,
+    fastScroll,
     handoffAfterHud: true
   });
   if (result?.hudReady) {
@@ -583,9 +623,17 @@ wireFilterMonthsStepper({
   readValue: readInactiveMonths
 });
 
+chrome.storage.local.get(FAST_SCROLL_PREF_KEY, (res) => {
+  if (chrome.runtime.lastError || !fastScrollEl) return;
+  fastScrollEl.checked = !!res[FAST_SCROLL_PREF_KEY];
+});
+
 refreshStatus();
 
 sendBackground('getJobState').then((state) => {
+  if (state?.fastScroll != null && fastScrollEl) {
+    fastScrollEl.checked = !!state.fastScroll;
+  }
   if (state?.isScraping) startPolling();
 });
 

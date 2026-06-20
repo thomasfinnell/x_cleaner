@@ -57,6 +57,7 @@ const XC_LIST_TYPE_PREF_KEY = 'xc_list_type_pref';
 const XC_FETCH_MODE_PREF_KEY = 'xc_fetch_mode_pref';
 const XC_FETCH_MODES = ['auto', 'rest', 'sniffer'];
 const XC_FETCH_MODE_DEFAULT = 'auto';
+const XC_FAST_SCROLL_PREF_KEY = 'xc_fast_scroll_pref';
 const XC_PERSIST_VERSION = 1;
 const XC_PERSIST_COLLECT_INTERVAL = 250;
 const XC_PERSIST_DEBOUNCE_MS = 15000;
@@ -81,6 +82,8 @@ const lastPersistedCounts = { following: 0, followers: 0 };
 let enrichArchiveStore = null;
 let enrichArchiveSaveTimer = null;
 const freshStartBackupTypes = new Set();
+let fastScrollEnabled = false;
+let gentleScrollStepCount = 0;
 
 function listCfg(type = listType) {
   return LIST_CONFIG[type] || LIST_CONFIG.following;
@@ -283,6 +286,103 @@ async function setFetchMode(_mode) {
   return XC_FETCH_MODE_DEFAULT;
 }
 
+async function loadFastScrollPref() {
+  const res = await chrome.storage.local.get(XC_FAST_SCROLL_PREF_KEY);
+  fastScrollEnabled = !!res[XC_FAST_SCROLL_PREF_KEY];
+  return fastScrollEnabled;
+}
+
+async function setFastScrollPref(enabled) {
+  fastScrollEnabled = !!enabled;
+  await chrome.storage.local.set({ [XC_FAST_SCROLL_PREF_KEY]: fastScrollEnabled });
+  return fastScrollEnabled;
+}
+
+function scrollModeLabel() {
+  return fastScrollEnabled ? 'fast scroll' : 'gentle scroll';
+}
+
+function scrollJitterMs(base, spread = 0.35) {
+  const delta = Math.floor(base * spread * (Math.random() * 2 - 1));
+  return Math.max(800, base + delta);
+}
+
+async function sleepAfterScrollStep(type = listType, context = 'tail') {
+  if (fastScrollEnabled) {
+    if (context === 'native-loop') {
+      const remaining = jobState.totalFollowing != null || jobState.totalFollowers != null
+        ? (totalForType(type) || 0) - curList(type).length
+        : null;
+      if (remaining != null && remaining > 0 && remaining <= 100) {
+        return type === 'followers' ? 2200 : 1800;
+      }
+      return type === 'followers' ? 2200 : 1800;
+    }
+    if (context === 'shortfall') {
+      return type === 'followers' ? 2500 : 1800;
+    }
+    return type === 'followers' ? 1600 : 1200;
+  }
+
+  if (context === 'nudge') {
+    return scrollJitterMs(9000, 0.35);
+  }
+  if (context === 'shortfall') {
+    return scrollJitterMs(type === 'followers' ? 16000 : 13000, 0.3);
+  }
+  if (context === 'native-loop') {
+    return scrollJitterMs(type === 'followers' ? 15000 : 12000, 0.35);
+  }
+  return scrollJitterMs(type === 'followers' ? 14000 : 11000, 0.35);
+}
+
+async function maybeGentleDwellPause() {
+  if (fastScrollEnabled) return;
+  if (gentleScrollStepCount % 10 !== 0) return;
+  const dwellMs = scrollJitterMs(90000, 0.4);
+  notifyProgress({
+    status: `Gentle pace — pausing ${Math.round(dwellMs / 1000)}s before next scroll...`
+  });
+  await sleep(dwellMs);
+}
+
+async function scrollListStep(tabId) {
+  if (fastScrollEnabled) {
+    await executeOnTab(tabId, injectedScrollListStep);
+    return;
+  }
+  await gentleScrollStepFromTab(tabId, gentleScrollStepCount);
+  gentleScrollStepCount += 1;
+  await maybeGentleDwellPause();
+}
+
+async function scrollListToLoad(tabId) {
+  if (fastScrollEnabled) {
+    await executeOnTab(tabId, injectedScrollListToLoad);
+    return;
+  }
+  for (let i = 0; i < 2; i += 1) {
+    await scrollListStep(tabId);
+    await sleep(scrollJitterMs(3500, 0.3));
+  }
+}
+
+async function scrollListToTop(tabId) {
+  await executeOnTab(tabId, injectedScrollListToTop);
+}
+
+async function pacedNudgeTabScroll(tabId, amount = 900) {
+  if (fastScrollEnabled) {
+    await nudgeTabListScroll(tabId, amount);
+    await sleep(amount > 800 ? 550 : 300);
+    return;
+  }
+  await gentleScrollStepFromTab(tabId, gentleScrollStepCount);
+  gentleScrollStepCount += 1;
+  await sleep(await sleepAfterScrollStep(listType, 'nudge'));
+  await maybeGentleDwellPause();
+}
+
 function fetchModeLabel(mode) {
   if (mode === 'rest') return 'REST v1.1 (200/page)';
   if (mode === 'sniffer') return 'native sniffer + GraphQL';
@@ -347,6 +447,8 @@ function buildHudState(extra = {}) {
     },
     mutuals: computeMutuals(),
     fetchMode: jobState.fetchMode || XC_FETCH_MODE_DEFAULT,
+    fastScroll: fastScrollEnabled,
+    fastScrollLabel: scrollModeLabel(),
     ...subscriptionPayload(),
     ...debugStatusPayload(),
     ...extra
@@ -715,7 +817,7 @@ async function passiveSnifferEnrichPass(tabId, type, ownerUsername) {
   if (!tabId) return 0;
   let totalMerged = 0;
   for (let pass = 0; pass < SNIFFER_ENRICH_PASSES; pass += 1) {
-    await nudgeTabListScroll(tabId, SNIFFER_ENRICH_SCROLL);
+    await pacedNudgeTabScroll(tabId, SNIFFER_ENRICH_SCROLL);
     await sleep(SNIFFER_ENRICH_DELAY_MS);
     totalMerged += await upgradeListFromSnifferDrain(tabId, type, ownerUsername);
   }
@@ -1386,7 +1488,7 @@ function syncBlueFlagsIntoRaw(type) {
 async function refreshBlueFlagsFromSniffer(type) {
   syncBlueFlagsIntoRaw(type);
   if (!(await ensureJobTabId())) return 0;
-  await nudgeTabListScroll(jobTabId, 900);
+  await pacedNudgeTabScroll(jobTabId, 900);
   await sleep(450);
   return upgradeListFromSnifferDrain(jobTabId, type, jobState.username);
 }
@@ -2816,10 +2918,15 @@ async function warmRestListPageContext(tabId, profile, type = listType) {
   }
 
   try {
-    await executeOnTab(tabId, () => {
-      window.scrollTo(0, Math.max(document.body.scrollHeight, 1200));
-    });
-    await sleep(alreadyOnListPage ? Math.min(scrollMs, 1200) : scrollMs);
+    if (fastScrollEnabled) {
+      await executeOnTab(tabId, () => {
+        window.scrollTo(0, Math.max(document.body.scrollHeight, 1200));
+      });
+      await sleep(alreadyOnListPage ? Math.min(scrollMs, 1200) : scrollMs);
+    } else {
+      await scrollListStep(tabId);
+      await sleep(scrollJitterMs(type === 'followers' ? 6000 : 5000, 0.25));
+    }
   } catch (error) {}
 
   await xcRestPrepareSession(tabId);
@@ -2944,9 +3051,10 @@ async function recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen
 
   let totalAdded = 0;
   let lastSeq = 0;
-  const passes = gap <= 10 ? 4 : 2;
-  const scrollDelayMs = type === 'followers' ? 2500 : 1800;
-  const listenMs = type === 'followers' ? 7000 : 5000;
+  const passes = fastScrollEnabled ? (gap <= 10 ? 4 : 2) : (gap <= 10 ? 8 : 12);
+  const listenMs = fastScrollEnabled
+    ? (type === 'followers' ? 7000 : 5000)
+    : (type === 'followers' ? 16000 : 12000);
 
   appendDebugStatusLog({
     status: `Native scroll sniffer: ${gap.toLocaleString()} short — ${passes} scroll passes...`,
@@ -2960,8 +3068,8 @@ async function recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen
   });
 
   for (let pass = 0; pass < passes && !activeFetch?.cancelled && listFetchNeedsMore(type, totalList); pass += 1) {
-    await executeOnTab(tabId, injectedScrollListToLoad);
-    await sleep(scrollDelayMs);
+    await scrollListToLoad(tabId);
+    await sleep(await sleepAfterScrollStep(type, 'shortfall'));
 
     const native = await waitForNativeList(tabId, cfg.opName, lastSeq, listenMs);
     if (native?.users?.length) {
@@ -2974,7 +3082,9 @@ async function recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen
           reason: 'collecting',
           method: 'native-sniffer',
           addedLastPage: added,
-          status: `Scroll sniffer p${pass + 1}: ${curList(type).length.toLocaleString()} / ${totalList.toLocaleString()} (+${added})`
+          status: fastScrollEnabled
+            ? `Scroll sniffer p${pass + 1}: ${curList(type).length.toLocaleString()} / ${totalList.toLocaleString()} (+${added})`
+            : `Gentle sniffer p${pass + 1}: ${curList(type).length.toLocaleString()} / ${totalList.toLocaleString()} (+${added})`
         });
       }
     }
@@ -3114,8 +3224,8 @@ async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalLi
     const capturedOp = await readCapturedListOpNameFromTab(tabId, opName);
     let captured = await readCapturedListTemplateFromTab(tabId, capturedOp || opName);
     if (!captured?.url) {
-      await executeOnTab(tabId, injectedScrollListToLoad);
-      await sleep(type === 'followers' ? 2200 : 1500);
+      await scrollListToLoad(tabId);
+      await sleep(await sleepAfterScrollStep(type, 'shortfall'));
       captured = await readCapturedListTemplateFromTab(tabId, capturedOp || opName);
     }
     let cursor = null;
@@ -3553,22 +3663,28 @@ async function fetchListTailScrollNative(tabId, profile, type, seen, totalList, 
   let totalAdded = 0;
   let stalePasses = 0;
   const gap = totalList != null ? totalList - curList(type).length : null;
-  const listenMs = gap != null && gap <= 15 ? 3500 : 5000;
-  const stepDelayMs = type === 'followers' ? 1600 : 1200;
-  const maxSteps = gap != null && gap <= 15 ? 8 : 12;
+  const listenMs = fastScrollEnabled
+    ? (gap != null && gap <= 15 ? 3500 : 5000)
+    : (gap != null && gap <= 15 ? 12000 : 16000);
+  const maxSteps = fastScrollEnabled
+    ? (gap != null && gap <= 15 ? 8 : 12)
+    : (gap != null && gap <= 15 ? 24 : 80);
+  const staleLimit = fastScrollEnabled ? 6 : 4;
 
   notifyProgress({
     reason: 'collecting',
     method: 'native-sniffer',
-    status: `Step-scrolling ${cfg.label.toLowerCase()} list for missing accounts...`
+    status: fastScrollEnabled
+      ? `Step-scrolling ${cfg.label.toLowerCase()} list for missing accounts...`
+      : `Gentle scroll — ${cfg.label.toLowerCase()} tail (paced for overnight)...`
   });
 
-  await executeOnTab(tabId, injectedScrollListToTop);
-  await sleep(800);
+  await scrollListToTop(tabId);
+  await sleep(fastScrollEnabled ? 800 : 2000);
 
   for (let step = 0; step < maxSteps && !activeFetch?.cancelled && listFetchNeedsMore(type, totalList); step += 1) {
-    await executeOnTab(tabId, injectedScrollListStep);
-    await sleep(stepDelayMs);
+    await scrollListStep(tabId);
+    await sleep(await sleepAfterScrollStep(type, 'tail'));
 
     const native = await waitForNativeList(tabId, cfg.opName, seq, listenMs);
     let added = 0;
@@ -3590,7 +3706,7 @@ async function fetchListTailScrollNative(tabId, profile, type, seen, totalList, 
       });
     } else {
       stalePasses += 1;
-      if (stalePasses >= 6) break;
+      if (stalePasses >= staleLimit) break;
     }
   }
 
@@ -3618,8 +3734,8 @@ async function fetchListTailGraphql(tabId, profile, type, seen, totalList, captu
 
   while (!activeFetch?.cancelled && pages < 30 && listFetchNeedsMore(type, totalList)) {
     if (!cursor) {
-      await executeOnTab(tabId, injectedScrollListToLoad);
-      await sleep(pageDelayMs * 2);
+      await scrollListToLoad(tabId);
+      await sleep(fastScrollEnabled ? pageDelayMs * 2 : await sleepAfterScrollStep(type, 'tail'));
       cursor = await readNativeListCursorFromTab(tabId, cfg.opName);
       if (!cursor && spareCursorIdx < spareCursors.length) {
         cursor = spareCursors[spareCursorIdx];
@@ -3698,8 +3814,8 @@ async function fetchListTailDom(tabId, profile, type, seen, totalList) {
       status: `Bottom scan pass ${pass + 1} for ${gap != null ? gap.toLocaleString() : 'remaining'} ${cfg.label.toLowerCase()}...`
     });
 
-    await executeOnTab(tabId, injectedScrollListToLoad);
-    await sleep(settleMs);
+    await scrollListToLoad(tabId);
+    await sleep(fastScrollEnabled ? settleMs : await sleepAfterScrollStep(type, 'tail'));
 
     const scraped = await collectVisibleListUsersFromTab(tabId, profile.username);
     const added = addNativeUsers({ users: scraped?.users || [] }, seen, profile.username, type);
@@ -3799,8 +3915,8 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
   const pageDelayMs = GRAPHQL_PAGE_DELAY_MS[type] || 600;
   let cursor = await readNativeListCursorFromTab(tabId, opName);
   if (!cursor && seen.size > nativePageSize(type)) {
-    await executeOnTab(tabId, injectedScrollListToLoad);
-    await sleep(pageDelayMs * 2);
+    await scrollListToLoad(tabId);
+    await sleep(fastScrollEnabled ? pageDelayMs * 2 : await sleepAfterScrollStep(type, 'tail'));
     cursor = await readNativeListCursorFromTab(tabId, opName);
     if (!cursor) {
       const resumeCursors = (await readNativeListTailCursorsFromTab(tabId, opName, 4)) || [];
@@ -3894,7 +4010,7 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
       const maxCursorRetries = type === 'followers' && tailGap != null && tailGap > 0 ? 15 : (tailGap != null && tailGap <= 20 ? 12 : 3);
       if (listFetchNeedsMore(type, totalList) && cursorRetries < maxCursorRetries) {
         cursorRetries += 1;
-        await executeOnTab(tabId, injectedScrollListToLoad);
+        await scrollListToLoad(tabId);
         await sleep(pageDelayMs * 2);
         const refreshed = await readNativeListCursorFromTab(tabId, opName);
         if (refreshed && refreshed !== cursor) {
@@ -4171,9 +4287,8 @@ async function runNativeListFetch(tabId, profile, type = listType) {
       continue;
     }
 
-    await executeOnTab(tabId, injectedScrollListToLoad);
-    const scrollDelayMs = remaining > 0 && remaining <= 100 ? 1200 : (type === 'followers' ? 2200 : 1800);
-    await sleep(scrollDelayMs);
+    await scrollListToLoad(tabId);
+    await sleep(await sleepAfterScrollStep(type, 'native-loop'));
   }
 
   if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList) && profile.userId) {
@@ -5205,8 +5320,7 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
 
         let blueMerged = 0;
         if (tabId) {
-          await nudgeTabListScroll(tabId, info.page % 2 === 0 ? 1100 : 650);
-          await sleep(info.page % 2 === 0 ? 550 : 300);
+          await pacedNudgeTabScroll(tabId, info.page % 2 === 0 ? 1100 : 650);
           blueMerged = await upgradeListFromSnifferDrain(tabId, type, profile.username);
         }
 
@@ -5257,8 +5371,13 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
 
   if (tabId) {
     try {
-      await executeOnTab(tabId, () => window.scrollTo(0, Math.max(document.body.scrollHeight, 2400)));
-      await sleep(700);
+      if (fastScrollEnabled) {
+        await executeOnTab(tabId, () => window.scrollTo(0, Math.max(document.body.scrollHeight, 2400)));
+        await sleep(700);
+      } else {
+        await scrollListStep(tabId);
+        await sleep(await sleepAfterScrollStep(type, 'nudge'));
+      }
       const blueMerged = await upgradeListFromSnifferDrain(tabId, type, profile.username);
       if (blueMerged > 0) {
         appendDebugStatusLog({
@@ -5300,6 +5419,13 @@ async function runExportFlow(requestedType = listType, options = {}) {
   if (activeFetch?.running) {
     return { ok: false, error: 'Collection already running.' };
   }
+
+  if (options.fastScroll != null) {
+    await setFastScrollPref(!!options.fastScroll);
+  } else {
+    await loadFastScrollPref();
+  }
+  gentleScrollStepCount = 0;
 
   const type = LIST_CONFIG[requestedType] ? requestedType : listType;
   const cfg = listCfg(type);
@@ -5827,6 +5953,7 @@ async function getStatusAsync() {
     await hydrateSubscriptionFromStorage(jobState.username);
   }
   const fetchMode = await getFetchMode();
+  await loadFastScrollPref();
   const storedCounts = {
     following: listStore.following.list.length,
     followers: listStore.followers.list.length
@@ -5845,6 +5972,8 @@ async function getStatusAsync() {
     fetchTarget: effectiveFetchTarget(totalForType()),
     fetchMode,
     fetchModeLabel: fetchModeLabel(fetchMode),
+    fastScroll: fastScrollEnabled,
+    fastScrollLabel: scrollModeLabel(),
     ...subscriptionPayload(),
     ...debugStatusPayload()
   });
@@ -5869,6 +5998,8 @@ function getStatus() {
     fetchTarget: effectiveFetchTarget(totalForType()),
     fetchMode: jobState.fetchMode || XC_FETCH_MODE_DEFAULT,
     fetchModeLabel: fetchModeLabel(jobState.fetchMode || XC_FETCH_MODE_DEFAULT),
+    fastScroll: fastScrollEnabled,
+    fastScrollLabel: scrollModeLabel(),
     ...subscriptionPayload(),
     ...debugStatusPayload()
   });
@@ -6011,6 +6142,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({
           ok: true,
           fetchMode: await setFetchMode(message.fetchMode),
+          ...(await getStatusAsync())
+        });
+        break;
+      case 'setFastScroll':
+        await setFastScrollPref(!!message.fastScroll);
+        notifyProgress();
+        sendResponse({
+          ok: true,
+          fastScroll: fastScrollEnabled,
+          fastScrollLabel: scrollModeLabel(),
           ...(await getStatusAsync())
         });
         break;

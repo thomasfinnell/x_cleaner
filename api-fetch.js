@@ -871,6 +871,62 @@ function readNativeFollowingList(minSeq) {
   return readNativeList('Following', minSeq);
 }
 
+function findListScrollRegion() {
+  const labels = ['Timeline: Followers', 'Timeline: Following', 'Followers', 'Following'];
+  for (const label of labels) {
+    const region = document.querySelector(`[aria-label="${label}"]`);
+    if (region) return region;
+  }
+  return document.querySelector('main');
+}
+
+function injectedGentleScrollStep(patternIndex = 0) {
+  const patterns = ['page', 'wheel', 'page', 'micro'];
+  const pattern = patterns[Math.abs(Math.floor(patternIndex)) % patterns.length];
+  const region = findListScrollRegion();
+  if (!region) return { pattern, moved: false };
+
+  try {
+    if (pattern === 'page') {
+      const step = Math.max(180, Math.floor(region.clientHeight * 0.85));
+      const before = region.scrollTop;
+      region.scrollTop = Math.min(region.scrollTop + step, region.scrollHeight);
+      return { pattern, moved: region.scrollTop > before };
+    }
+
+    if (pattern === 'wheel') {
+      let moved = false;
+      const chunks = 3 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < chunks; i += 1) {
+        const delta = 90 + Math.floor(Math.random() * 90);
+        const before = region.scrollTop;
+        region.scrollTop = Math.min(region.scrollTop + delta, region.scrollHeight);
+        if (region.scrollTop > before) moved = true;
+        region.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: delta,
+          bubbles: true,
+          cancelable: true
+        }));
+      }
+      return { pattern, moved };
+    }
+
+    if (pattern === 'micro') {
+      region.scrollTop = Math.max(0, region.scrollTop - (60 + Math.floor(Math.random() * 50)));
+      const step = Math.max(180, Math.floor(region.clientHeight * 0.85));
+      const before = region.scrollTop;
+      region.scrollTop = Math.min(region.scrollTop + step, region.scrollHeight);
+      return { pattern, moved: region.scrollTop > before };
+    }
+  } catch (error) {}
+
+  return { pattern, moved: false };
+}
+
+async function gentleScrollStepFromTab(tabId, patternIndex = 0) {
+  return executeOnTab(tabId, injectedGentleScrollStep, [patternIndex]);
+}
+
 function injectedScrollListStep() {
   try {
     const labels = ['Timeline: Followers', 'Timeline: Following', 'Followers', 'Following'];

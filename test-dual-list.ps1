@@ -25,12 +25,13 @@ foreach ($f in $required) {
 
 # Manifest JSON
 $manifest = Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json
-Assert 'manifest version 0.86' ($manifest.version -eq '0.86')
+Assert 'manifest version 0.90' ($manifest.version -eq '0.90')
 Assert 'background service worker' ($manifest.background.service_worker -eq 'background.js')
 
 # Action wiring (popup/background/content agree)
 $bg = Get-Content (Join-Path $root 'background.js') -Raw
 $popup = Get-Content (Join-Path $root 'popup.js') -Raw
+$popupHtml = Get-Content (Join-Path $root 'popup.html') -Raw
 $content = Get-Content (Join-Path $root 'content.js') -Raw
 $api = Get-Content (Join-Path $root 'api-fetch.js') -Raw
 
@@ -82,6 +83,15 @@ Assert 'popup load following csv' ($popup -match "sendBackground\('loadListCsv'"
 Assert 'popup import mode replace/append' ($popup -match 'importModeReplace')
 Assert 'HUD load following csv' ($content -match "action: 'loadListCsv'")
 Assert 'HUD import replace/append' ($content -match 'xcleaner-import-replace')
+
+# Fast vs gentle scroll
+Assert 'fast scroll pref key' ($bg -match 'xc_fast_scroll_pref')
+Assert 'gentle scroll step in api-fetch' ($api -match 'function injectedGentleScrollStep')
+Assert 'background setFastScroll action' ($bg -match "case 'setFastScroll'")
+Assert 'popup fast checkbox' ($popupHtml -match 'id="fastScroll"')
+Assert 'HUD fast checkbox' ($content -match 'xcleaner-fast-scroll')
+Assert 'popup fast scroll warning' ($popup -match 'shadowban')
+Assert 'runExportFlow passes fastScroll' ($popup -match 'fastScroll')
 
 Write-Host ""
 Write-Host "Results: $passed passed, $failed failed"
