@@ -1,15 +1,136 @@
 // xc-fetch-sniffer.js — capture native X GraphQL Following responses (MAIN world)
 (function () {
-  if (window.__xcSnifferInstalled) return;
+  const XC_SNIFFER_VERSION = 5;
+  if (window.__xcSnifferVersion === XC_SNIFFER_VERSION) return;
+  window.__xcSnifferVersion = XC_SNIFFER_VERSION;
   window.__xcSnifferInstalled = true;
   window.__xcCapturedGql = window.__xcCapturedGql || {};
   window.__xcListSeq = window.__xcListSeq || 0;
 
+  try {
+    sessionStorage.removeItem('xc_list_queue_Following');
+    sessionStorage.removeItem('xc_list_latest_Following');
+  } catch (error) {}
+
   const LIST_OPS = new Set(['Following', 'Followers']);
   const CREATOR_SUBS_OPS = new Set(['UserCreatorSubscriptions']);
 
-  const NON_LIST_ENTRY_ID = /who-to-follow|who_to_follow|whotofollow|suggest|promoted|connect|grok|messageprompt|subscribed|ranked|trend|explore|advertiser|recap|listheader|divider|label|cursor-top/i;
+  const NON_LIST_ENTRY_ID = /who-to-follow|who_to_follow|whotofollow|suggest|pymk|recommend|similar|promoted|connect|grok|messageprompt|subscribed|ranked|trend|explore|advertiser|recap|listheader|divider|label|cursor-top/i;
+  const SUGGESTION_SOCIAL_TEXT = /who to follow|people to follow|suggested for you|because you follow|followed by people|popular in your|similar to @/i;
   const BLOCKED_HANDLES = new Set(['grok', 'x', 'twitter', 'support', 'safety', 'premium', 'verified', 'explore', 'help', 'ads', 'business', 'developers', 'xai', 'create', 'search']);
+
+  window.__xcListPageKind = () => {
+    const pathname = (location.pathname || '').toLowerCase();
+    if (/\/followers(?:\/|$)/.test(pathname)) return 'followers';
+    if (/\/following(?:\/|$)/.test(pathname)) return 'following';
+    return null;
+  };
+
+  window.__xcResolveListRoot = () => {
+    const listKind = window.__xcListPageKind();
+    if (!listKind) return null;
+
+    const expectedLabels = listKind === 'followers'
+      ? ['Timeline: Followers', 'Followers']
+      : ['Timeline: Following', 'Following'];
+    for (const label of expectedLabels) {
+      const el = document.querySelector(`[aria-label="${label}"]`);
+      if (el && !el.closest('[data-testid="sidebarColumn"]')) return el;
+    }
+
+    const primary = document.querySelector('[data-testid="primaryColumn"]');
+    if (!primary) return null;
+
+    const isSuggestionRegion = (region) => {
+      if (!region || region.closest('[data-testid="sidebarColumn"]')) return true;
+      for (const heading of region.querySelectorAll('h2, [role="heading"]')) {
+        const text = (heading.textContent || '').trim().toLowerCase();
+        if (text === 'who to follow' || /^people to follow/.test(text)) return true;
+      }
+      const aria = (region.getAttribute('aria-label') || '').toLowerCase();
+      if (/who to follow|people to follow|suggest/.test(aria)) return true;
+      const testId = (region.getAttribute('data-testid') || '').toLowerCase();
+      if (/suggest|whotofollow|sidebar/.test(testId)) return true;
+      return false;
+    };
+
+    const listHeading = listKind === 'followers' ? /^followers$/i : /^following$/i;
+    for (const region of primary.querySelectorAll('section, div[role="region"]')) {
+      if (isSuggestionRegion(region)) continue;
+      const hasHeading = Array.from(region.querySelectorAll('h2, [role="heading"]'))
+        .some((heading) => listHeading.test((heading.textContent || '').trim()));
+      const cells = region.querySelectorAll('[data-testid="UserCell"]').length;
+      if (hasHeading && cells > 0) return region;
+    }
+
+    let best = null;
+    let bestCount = 0;
+    for (const region of primary.querySelectorAll('section, div[role="region"]')) {
+      if (isSuggestionRegion(region)) continue;
+      const cells = region.querySelectorAll('[data-testid="UserCell"]').length;
+      if (cells > bestCount) {
+        bestCount = cells;
+        best = region;
+      }
+    }
+    if (best && bestCount > 0) return best;
+
+    return null;
+  };
+
+  window.__xcDomUserCellShowsFollowAction = (cell) => {
+    if (!cell) return false;
+    if (cell.querySelector('[data-testid="userFollow"]')) return true;
+    for (const btn of cell.querySelectorAll('button[aria-label], [role="button"][aria-label]')) {
+      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+      if (/^follow @/.test(label) && !label.includes('following')) return true;
+    }
+    for (const btn of cell.querySelectorAll('button, [role="button"]')) {
+      const text = (btn.textContent || '').trim().toLowerCase();
+      if (text === 'follow') return true;
+    }
+    return false;
+  };
+
+  window.__xcDomUserCellShowsFollowingState = (cell) => {
+    if (!cell) return false;
+    if (cell.querySelector('[data-testid="unfollow"], [data-testid="userFollowing"]')) return true;
+    for (const btn of cell.querySelectorAll('button[aria-label], [role="button"][aria-label]')) {
+      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+      if (label.includes('following @') || label.startsWith('unfollow')) return true;
+    }
+    for (const btn of cell.querySelectorAll('button, [role="button"]')) {
+      const text = (btn.textContent || '').trim().toLowerCase();
+      if (text === 'following') return true;
+    }
+    return false;
+  };
+
+  window.__xcDomUserIsFollowingListMember = (cell, listKind) => {
+    if (!cell || listKind !== 'following') return true;
+    if (cell.closest('[data-testid="sidebarColumn"]')) return false;
+
+    let parent = cell.parentElement;
+    for (let depth = 0; parent && depth < 16; depth += 1, parent = parent.parentElement) {
+      for (const heading of parent.querySelectorAll('h2, [role="heading"]')) {
+        const text = (heading.textContent || '').trim().toLowerCase();
+        if (text === 'who to follow' || /^people to follow/.test(text)) return false;
+      }
+      const aria = (parent.getAttribute('aria-label') || '').toLowerCase();
+      if (/who to follow|people to follow|suggest/.test(aria)) return false;
+    }
+
+    if (window.__xcDomUserCellShowsFollowAction(cell)) return false;
+    return true;
+  };
+
+  const entryHasTrustedListUser = (content) => {
+    const itemContent = content?.itemContent;
+    return !!(
+      itemContent?.user_results?.result
+      || itemContent?.user?.result
+    );
+  };
 
   const parseListBody = (body) => {
     const users = [];
@@ -24,8 +145,48 @@
         || itemContent.social_context?.text
         || ''
       ).toLowerCase();
+      const displayType = String(itemContent.userDisplayType || '').toLowerCase();
       if (socialText.includes('follows you')) hints.follows_you = true;
+      if (
+        SUGGESTION_SOCIAL_TEXT.test(socialText)
+        || /recommend|suggest|pymk|similar/.test(displayType)
+      ) {
+        hints.you_follow = false;
+      }
       return hints;
+    };
+
+    const entryMetaFromItemContent = (itemContent, entryId) => {
+      const socialText = String(
+        itemContent?.socialContext?.text
+        || itemContent?.social_context?.text
+        || ''
+      );
+      const displayType = String(itemContent?.userDisplayType || '');
+      const socialLower = socialText.toLowerCase();
+      const displayLower = displayType.toLowerCase();
+      const idLower = String(entryId || '').toLowerCase();
+      const isSuggestion = SUGGESTION_SOCIAL_TEXT.test(socialLower)
+        || /recommend|suggest|pymk|similar/.test(displayLower)
+        || (idLower && NON_LIST_ENTRY_ID.test(idLower) && !idLower.startsWith('user-'));
+      return {
+        _xcEntryId: String(entryId || ''),
+        _xcSocialContext: socialText,
+        _xcUserDisplayType: displayType,
+        _xcSuggestion: isSuggestion
+      };
+    };
+
+    const isSuggestionTimelineModule = (content, entryId) => {
+      const idLower = String(entryId || '').toLowerCase();
+      if (NON_LIST_ENTRY_ID.test(idLower) && !idLower.startsWith('user-')) return true;
+      const moduleText = [
+        content?.header?.text,
+        content?.footer?.text,
+        content?.clientEventInfo?.component,
+        content?.displayType
+      ].map((value) => String(value || '').toLowerCase()).join(' ');
+      return SUGGESTION_SOCIAL_TEXT.test(moduleText) || /who to follow|people to follow/.test(moduleText);
     };
 
     const readViewerRelationship = (userResult, hints = {}) => {
@@ -51,7 +212,7 @@
       };
     };
 
-    const addUser = (userResult, hints = {}) => {
+    const addUser = (userResult, hints = {}, trustedFollowEntry = false) => {
       if (!userResult || userResult.__typename === 'UserUnavailable') return;
       const legacy = userResult.legacy || {};
       const core = userResult.core || {};
@@ -61,11 +222,17 @@
       const key = String(sn).toLowerCase();
       if (BLOCKED_HANDLES.has(key)) return;
       const relationship = readViewerRelationship(userResult, hints);
+      const isSuggestion = hints._xcSuggestion === true || relationship.you_follow === false;
       if (seen.has(key)) {
         const existing = users.find((user) => String(user.username).toLowerCase() === key);
         if (existing) {
           if (existing.you_follow == null && relationship.you_follow != null) existing.you_follow = relationship.you_follow;
           if (existing.follows_you == null && relationship.follows_you != null) existing.follows_you = relationship.follows_you;
+          if (trustedFollowEntry) existing._xcTrustedFollow = true;
+          if (isSuggestion) existing._xcSuggestion = true;
+          if (!existing._xcEntryId && hints._xcEntryId) existing._xcEntryId = hints._xcEntryId;
+          if (!existing._xcSocialContext && hints._xcSocialContext) existing._xcSocialContext = hints._xcSocialContext;
+          if (!existing._xcUserDisplayType && hints._xcUserDisplayType) existing._xcUserDisplayType = hints._xcUserDisplayType;
         }
         return;
       }
@@ -82,21 +249,26 @@
         default_avatar: !!legacy.default_profile_image,
         rest_id: id,
         you_follow: relationship.you_follow,
-        follows_you: relationship.follows_you
+        follows_you: relationship.follows_you,
+        _xcEntryId: hints._xcEntryId || '',
+        _xcSocialContext: hints._xcSocialContext || '',
+        _xcUserDisplayType: hints._xcUserDisplayType || '',
+        _xcSuggestion: isSuggestion,
+        _xcTrustedFollow: trustedFollowEntry
       });
     };
 
-    const absorbUserNode = (node, hints = {}) => {
+    const absorbUserNode = (node, hints = {}, trustedFollowEntry = false) => {
       if (!node || typeof node !== 'object') return;
       const itemHints = {
         ...hints,
         ...relationshipHintsFromItemContent(node.itemContent || node)
       };
-      if (node.user_results?.result) addUser(node.user_results.result, itemHints);
-      if (node.user?.result) addUser(node.user.result, itemHints);
-      if (node.itemContent?.user_results?.result) addUser(node.itemContent.user_results.result, itemHints);
-      if (node.itemContent?.user?.result) addUser(node.itemContent.user.result, itemHints);
-      if (node.legacy || node.core || node.__typename === 'User') addUser(node, itemHints);
+      if (node.user_results?.result) addUser(node.user_results.result, itemHints, trustedFollowEntry);
+      if (node.user?.result) addUser(node.user.result, itemHints, trustedFollowEntry);
+      if (node.itemContent?.user_results?.result) addUser(node.itemContent.user_results.result, itemHints, trustedFollowEntry);
+      if (node.itemContent?.user?.result) addUser(node.itemContent.user.result, itemHints, trustedFollowEntry);
+      if (node.legacy || node.core || node.__typename === 'User') addUser(node, itemHints, trustedFollowEntry);
     };
 
     const processModuleItems = (items) => {
@@ -133,14 +305,20 @@
       }
 
       if (idLower.includes('cursor-top') || content.cursorType === 'Top') return;
-      if (NON_LIST_ENTRY_ID.test(idLower) && !idLower.startsWith('user-')) return;
+      if (isSuggestionTimelineModule(content, entryId)) return;
 
-      const entryHints = relationshipHintsFromItemContent(content.itemContent);
-      absorbUserNode(content.itemContent, entryHints);
-      processModuleItems(content.items);
       if (content.entryType === 'TimelineTimelineModule') {
         processModuleItems(content.items);
+        return;
       }
+
+      const entryHints = {
+        ...relationshipHintsFromItemContent(content.itemContent),
+        ...entryMetaFromItemContent(content.itemContent, entryId)
+      };
+      const trustedFollowEntry = idLower.startsWith('user-') || entryHasTrustedListUser(content);
+      absorbUserNode(content.itemContent, entryHints, trustedFollowEntry);
+      processModuleItems(content.items);
     };
 
     const walkInstructions = (instructions) => {
@@ -150,9 +328,6 @@
           processEntry(entry);
         }
         if (inst.entry) processEntry(inst.entry);
-        if (Array.isArray(inst.moduleItems)) {
-          processModuleItems(inst.moduleItems);
-        }
       }
     };
 
@@ -189,6 +364,27 @@
         absorbUserNode(edge?.itemContent?.user_results?.result);
         absorbUserNode(edge?.itemContent?.user?.result);
       }
+    }
+
+    if (!users.length && body?.data) {
+      const walk = (node, depth, parentEntryId = '') => {
+        if (!node || typeof node !== 'object' || depth > 22) return;
+        if (Array.isArray(node)) {
+          for (const item of node) walk(item, depth + 1, parentEntryId);
+          return;
+        }
+        const entryId = node.entryId || parentEntryId || '';
+        const itemContent = node.itemContent || node.content?.itemContent;
+        if (itemContent?.user_results?.result || itemContent?.user?.result) {
+          const entryHints = {
+            ...relationshipHintsFromItemContent(itemContent),
+            ...entryMetaFromItemContent(itemContent, entryId)
+          };
+          absorbUserNode(itemContent, entryHints, true);
+        }
+        for (const value of Object.values(node)) walk(value, depth + 1, entryId);
+      };
+      walk(body.data, 0);
     }
 
     return { users, nextCursor };
@@ -278,9 +474,45 @@
     } catch (error) {}
   };
 
+  const stampListRelationships = (users, listOpName) => {
+    for (const user of users) {
+      if (listOpName === 'Followers' && user.follows_you == null) user.follows_you = true;
+      if (
+        listOpName === 'Following'
+        && !user._xcSuggestion
+        && user.you_follow !== false
+        && user.you_follow == null
+      ) {
+        user.you_follow = true;
+      }
+    }
+  };
+
+  const isSuggestionFollowingUser = (user) => {
+    if (!user) return true;
+    if (user.you_follow === false) return true;
+    if (user._xcSuggestion === true) return true;
+    const social = String(user._xcSocialContext || '').toLowerCase();
+    if (SUGGESTION_SOCIAL_TEXT.test(social)) return true;
+    const displayType = String(user._xcUserDisplayType || '').toLowerCase();
+    if (/recommend|suggest|pymk|similar/.test(displayType)) return true;
+    const entryId = String(user._xcEntryId || '').toLowerCase();
+    if (entryId && NON_LIST_ENTRY_ID.test(entryId) && !entryId.startsWith('user-')) return true;
+    return false;
+  };
+
+  const filterFollowingOpUsers = (users, opName) => {
+    if (opName !== 'Following') return users;
+    return users.filter((user) => !isSuggestionFollowingUser(user));
+  };
+
   const storeListResponse = (canonical, opName, url, body) => {
     const parsed = parseListBody(body);
     if (!parsed.users.length && !parsed.nextCursor) return;
+    stampListRelationships(parsed.users, opName);
+    if (opName === 'Following') {
+      for (const user of parsed.users) user._xcFromFollowingOp = true;
+    }
     window.__xcListSeq += 1;
     const payload = {
       canonical,
@@ -347,7 +579,8 @@
     } catch (error) {}
   };
 
-  const origFetch = window.fetch;
+  if (!window.__xcOrigFetch) window.__xcOrigFetch = window.fetch;
+  const origFetch = window.__xcOrigFetch;
   window.fetch = function (...args) {
     const req = args[0];
     if (req && typeof req !== 'string' && req.headers) {
@@ -371,13 +604,16 @@
     });
   };
 
-  const origOpen = XMLHttpRequest.prototype.open;
+  if (!window.__xcOrigXhrOpen) window.__xcOrigXhrOpen = XMLHttpRequest.prototype.open;
+  if (!window.__xcOrigXhrSend) window.__xcOrigXhrSend = XMLHttpRequest.prototype.send;
+  if (!window.__xcOrigXhrSetHeader) window.__xcOrigXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+  const origOpen = window.__xcOrigXhrOpen;
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     this.__xcUrl = url;
     this.__xcMethod = method;
     return origOpen.call(this, method, url, ...rest);
   };
-  const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+  const origSetRequestHeader = window.__xcOrigXhrSetHeader;
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
     if (String(name || '').toLowerCase() === 'authorization') {
       captureBearer({ authorization: value });
@@ -385,7 +621,7 @@
     return origSetRequestHeader.call(this, name, value);
   };
 
-  const origSend = XMLHttpRequest.prototype.send;
+  const origSend = window.__xcOrigXhrSend;
   XMLHttpRequest.prototype.send = function (...args) {
     const meta = this.__xcUrl ? remember(this.__xcUrl, this.__xcMethod) : null;
     if (meta) {

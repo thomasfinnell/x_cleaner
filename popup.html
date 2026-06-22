@@ -11,7 +11,7 @@
     #exportBtn { background: #1d9bf0; color: #fff; display: block; }
     #viewBtn { background: #eef2f6; color: #111; border: 1px solid #cfd9de; display: block; }
     #account { font-size: 13px; color: #444; margin-bottom: 8px; }
-    #method { font-size: 11px; color: #666; margin-bottom: 8px; }
+    #method { display: none; }
     .list-cards {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -337,7 +337,7 @@
     <label><input type="checkbox" id="removeBlue"> Remove Verified</label>
     <label class="months-filter">
       <input type="checkbox" id="removeInactive">
-      <span>Last post &gt;</span>
+      <span>Last post &gt;</span> <span style="font-size:10px;opacity:0.7">(following)</span>
       <span class="months-stepper">
         <button type="button" id="inactiveMonthsDec" aria-label="Decrease months">−</button>
         <input type="number" id="inactiveMonths" value="6" min="1" max="24" step="1" aria-label="Last post months">
@@ -346,12 +346,12 @@
       <span>months</span>
     </label>
     <label title="Followers only: keep potential bots you do not follow. Skips accounts you follow (you_follow from Followers REST, or Following list if fetched). Signals: &lt;10 tweets, default avatar, no bio, account &lt;30 days, @handle ending with &gt;4 digits, followers &gt;2× following.">
-      <input type="checkbox" id="botCheck"> Bot check
+      <input type="checkbox" id="botCheck"> Bot check <span style="font-size:10px;opacity:0.7">(followers)</span>
     </label>
     <button id="filterBtn" type="button">Filter</button>
   </fieldset>
   <button id="viewBtn" type="button" title="Preview first 5 records in the active list">View</button>
-  <button id="exportBtn" title="Requires @d2fl subscription">Export CSV</button>
+  <button id="exportBtn" title="Download CSV">Export CSV</button>
   <fieldset class="import-box">
     <legend>Load CSV</legend>
     <div class="import-mode">

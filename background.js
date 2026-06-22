@@ -2,6 +2,7 @@ importScripts('subscription.js', 'api-fetch.js', 'rest-fetch.js');
 
 let jobTabId = null;
 let activeFetch = null;
+let jobCancelled = false;
 let listType = 'following';
 let jobState = {
   username: null,
@@ -46,6 +47,8 @@ const MIN_FILTER_MONTHS = 1;
 const MAX_FILTER_MONTHS = 24;
 const ENRICH_BATCH_SIZE = XC_REST_LOOKUP_BATCH_SIZE;
 const ENRICH_BATCH_DELAY_MS = XC_REST_LOOKUP_DELAY_MS;
+const INACTIVE_LOOKUP_BATCH_SIZE = 12;
+const INACTIVE_LOOKUP_DELAY_MS = 2800;
 const ENRICH_RATE_LIMIT_MAX_RETRIES = 8;
 const ENRICH_BEARER_WAIT_MS = 12000;
 const SNIFFER_ENRICH_PASSES = 4;
@@ -72,8 +75,17 @@ const XC_FOLLOWERS_NAV_SETTLE_MS = 5000;
 const XC_PRE_LIST_FETCH_SETTLE_MS = 1500;
 const XC_POST_SNIFFER_SETTLE_MS = 800;
 
+// Gentle mode recovery caps for followers: keep absolute numbers small even on large lists
+// (stealth-friendly for overnight runs) but allow a small % so large accounts can finish.
+function gentleFollowersRecoveryCap(totalList) {
+  if (!totalList || totalList <= 0) return 40;
+  const pct = Math.floor(totalList * 0.012); // ~1.2%
+  return Math.min(120, Math.max(30, pct));
+}
+
 // Set false to hide the scrollable status log in the HUD/popup.
 const XC_DEBUG_STATUS_LOG = false;
+
 const XC_DEBUG_STATUS_LOG_MAX_LINES = 50;
 const XC_DEBUG_STATUS_LOG_STORAGE_KEY = 'xc_debug_status_log';
 
@@ -371,24 +383,39 @@ async function sleepAfterScrollStep(type = listType, context = 'tail') {
   }
 
   if (context === 'nudge') {
-    return scrollJitterMs(9000, 0.35);
+    return scrollJitterMs(type === 'followers' ? 4500 : 9000, 0.35);
   }
   if (context === 'shortfall') {
-    return scrollJitterMs(type === 'followers' ? 16000 : 13000, 0.3);
+    return scrollJitterMs(type === 'followers' ? 8000 : 13000, 0.3);
   }
   if (context === 'native-loop') {
-    return scrollJitterMs(type === 'followers' ? 15000 : 12000, 0.35);
+    return scrollJitterMs(type === 'followers' ? 5000 : 12000, 0.35);
   }
-  return scrollJitterMs(type === 'followers' ? 14000 : 11000, 0.35);
+  return scrollJitterMs(type === 'followers' ? 6000 : 11000, 0.35);
+}
+
+function observeLoopPaceMs(type = listType, added = 0) {
+  if (fastScrollEnabled) {
+    return type === 'followers' ? 2200 : 1800;
+  }
+  if (type === 'followers') {
+    if (added >= 15) return scrollJitterMs(1800, 0.2);
+    if (added > 0) return scrollJitterMs(3000, 0.25);
+    return scrollJitterMs(4500, 0.25);
+  }
+  if (added > 0) return scrollJitterMs(6500, 0.3);
+  return scrollJitterMs(9000, 0.3);
 }
 
 async function maybeGentleDwellPause(type = listType) {
   if (fastScrollEnabled) return;
+  if (type === 'followers') return;
   const cfg = listCfg(type);
   const totalList = jobState[cfg.totalKey] ?? null;
   const gap = totalList != null ? totalList - curList(type).length : null;
+  if (gap != null && gap > 100) return;
   if (gap != null && gap > 0 && gap <= 15) return;
-  if (gentleScrollStepCount % 10 !== 0) return;
+  if (gentleScrollStepCount % 20 !== 0) return;
   const dwellMs = XC_GENTLE_DWELL_BASE_MS
     + Math.floor(Math.random() * (XC_GENTLE_DWELL_JITTER_MS * 2 + 1))
     - XC_GENTLE_DWELL_JITTER_MS;
@@ -399,13 +426,17 @@ async function maybeGentleDwellPause(type = listType) {
 }
 
 async function scrollListStep(tabId) {
-  if (fastScrollEnabled) {
+  if (fastScrollEnabled || listType === 'followers') {
     await executeOnTab(tabId, injectedScrollListStep);
+    gentleScrollStepCount += 1;
     appendDebugStatusLog({
       reason: 'scroll-step',
       method: jobState.method || listType,
-      status: 'Fast scroll step (list column)'
+      status: fastScrollEnabled
+        ? 'Fast scroll step (list column)'
+        : `Followers observe scroll #${gentleScrollStepCount}`
     });
+    await maybeGentleDwellPause(listType);
     return;
   }
   const scrollResult = await gentleScrollStepFromTab(tabId, gentleScrollStepCount);
@@ -423,7 +454,7 @@ async function scrollListStep(tabId) {
 
 async function scrollListToLoad(tabId, options = {}) {
   const gap = options.gap ?? null;
-  const aggressive = !!options.aggressive || (gap != null && gap > 0 && gap <= 25);
+  const aggressive = !!options.aggressive || (gap != null && gap > 0 && gap <= (listType === 'followers' ? 40 : 25));
   if (fastScrollEnabled || aggressive) {
     await executeOnTab(tabId, injectedScrollListToLoad);
     if (!fastScrollEnabled && aggressive) {
@@ -463,11 +494,13 @@ async function ensureProfileUserId(tabId, profile) {
   return profile?.userId || null;
 }
 
-async function observeRecoverShortfall(tabId, profile, type, seen, totalList) {
-  const cfg = listCfg(type);
+async function observeFinishShortfall(tabId, profile, type, seen, totalList, options = {}) {
+  if (isJobCancelled()) return 0;
+  if (!listFetchNeedsMore(type, totalList)) return 0;
   let gap = totalList != null ? totalList - curList(type).length : null;
-  if (!gap || gap <= 0 || gap > 25) return 0;
+  if (!gap || gap <= 0) return 0;
 
+  const cfg = listCfg(type);
   let totalAdded = 0;
   const noteProgress = (status, method = 'observe') => {
     appendDebugStatusLog({ reason: 'collecting', method, status });
@@ -475,14 +508,16 @@ async function observeRecoverShortfall(tabId, profile, type, seen, totalList) {
   };
 
   noteProgress(
-    `Observe tail recovery — ${gap.toLocaleString()} short (sniffer cursors + scroll, no REST bulk)...`
+    `Observe finish — ${gap.toLocaleString()} short (tail GraphQL + sniffer, no REST bulk)...`
   );
 
   await ensureProfileUserId(tabId, profile);
-  await scrollListToTop(tabId);
-  await sleep(scrollJitterMs(fastScrollEnabled ? 800 : 2500, 0.2));
-  await scrollListToLoad(tabId, { gap, aggressive: true });
-  await sleep(scrollJitterMs(fastScrollEnabled ? 1200 : 3000, 0.2));
+  try {
+    await scrollListToTop(tabId);
+    await sleep(scrollJitterMs(fastScrollEnabled ? 800 : 1500, 0.2));
+    await scrollListToLoad(tabId, { gap, aggressive: true });
+    await sleep(scrollJitterMs(fastScrollEnabled ? 1200 : 1800, 0.2));
+  } catch (error) {}
 
   try {
     const drained = await readNativeListQueueDrainFromTab(tabId, cfg.opName);
@@ -501,32 +536,62 @@ async function observeRecoverShortfall(tabId, profile, type, seen, totalList) {
 
   totalAdded += await fetchListTailGap(tabId, profile, type, seen, totalList);
 
-  gap = totalList != null ? totalList - curList(type).length : null;
-  if (gap > 0 && gap <= 20 && listFetchNeedsMore(type, totalList) && profile.userId) {
-    noteProgress(`Observe tail — GraphQL continuation (${gap.toLocaleString()} short)...`, 'graphql');
+  if (listFetchNeedsMore(type, totalList) && profile.userId) {
+    noteProgress(`Observe finish — GraphQL restart (${gap.toLocaleString()} short)...`, 'graphql');
     totalAdded += await continueListFetchWithGraphql(
       tabId,
       profile,
       type,
       seen,
       effectiveFetchTarget(totalList),
-      totalList
+      totalList,
+      { restartFromTop: true, skipPostRecovery: true }
     );
   }
 
-  gap = totalList != null ? totalList - curList(type).length : null;
-  if (gap > 0 && gap <= 15 && listFetchNeedsMore(type, totalList)) {
-    noteProgress(`Observe tail — REST cursor recovery (${gap.toLocaleString()} short)...`, 'observe');
-    totalAdded += await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList);
+  if (listFetchNeedsMore(type, totalList)) {
+    totalAdded += await recoverShortfallViaTabGraphql(
+      tabId,
+      profile,
+      type,
+      seen,
+      totalList,
+      { skipWarmup: true }
+    );
+  }
+
+  if (listFetchNeedsMore(type, totalList)) {
+    totalAdded += await recoverShortfallViaWorkerGraphql(tabId, profile, type, seen, totalList);
+  }
+
+  if (listFetchNeedsMore(type, totalList)) {
+    totalAdded += await recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen, totalList);
   }
 
   gap = totalList != null ? totalList - curList(type).length : null;
-  if (gap > 0 && gap <= 10 && listFetchNeedsMore(type, totalList)) {
-    noteProgress(`Observe tail — targeted REST lookup (${gap.toLocaleString()} short, not bulk)...`, 'observe');
-    totalAdded += await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+  const restGapCap = type === 'following' ? 200 : gentleFollowersRecoveryCap(totalList);
+  if (options.allowRest !== false && gap > 0 && gap <= restGapCap && listFetchNeedsMore(type, totalList)) {
+    noteProgress(`Observe finish — REST cursor recovery (${gap.toLocaleString()} short)...`, 'observe');
+    totalAdded += await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList, {
+      maxPages: type === 'following' ? 16 : 12,
+      scrollToLoad: true
+    });
+    gap = totalList != null ? totalList - curList(type).length : null;
+    const restTailCap = type === 'following' ? 200 : Math.min(50, gentleFollowersRecoveryCap(totalList));
+    if (gap > 0 && gap <= restTailCap && listFetchNeedsMore(type, totalList)) {
+      noteProgress(`Observe finish — targeted REST lookup (${gap.toLocaleString()} short)...`, 'observe');
+      totalAdded += await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+    }
   }
 
   return totalAdded;
+}
+
+async function observeRecoverShortfall(tabId, profile, type, seen, totalList) {
+  const gap = totalList != null ? totalList - curList(type).length : null;
+  const maxGap = type === 'followers' ? gentleFollowersRecoveryCap(totalList) : 25;
+  if (!gap || gap <= 0 || gap > maxGap) return 0;
+  return observeFinishShortfall(tabId, profile, type, seen, totalList);
 }
 
 function fetchModeLabel(mode) {
@@ -542,10 +607,55 @@ function trimListToFetchLimit(type = listType) {
 }
 
 function subscriptionPayload() {
+  const status = xcFormatSubscriptionStatus(subscriptionInfo, jobState.username);
   return {
     ...subscriptionInfo,
-    subscriptionStatus: xcFormatSubscriptionStatus(subscriptionInfo, jobState.username)
+    canExport: true,
+    subscriptionStatus: status
   };
+}
+
+async function clearAllListPersistForAccount(username) {
+  const handle = normalizeAccountHandle(username);
+  if (!handle) return;
+  const keys = LIST_TYPES.map((type) => persistStorageKey(type, handle));
+  await chrome.storage.local.remove(keys);
+}
+
+async function applyFreeTierWindow(handle) {
+  const resolved = await resolveActiveUsername(handle);
+  if (!resolved) return null;
+
+  await hydrateSubscriptionFromStorage(resolved);
+  if (subscriptionInfo.isSubscribed) {
+    return { reset: false };
+  }
+
+  const windowInfo = await xcEnsureFreeTierWindow(resolved);
+  subscriptionInfo = {
+    ...subscriptionInfo,
+    canExport: true,
+    freeTierResetsAt: windowInfo.resetsAt
+  };
+
+  if (windowInfo.reset) {
+    await clearAllListPersistForAccount(resolved);
+    for (const type of LIST_TYPES) {
+      setCurList([], type);
+      setCurRaw([], type);
+      restoredTypes[type] = false;
+    }
+    if ((jobState.username || '').toLowerCase() === resolved.toLowerCase()) {
+      jobState.count = 0;
+      jobState.rawCount = 0;
+      jobState.savedAt = null;
+      jobState.reason = null;
+      jobState.status = `Free tier reset — cached lists cleared. Collect up to ${XC_FREE_FETCH_LIMIT} again.`;
+      notifyProgress({ status: jobState.status, reason: 'complete' });
+    }
+  }
+
+  return windowInfo;
 }
 
 const LIST_TYPE_IDLE_REASONS = new Set([
@@ -555,13 +665,36 @@ const LIST_TYPE_IDLE_REASONS = new Set([
   'exported',
   'error',
   'end-of-list',
+  'observe-empty',
+  'rest-empty',
   'filtering',
   'enriching'
 ]);
 
+const LIST_TYPE_MID_FLIGHT_REASONS = new Set([
+  'start',
+  'collecting',
+  'loading-profile',
+  'profile-loaded',
+  'waiting-native',
+  'filtering',
+  'enriching'
+]);
+
+function clearStaleActiveFetch() {
+  if (!activeFetch?.running || activeEnrich?.running) return;
+  if (jobState.isScraping || jobState.isEnriching) return;
+  if (LIST_TYPE_MID_FLIGHT_REASONS.has(jobState.reason)) return;
+  activeFetch = null;
+}
+
 function isListTypeSwitchLocked(state = jobState) {
-  if (activeFetch?.running || activeEnrich?.running) return true;
-  return false;
+  if (activeEnrich?.running) return true;
+  if (!activeFetch?.running) return false;
+  if (!jobState.isScraping && !jobState.isEnriching && !LIST_TYPE_MID_FLIGHT_REASONS.has(jobState.reason)) {
+    return false;
+  }
+  return true;
 }
 
 function buildListStats() {
@@ -589,7 +722,46 @@ async function withFastScrollRecoveryBoost(fn) {
   }
 }
 
+function reconcileIdleJobState() {
+  clearStaleActiveFetch();
+
+  if (activeFetch?.running || activeEnrich?.running) return;
+
+  if (activeEnrich && !activeEnrich.running) {
+    activeEnrich = null;
+  }
+
+  if (jobState.isEnriching) {
+    jobState.isEnriching = false;
+  }
+
+  const midFlightReasons = new Set([
+    'start',
+    'collecting',
+    'loading-profile',
+    'profile-loaded',
+    'waiting-native',
+    'filtering',
+    'enriching'
+  ]);
+
+  if (jobState.isScraping && midFlightReasons.has(jobState.reason)) {
+    jobState.isScraping = false;
+    jobState.reason = curList().length > 0 ? 'complete' : (jobState.reason === 'filtering' ? 'filtered' : null);
+  } else if (jobState.isScraping && LIST_TYPE_IDLE_REASONS.has(jobState.reason)) {
+    jobState.isScraping = false;
+  }
+
+  if (jobState.reason === 'filtering' || jobState.reason === 'enriching') {
+    jobState.isEnriching = false;
+    if (!activeEnrich?.running) {
+      jobState.reason = curList().length > 0 ? 'filtered' : 'complete';
+    }
+  }
+}
+
 function normalizeClientState(state) {
+  reconcileIdleJobState();
   const next = { ...state };
   const enriching = !!(activeEnrich?.running || next.isEnriching);
   const collecting = !!activeFetch?.running;
@@ -626,8 +798,19 @@ function buildHudState(extra = {}) {
   });
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, options = {}) {
+  if (!options.cancellable) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  const stepMs = 200;
+  const deadline = Date.now() + ms;
+  return (async () => {
+    while (Date.now() < deadline) {
+      if (isJobCancelled()) return;
+      const remaining = deadline - Date.now();
+      await new Promise((resolve) => setTimeout(resolve, Math.min(stepMs, remaining)));
+    }
+  })();
 }
 
 async function waitForTabComplete(tabId, timeout = 25000) {
@@ -901,14 +1084,14 @@ function finalizeFreshStartBackup(type = listType) {
   return remaining;
 }
 
-function finalizeFreshStartForStop() {
-  for (const type of [...freshStartBackupTypes]) {
+function finalizeFreshStartForStop(type = listType) {
+  if (freshStartBackupTypes.has(type)) {
     finalizeFreshStartBackup(type);
   }
 }
 
 async function persistFreshStartStopState() {
-  finalizeFreshStartForStop();
+  finalizeFreshStartForStop(listType);
   const type = listType;
   if (!curList(type).length && !curRaw(type).length) {
     await clearListPersist(type);
@@ -1180,24 +1363,97 @@ function addNativeUsers(nativeBatch, seen, ownerUsername, type = listType) {
   const cfg = listCfg(type);
   const totalList = jobState[cfg.totalKey] ?? null;
 
+  const otherType = type === 'following' ? 'followers' : 'following';
+  const otherSet = new Set((curList(otherType) || []).map(u => (u.username || '').toLowerCase()));
+
   for (const user of nativeBatch.users || []) {
     if (totalList != null && curList(type).length >= totalList) break;
     const key = (user.username || '').toLowerCase();
     if (!key || key === owner) continue;
+    if (type === 'following' && !xcIsVerifiedFollowingListUser(user)) {
+      continue;
+    }
     if (seen.has(key)) {
       const existing = curList(type).find((row) => (row.username || '').toLowerCase() === key);
       mergeUserFields(existing, user);
       consumeArchivedEnrichmentForUser(existing, type);
+      crossPopulateMutualFlags(existing, type, otherSet);
       continue;
     }
     seen.add(key);
     const row = { ...user };
     consumeArchivedEnrichmentForUser(row, type);
     curList(type).push(row);
+    crossPopulateMutualFlags(row, type, otherSet);
     added++;
   }
 
   return added;
+}
+
+function crossPopulateMutualFlags(row, type, otherSet) {
+  if (!row || !row.username) return;
+  const key = (row.username || '').toLowerCase();
+  let inOther = false;
+  const otherType = type === 'following' ? 'followers' : 'following';
+  if (otherSet && otherSet.has(key)) {
+    inOther = true;
+  } else if (!otherSet) {
+    const otherList = curList(otherType) || [];
+    inOther = otherList.some(u => (u.username || '').toLowerCase() === key);
+  }
+
+  if (type === 'following') {
+    if (row.you_follow == null) row.you_follow = true;
+    if (inOther) {
+      row.follows_you = true;
+      const otherLive = (curList(otherType) || []).find(u => (u.username || '').toLowerCase() === key);
+      if (otherLive) {
+        otherLive.you_follow = true;
+        otherLive.follows_you = true;
+      }
+      const otherRaw = findRawUserByHandle(otherType, key);
+      if (otherRaw) {
+        otherRaw.you_follow = true;
+        otherRaw.follows_you = true;
+        if (otherRaw.last_active_ms != null && row.last_active_ms == null) {
+          row.last_active_ms = otherRaw.last_active_ms;
+        }
+      }
+    } else {
+      const otherLen = (curList(otherType) || []).length;
+      const otherTotal = jobState[listCfg(otherType).totalKey];
+      const otherComplete = (otherTotal != null && otherLen >= otherTotal) || (!jobState.isScraping && otherLen > 0);
+      if (otherComplete && row.follows_you == null) {
+        row.follows_you = false;
+      }
+    }
+  } else {
+    if (row.follows_you == null) row.follows_you = true;
+    if (inOther) {
+      row.you_follow = true;
+      const otherLive = (curList(otherType) || []).find(u => (u.username || '').toLowerCase() === key);
+      if (otherLive) {
+        otherLive.follows_you = true;
+        otherLive.you_follow = true;
+      }
+      const otherRaw = findRawUserByHandle(otherType, key);
+      if (otherRaw) {
+        otherRaw.follows_you = true;
+        otherRaw.you_follow = true;
+        if (otherRaw.last_active_ms != null && row.last_active_ms == null) {
+          row.last_active_ms = otherRaw.last_active_ms;
+        }
+      }
+    } else {
+      const otherLen = (curList(otherType) || []).length;
+      const otherTotal = jobState[listCfg(otherType).totalKey];
+      const otherComplete = (otherTotal != null && otherLen >= otherTotal) || (!jobState.isScraping && otherLen > 0);
+      if (otherComplete && row.you_follow == null) {
+        row.you_follow = false;
+      }
+    }
+  }
 }
 
 async function scrapeProfileStats(tabId, handle) {
@@ -1370,12 +1626,88 @@ function normalizeInactiveMonths(value) {
   return normalizeFilterMonths(value, DEFAULT_INACTIVE_MONTHS);
 }
 
-function isInactiveAccount(lastActiveMs, months = DEFAULT_INACTIVE_MONTHS) {
-  if (lastActiveMs == null) return false;
-
+function inactiveFilterCutoffMs(months = DEFAULT_INACTIVE_MONTHS) {
   const cutoff = new Date();
   cutoff.setMonth(cutoff.getMonth() - months);
-  return lastActiveMs < cutoff.getTime();
+  return cutoff.getTime();
+}
+
+function isInactiveAccount(lastActiveMs, months = DEFAULT_INACTIVE_MONTHS) {
+  if (lastActiveMs == null) return false;
+  return lastActiveMs < inactiveFilterCutoffMs(months);
+}
+
+function accountCreatedMs(user) {
+  return parseAccountCreatedAt(user?.created_at);
+}
+
+function isAccountTooYoungForInactiveFilter(user, months) {
+  // Age threshold for pre-qual must come from the UI input (the inactiveMonths value),
+  // not hardcoded to DEFAULT_INACTIVE_MONTHS (6).
+  if (months == null) months = DEFAULT_INACTIVE_MONTHS;
+  const createdMs = accountCreatedMs(user);
+  if (createdMs == null) return false;
+  return createdMs >= inactiveFilterCutoffMs(months);
+}
+
+function hasZeroTweetCount(user) {
+  const count = user?.tweet_count;
+  if (count == null || count === '') return false;
+  const n = Number(count);
+  return Number.isFinite(n) && n <= 0;
+}
+
+function partitionInactiveFilterCandidates(users, months, cache, now, type = listType) {
+  const cutoffMs = inactiveFilterCutoffMs(months);
+  const tooYoung = [];
+  const resolvedInactive = [];
+  const resolvedActive = [];
+  const needsLookup = [];
+
+  for (const user of users) {
+    if (isAccountTooYoungForInactiveFilter(user, months)) {
+      tooYoung.push(user);
+      continue;
+    }
+
+    hydrateLastActiveFromStoredSources(user, type, cache, now);
+
+    if (user.last_active_ms != null) {
+      if (user.last_active_ms < cutoffMs) resolvedInactive.push(user);
+      else resolvedActive.push(user);
+      continue;
+    }
+
+    const createdMs = accountCreatedMs(user);
+    if (hasZeroTweetCount(user) && (createdMs == null || createdMs < cutoffMs)) {
+      resolvedInactive.push(user);
+      continue;
+    }
+
+    needsLookup.push(user);
+  }
+
+  return { tooYoung, resolvedInactive, resolvedActive, needsLookup, cutoffMs };
+}
+
+function classifyInactiveAfterLookup(user, cutoffMs) {
+  if (user.last_active_ms != null) {
+    return user.last_active_ms < cutoffMs;
+  }
+  // If we couldn't obtain a last tweet date, fall back to account age for old accounts.
+  // This helps detect inactive accounts when the lookup didn't return status.created_at
+  // (common for some accounts, protected, low activity, etc.).
+  const createdMs = accountCreatedMs(user);
+  if (createdMs != null && createdMs < cutoffMs) {
+    // Old account: treat as inactive if zero or very low tweets, or if we simply have no recent activity signal.
+    if (hasZeroTweetCount(user) || (user.tweet_count != null && Number(user.tweet_count) <= 5)) {
+      return true;
+    }
+    // Conservative: if old account and no last tweet data at all, consider it a candidate
+    // (user can adjust months or review manually).
+    return true;
+  }
+  return false;
 }
 
 function accountBio(user) {
@@ -1501,6 +1833,14 @@ function refreshMutualFlagsFromOtherList(type) {
   let upgraded = 0;
   const seen = new Set();
 
+  // Build map from other list for hydration data transfer (e.g. last_active for mutuals)
+  const otherUsers = usersForMutuals(otherType);
+  const otherMap = new Map();
+  for (const ou of otherUsers) {
+    const k = (ou.username || '').toLowerCase();
+    if (k) otherMap.set(k, ou);
+  }
+
   for (const user of curRaw(type)) {
     const key = (user.username || '').toLowerCase();
     if (!key || !otherSet.has(key) || seen.has(key)) continue;
@@ -1511,6 +1851,16 @@ function refreshMutualFlagsFromOtherList(type) {
     }
     const live = findListUserByHandle(type, key);
     if (live && live[flagKey] !== true) live[flagKey] = true;
+
+    // Transfer any last_active_ms hydration from mutual in the other list to this list (esp. to followers)
+    const otherUser = otherMap.get(key);
+    if (otherUser && otherUser.last_active_ms != null && user.last_active_ms == null) {
+      user.last_active_ms = otherUser.last_active_ms;
+      upgraded += 1;
+      if (live && live.last_active_ms == null) live.last_active_ms = otherUser.last_active_ms;
+      const rawRow = findRawUserByHandle(type, key);
+      if (rawRow && rawRow.last_active_ms == null) rawRow.last_active_ms = otherUser.last_active_ms;
+    }
   }
 
   return { upgraded, otherCount: otherSet.size };
@@ -1542,6 +1892,31 @@ async function saveActivityCache(cache) {
   await chrome.storage.local.set({ [XC_ACTIVITY_CACHE_KEY]: cache });
 }
 
+async function getLastTweetTimeFromTimeline(screenName, options = {}) {
+  const handle = String(screenName || '').replace(/^@+/, '').trim();
+  if (!handle) return null;
+  const query = new URLSearchParams({
+    screen_name: handle,
+    count: '1',
+    include_rts: 'false',
+    trim_user: 'true'
+  });
+  const url = `${XC_REST_API_ORIGIN}/statuses/user_timeline.json?${query.toString()}`;
+  try {
+    const body = await xcRestMakeApiRequest(url, 'GET', null, options);
+    if (Array.isArray(body) && body.length > 0) {
+      const created = body[0] && body[0].created_at;
+      if (created) {
+        const ts = Date.parse(created);
+        if (!isNaN(ts)) return ts;
+      }
+    }
+  } catch (e) {
+    // ignore, keep as null
+  }
+  return null;
+}
+
 function hasStoredLastActive(user, type = listType, cache = {}, now = Date.now()) {
   if (user.last_active_ms != null) return true;
   const key = (user.username || '').toLowerCase();
@@ -1551,7 +1926,15 @@ function hasStoredLastActive(user, type = listType, cache = {}, now = Date.now()
     if (archived?.last_active_ms != null) return true;
   }
   const entry = cache[key];
-  return !!(entry?.last_active_ms && now - (entry.fetched_at || 0) < XC_ACTIVITY_CACHE_TTL_MS);
+  if (entry && typeof entry === 'object' && entry.fetched_at != null &&
+      (now - (entry.fetched_at || 0) < XC_ACTIVITY_CACHE_TTL_MS)) {
+    // Only skip re-lookup if we have a positive date, or a previous full attempt (lookup + timeline)
+    // This lets old cache nulls (pre-timeline) be re-attempted with current logic.
+    if (entry.last_active_ms != null || entry.full_attempt === true) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function hydrateLastActiveFromStoredSources(user, type = listType, cache = {}, now = Date.now()) {
@@ -1568,9 +1951,15 @@ function hydrateLastActiveFromStoredSources(user, type = listType, cache = {}, n
   }
 
   const entry = cache[key];
-  if (entry?.last_active_ms && now - (entry.fetched_at || 0) < XC_ACTIVITY_CACHE_TTL_MS) {
-    user.last_active_ms = entry.last_active_ms;
-    return true;
+  if (entry && typeof entry === 'object' && entry.fetched_at != null &&
+      (now - (entry.fetched_at || 0) < XC_ACTIVITY_CACHE_TTL_MS)) {
+    user.last_active_ms = entry.last_active_ms ?? null;
+    // Only treat as stored/skip if we have positive date or full previous attempt.
+    // Old nulls (no full_attempt flag) will not skip, allowing timeline fallback etc.
+    if (entry.last_active_ms != null || entry.full_attempt === true) {
+      return true;
+    }
+    return false;
   }
 
   return false;
@@ -1585,10 +1974,20 @@ function countLastActiveLookupNeeded(users, cache, now = Date.now(), type = list
   return needed;
 }
 
-async function enrichLastActiveForUsers(tabId, users, type = listType, onProgress) {
+async function enrichLastActiveForUsers(tabId, users, type = listType, progressOrOptions) {
+  let onProgress = null;
+  let batchSize = ENRICH_BATCH_SIZE;
+  let batchDelayMs = ENRICH_BATCH_DELAY_MS;
+
   if (typeof type === 'function') {
     onProgress = type;
     type = listType;
+  } else if (typeof progressOrOptions === 'function') {
+    onProgress = progressOrOptions;
+  } else if (progressOrOptions && typeof progressOrOptions === 'object') {
+    onProgress = progressOrOptions.onProgress;
+    batchSize = progressOrOptions.batchSize || batchSize;
+    batchDelayMs = progressOrOptions.batchDelayMs || batchDelayMs;
   }
 
   const cache = await loadActivityCache();
@@ -1611,17 +2010,18 @@ async function enrichLastActiveForUsers(tabId, users, type = listType, onProgres
   }
 
   let rateLimitRetries = 0;
-  for (let i = 0; i < needsLookup.length; i += ENRICH_BATCH_SIZE) {
+  for (let i = 0; i < needsLookup.length; i += batchSize) {
     if (activeEnrich?.cancelled) break;
     throwIfCancelled();
 
-    const batch = needsLookup.slice(i, i + ENRICH_BATCH_SIZE);
+    const batch = needsLookup.slice(i, i + batchSize);
     const handles = batch
       .map((user) => String(user.username || '').replace(/^@+/, '').trim())
       .filter(Boolean);
 
+    let lookupRes = null;
     try {
-      const res = await xcRestUsersLookupBatch(handles, {
+      lookupRes = await xcRestUsersLookupBatch(handles, {
         tabId,
         listType: type,
         preferTabContext: true,
@@ -1631,17 +2031,33 @@ async function enrichLastActiveForUsers(tabId, users, type = listType, onProgres
       throwIfCancelled();
 
       rateLimitRetries = 0;
-      if (res?.ok && res.lastActive) {
-        for (const [sn, ts] of Object.entries(res.lastActive)) {
-          cache[sn] = { last_active_ms: ts, fetched_at: now };
+      if (lookupRes?.ok) {
+        const la = lookupRes.lastActive || {};
+        for (const h of handles) {
+          const sk = h.toLowerCase();
+          const ts = la[sk];
+          cache[sk] = {
+            last_active_ms: (ts != null ? ts : null),
+            fetched_at: now
+          };
         }
       }
-      if (res?.ok && res.blueByName) {
+      if (lookupRes?.ok && lookupRes.profilesByName) {
+        for (const user of batch) {
+          const key = (user.username || '').toLowerCase();
+          const profile = lookupRes.profilesByName[key];
+          if (!profile) continue;
+          mergeUserFields(user, profile);
+          const rawRow = findRawUserByHandle(type, key);
+          if (rawRow) mergeUserFields(rawRow, profile);
+        }
+      }
+      if (lookupRes?.ok && lookupRes.blueByName) {
         for (const user of enriched) {
           const key = (user.username || '').toLowerCase();
-          if (key && res.blueByName[key]) user.is_blue = true;
+          if (key && lookupRes.blueByName[key]) user.is_blue = true;
         }
-        for (const [sn, isBlue] of Object.entries(res.blueByName)) {
+        for (const [sn, isBlue] of Object.entries(lookupRes.blueByName)) {
           if (!isBlue) continue;
           const rawRow = findRawUserByHandle(type, sn);
           if (rawRow) rawRow.is_blue = true;
@@ -1663,7 +2079,7 @@ async function enrichLastActiveForUsers(tabId, users, type = listType, onProgres
         if (onProgress) onProgress({ processed, total, waiting: true });
         await sleep(XC_REST_RATE_LIMIT_BACKOFF_MS);
         if (activeEnrich?.cancelled) break;
-        i -= ENRICH_BATCH_SIZE;
+        i -= batchSize;
         continue;
       }
     }
@@ -1674,12 +2090,37 @@ async function enrichLastActiveForUsers(tabId, users, type = listType, onProgres
       user.last_active_ms = entry?.last_active_ms ?? null;
     }
 
+    // Fallback to user timeline if the lookup didn't provide a last tweet date.
+    // This can get dates for accounts where /users/lookup omits the status.
+    for (const user of batch) {
+      if (user.last_active_ms != null) continue;
+      const ts = await getLastTweetTimeFromTimeline(user.username, { tabId });
+      if (ts) {
+        user.last_active_ms = ts;
+        const k = (user.username || '').toLowerCase();
+        cache[k] = { last_active_ms: ts, fetched_at: now, full_attempt: true };
+      }
+    }
+
+    // Ensure we record a cache entry for every account we queried in this batch
+    // (even if no date from lookup or fallback). This prevents re-queries on re-runs
+    // for "no tweet date" accounts.
+    for (const user of batch) {
+      const k = (user.username || '').toLowerCase();
+      if (!cache[k]) {
+        cache[k] = { last_active_ms: null, fetched_at: now, full_attempt: true };
+      } else if (cache[k] && !cache[k].full_attempt) {
+        // upgrade old entry to mark as full attempt
+        cache[k].full_attempt = true;
+      }
+    }
+
     processed = Math.min(total, processed + batch.length);
     if (onProgress) onProgress({ processed, total, waiting: false });
 
-    if (i + ENRICH_BATCH_SIZE < needsLookup.length) {
+    if (i + batchSize < needsLookup.length) {
       if (onProgress) onProgress({ processed, total, waiting: true });
-      await sleep(ENRICH_BATCH_DELAY_MS);
+      await sleep(batchDelayMs);
       if (activeEnrich?.cancelled) break;
     }
   }
@@ -1875,6 +2316,7 @@ function clearInMemoryLists() {
 }
 
 async function applyAccountSwitch(detected) {
+  cancelActiveWork();
   clearInMemoryLists();
   jobState = {
     ...jobState,
@@ -1887,9 +2329,10 @@ async function applyAccountSwitch(detected) {
     reason: null,
     filterRemoved: 0,
     appliedFilters: [],
-    status: null,
-    debugStatusLog: []
+    status: null
   };
+  activeFetch = null;
+  activeEnrich = null;
   await restoreAllListState();
 }
 
@@ -1901,6 +2344,9 @@ async function alignAccountForJob(detected) {
   const nextLower = normalizeAccountHandle(next);
 
   if (prev && prev !== nextLower) {
+    cancelActiveWork();
+    activeFetch = null;
+    activeEnrich = null;
     await applyAccountSwitch(next);
     return;
   }
@@ -2148,6 +2594,7 @@ const LIST_PREVIEW_COLUMNS = [
   { key: 'followers_count', label: 'followers_count' },
   { key: 'tweet_count', label: 'tweet_count' },
   { key: 'created_at', label: 'created_at' },
+  { key: 'created_on', label: 'created_on' },
   { key: 'bio', label: 'bio' },
   { key: 'is_blue', label: 'is_blue' },
   { key: 'default_avatar', label: 'default_avatar' },
@@ -2164,6 +2611,7 @@ function mapListPreviewRow(user) {
     followers_count: user.followers_count ?? '',
     tweet_count: user.tweet_count ?? '',
     created_at: user.created_at ?? '',
+    created_on: user.created_at ?? user.created_on ?? '',
     bio: accountBio(user),
     is_blue: user.is_blue ?? false,
     default_avatar: user.default_avatar ?? false,
@@ -2183,14 +2631,17 @@ async function getListPreview(requestedType = listType) {
     await restoreListState(type);
   }
   const cfg = listCfg(type);
-  const users = curList(type).slice(0, 5);
+  const isNonFree = !!subscriptionInfo.isSubscribed || subscriptionInfo.canExport === true;
+  const previewLimit = isNonFree ? 10 : 5;
+  const users = curList(type).slice(0, previewLimit);
   return {
     ok: true,
     listType: type,
     listLabel: cfg.label,
     total: curList(type).length,
     columns: LIST_PREVIEW_COLUMNS,
-    rows: users.map(mapListPreviewRow)
+    rows: users.map(mapListPreviewRow),
+    previewLimit
   };
 }
 
@@ -2473,6 +2924,22 @@ async function loadListFromCsv(type, csvText, options = {}) {
   jobState.rawCount = nextRaw.length;
   restoredTypes[type] = true;
 
+  // Wire cross-populate for CSV loads: if same username appears in the other list (already loaded),
+  // set the mutual flags (you_follow / follows_you) on both sides.
+  const otherType = type === 'following' ? 'followers' : 'following';
+  const otherSet = new Set((curList(otherType) || []).map(u => (u.username || '').toLowerCase()));
+  for (const u of curList(type)) {
+    crossPopulateMutualFlags(u, type, otherSet);
+  }
+  for (const u of curRaw(type)) {
+    crossPopulateMutualFlags(u, type, otherSet);
+  }
+
+  // Persist updates to the other list if we filled any mutual flags on it
+  if ((curList(otherType) || []).length > 0) {
+    schedulePersist(true, otherType);
+  }
+
   const cfg = listCfg(type);
   let status = mode === 'append'
     ? `Appended CSV — ${nextList.length.toLocaleString()} ${cfg.label.toLowerCase()} (${parsed.length.toLocaleString()} in file, ${appended.toLocaleString()} new).`
@@ -2591,9 +3058,11 @@ async function ensureFilterHudHandoff(options = {}, type = listType) {
   });
 }
 
+const XC_EXPECTED_SNIFFER_VERSION = 5;
+
 async function ensureSnifferInstalled(tabId) {
-  const installed = await executeOnTab(tabId, () => !!window.__xcSnifferInstalled);
-  if (installed) return true;
+  const version = await executeOnTab(tabId, () => window.__xcSnifferVersion || 0);
+  if (version === XC_EXPECTED_SNIFFER_VERSION) return true;
 
   try {
     await chrome.scripting.executeScript({
@@ -2839,10 +3308,7 @@ async function syncActiveAccountFromTab(options = {}) {
     username: explicitUsername
   } = options;
 
-  if (jobState.isScraping || activeFetch?.running) {
-    await hydrateSubscriptionFromStorage(jobState.username);
-    return { ok: true, switched: false, username: jobState.username, tabId: jobTabId };
-  }
+  // Always detect first to catch user switches even while a job might be active for previous user.
 
   let tab = null;
   if (preferredTabId) {
@@ -2885,6 +3351,9 @@ async function syncActiveAccountFromTab(options = {}) {
   const switched = !!prevUsername && prevUsername !== nextUsername;
 
   if (switched) {
+    cancelActiveWork();
+    activeFetch = null;
+    activeEnrich = null;
     await applyAccountSwitch(detected);
     notifyProgress({
       status: `Switched to @${detected} — showing cached lists for this account.`
@@ -3003,7 +3472,7 @@ function planGraphqlListFetch(type, totalList, collectedCount = 0) {
   const lastPageAccounts = remaining % pageSize;
   const totalPages = fullPages + (lastPageAccounts > 0 ? 1 : 0);
   // Followers: 1/request on small tail. Following: one sized request (native batches are ~50).
-  const tailSingleAccount = type === 'followers'
+  const tailSingleAccount = type === 'following'
     && totalPages === 1
     && remaining > 0
     && remaining <= GRAPHQL_TAIL_SINGLE_MAX;
@@ -3024,6 +3493,10 @@ function graphqlRequestCount(type, totalList, collectedCount = 0) {
   if (plan.remaining == null || plan.remaining <= 0) return pageSize;
   if (plan.fullPages > 0) return pageSize;
   if (plan.tailSingleAccount) return 1;
+  // For followers small tails, avoid tiny counts that can 404; use a small safe batch
+  if (type === 'followers' && plan.remaining != null && plan.remaining > 0 && plan.remaining <= 20) {
+    return Math.min(Math.max(3, plan.remaining), pageSize);
+  }
   return Math.min(plan.remaining + 2, pageSize);
 }
 
@@ -3063,7 +3536,11 @@ function nativeStalePassLimit(type, totalList, collected) {
   if (nativeLikelyAtTail(type, collected, totalList)) return 3;
   const remaining = totalList != null ? totalList - collected : null;
   if (remaining != null && remaining <= nativePageSize(type)) return 4;
-  if (totalList != null && collected < totalList) return 6;
+  if (totalList != null && collected < totalList) {
+    // More patience on large followers lists in overnight gentle mode
+    if (type === 'followers' && totalList > 2000) return 12;
+    return 8;
+  }
   return 5;
 }
 
@@ -3077,14 +3554,97 @@ function nativeListenTimeoutMs(type, passes, remaining) {
 
 function observeListenTimeoutMs(type, passes, remaining) {
   if (passes === 0) {
-    return type === 'followers' ? 25000 : 20000;
+    return type === 'followers' ? 12000 : 20000;
   }
   if (remaining > 0 && remaining <= 100) {
-    return scrollJitterMs(8000, 0.25);
+    return type === 'followers' ? scrollJitterMs(3500, 0.25) : scrollJitterMs(8000, 0.25);
   }
   return type === 'followers'
-    ? scrollJitterMs(14000, 0.3)
+    ? scrollJitterMs(5000, 0.25)
     : scrollJitterMs(11000, 0.3);
+}
+
+function observeGraphqlHandoffMinPasses(type, collected) {
+  if (type === 'following' && collected === 0) return 1;
+  return 2;
+}
+
+async function observeTryGraphqlHandoff(tabId, profile, type, seen, fetchTarget, totalList, passes) {
+  if (!listFetchNeedsMore(type, totalList)) return false;
+  const collected = curList(type).length;
+  if (passes < observeGraphqlHandoffMinPasses(type, collected)) return false;
+  if (isJobCancelled()) return false;
+
+  const cfg = listCfg(type);
+  const captured = await readCapturedListTemplateFromTab(tabId, cfg.opName);
+  const pageNote = type === 'followers' ? '~100/page' : '~20/page';
+  const stalled = passes >= 5 && collected > 0 && collected < 200; // allow handoff on slow progress for large lists
+  const canHandoff = type === 'following'
+    ? (collected === 0 && passes >= 1)
+      || collected >= 12
+      || (collected > 0 && (captured?.url || passes >= 4))
+    : !(collected < 12 && !captured?.url) || stalled;
+  if (!canHandoff) return false;
+
+  await ensureProfileUserId(tabId, profile);
+  if (!profile.userId) return false;
+
+  try {
+    await stopListObserverFromTab(tabId);
+  } catch (error) {}
+
+  const restartFromTop = collected === 0;
+  if (restartFromTop) {
+    try {
+      await scrollListToTop(tabId);
+      await sleep(1000);
+    } catch (error) {}
+  }
+
+  if (collected > 0) {
+    notifyProgress({
+      reason: 'collecting',
+      method: 'rest-v1.1',
+      status: `${cfg.label} observe → REST sniffer cursor (${collected.toLocaleString()} warmed up)...`
+    });
+    appendDebugStatusLog({
+      reason: 'collecting',
+      method: 'rest-v1.1',
+      status: `${cfg.label} handoff — REST sniffer cursor after ${passes} observe pass(es)`
+    });
+    await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList, {
+      maxPages: type === 'followers' ? 12 : 16,
+      scrollToLoad: true
+    });
+    if (!listFetchNeedsMore(type, totalList)) return true;
+
+    const tailGap = totalList != null ? totalList - curList(type).length : null;
+    if (tailGap != null && tailGap > 0 && tailGap <= 200) {
+      await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+    }
+    if (!listFetchNeedsMore(type, totalList)) return true;
+
+    if (type === 'followers') {
+      await recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalList, { skipWarmup: true });
+      return true;
+    }
+  }
+
+  notifyProgress({
+    reason: 'collecting',
+    method: 'graphql',
+    status: `${cfg.label} observe → GraphQL (${collected.toLocaleString()} warmed up, ${pageNote})...`
+  });
+  appendDebugStatusLog({
+    reason: 'collecting',
+    method: 'graphql',
+    status: `Observe handoff to GraphQL (${type}) after ${passes} pass(es), ${collected} collected`
+  });
+
+  await continueListFetchWithGraphql(tabId, profile, type, seen, fetchTarget, totalList, {
+    restartFromTop
+  });
+  return true;
 }
 
 function effectiveTotalList(type, profile) {
@@ -3128,16 +3688,84 @@ async function followersWorkerOpCandidates(_tabId) {
   return ['Followers'];
 }
 
+async function buildGraphqlCatalog(tabId, type, force = false) {
+  let catalog = await prefetchQueryCatalog(force);
+  if (type === 'followers') {
+    catalog = await resolveCatalogWithTabQueryIds(tabId, catalog);
+  }
+  return catalog;
+}
+
+async function fetchListGraphqlPage(tabId, type, fetchParams, options = {}) {
+  const listPath = fetchParams.listPath
+    || (fetchParams.opName === 'Followers' ? 'followers' : 'following');
+  const params = {
+    ...fetchParams,
+    listPath,
+    capturedTemplate: options.capturedTemplate ?? null
+  };
+
+  if (tabId) {
+    if (type === 'followers' && !params.capturedTemplate) {
+      try {
+        const snifferTemplate = await readCapturedListTemplateFromTab(tabId, params.opName);
+        if (snifferTemplate?.url) {
+          const sniffRes = await fetchListPageFromTab(tabId, {
+            ...params,
+            capturedTemplate: snifferTemplate
+          });
+          if (sniffRes?.ok) return sniffRes;
+        }
+      } catch (error) {}
+    }
+
+    let tabRes = await fetchListPageFromTab(tabId, params);
+    if (tabRes?.ok) return tabRes;
+
+    const shouldRefresh = !options.retried
+      && (tabRes?.status === 404
+        || tabRes?.status === 401
+        || /404|401|auth failed/i.test(tabRes?.error || ''));
+    if (shouldRefresh) {
+      const freshCatalog = await buildGraphqlCatalog(tabId, type, true);
+      tabRes = await fetchListPageFromTab(tabId, {
+        ...params,
+        catalog: freshCatalog,
+        capturedTemplate: null
+      });
+      if (tabRes?.ok) return tabRes;
+    }
+
+    if (type === 'followers') {
+      return tabRes;
+    }
+
+    const merged = await fetchListPageMerged(tabId, { ...params, capturedTemplate: null });
+    return merged?.ok ? merged : (tabRes || merged);
+  }
+
+  const session = await getXSessionCookies();
+  return fetchListPageWorker({
+    opName: params.opName,
+    userId: params.userId,
+    screenName: params.screenName,
+    cursor: params.cursor,
+    count: params.count,
+    catalog: params.catalog,
+    ct0: session.ct0,
+    listPath
+  });
+}
+
 async function recoverShortfallViaWorkerGraphql(tabId, profile, type, seen, totalList) {
   const gap = totalList != null ? totalList - curList(type).length : null;
-  if (gap == null || gap <= 0 || gap > 100) return 0;
+  if (gap == null || gap <= 0 || gap > 200) return 0;
 
   const cfg = listCfg(type);
   const session = await getXSessionCookies();
   if (!session.ct0 || !profile.userId) return 0;
 
-  let catalog = await prefetchQueryCatalog(true);
-  catalog = await resolveCatalogWithTabQueryIds(tabId, catalog);
+  let catalog = await buildGraphqlCatalog(tabId, type, true);
   const opNames = type === 'followers'
     ? await followersWorkerOpCandidates(tabId)
     : [cfg.opName];
@@ -3163,7 +3791,7 @@ async function recoverShortfallViaWorkerGraphql(tabId, profile, type, seen, tota
     let stalePages = 0;
     const maxPages = Math.ceil((totalList || 500) / graphqlListPageCount(type)) + 8;
 
-    while (!activeFetch?.cancelled && pages < maxPages && listFetchNeedsMore(type, totalList)) {
+    while (!isJobCancelled() && pages < maxPages && listFetchNeedsMore(type, totalList)) {
       const requestCount = graphqlRequestCount(type, totalList, curList(type).length);
       const res = await fetchListPageWorker({
         opName,
@@ -3182,16 +3810,15 @@ async function recoverShortfallViaWorkerGraphql(tabId, profile, type, seen, tota
           method: 'graphql-worker',
           reason: 'collecting'
         });
-        if (tabId && pages === 0) {
-          const tabRes = await fetchListPageFromTab(tabId, {
+        if (tabId && pages === 0 && type === 'followers') {
+          const tabRes = await fetchListGraphqlPage(tabId, type, {
             opName,
             userId: profile.userId,
             screenName: profile.username,
             cursor,
             count: requestCount,
             catalog,
-            listPath: cfg.path,
-            capturedTemplate: await readCapturedListTemplateFromTab(tabId, opName)
+            listPath: cfg.path
           });
           if (tabRes?.ok) {
             const parsedCount = (tabRes.users || []).length;
@@ -3319,36 +3946,93 @@ async function warmRestListPageContext(tabId, profile, type = listType) {
   return true;
 }
 
-async function recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList) {
+async function recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList, options = {}) {
   const cfg = listCfg(type);
   const gap = totalList != null ? totalList - curList(type).length : null;
   if (!tabId || !gap || gap <= 0) return 0;
 
-  const cursor = await readNativeListCursorFromTab(tabId, cfg.opName);
-  if (!cursor || cursor === '0') return 0;
+  const maxPages = options.maxPages || (type === 'followers' ? 12 : 16);
+  let totalAdded = 0;
+  let stalePasses = 0;
+  let restCursor = null;
 
-  try {
-    const page = await xcRestFetchListPage(profile.username, type, cursor, {
-      tabId,
-      userId: profile.userId,
-      preferTabContext: true,
-      pageSize: Math.min(200, Math.max(gap + 5, 20)),
-      tabRetries: 2
-    });
-    const added = addNativeUsers({ users: page.users || [] }, seen, profile.username, type);
-    trimListToFetchLimit(type);
-    if (added > 0) {
-      notifyProgress({
-        reason: 'collecting',
-        method: 'rest-v1.1',
-        addedLastPage: added,
-        status: `REST sniffer cursor: ${curList(type).length.toLocaleString()} / ${totalList.toLocaleString()} (+${added})`
-      });
+  for (let pass = 0; pass < maxPages && listFetchNeedsMore(type, totalList); pass += 1) {
+    let cursor = restCursor;
+    if (!cursor || cursor === '0') {
+      cursor = await readNativeListCursorFromTab(tabId, cfg.opName);
+      if (!cursor || cursor === '0') {
+        if (options.scrollToLoad && pass < maxPages - 1) {
+          try {
+            const remaining = totalList != null ? totalList - curList(type).length : gap;
+            if (remaining != null && remaining <= 20) {
+              await scrollListToLoad(tabId, { gap: remaining, aggressive: true });
+              await sleep(type === 'followers' ? 1200 : 1800);
+            } else {
+              await scrollListStep(tabId);
+              await sleep(type === 'followers' ? 1800 : 2500);
+            }
+          } catch (error) {}
+          cursor = await readNativeListCursorFromTab(tabId, cfg.opName);
+        }
+        if (!cursor || cursor === '0') break;
+      }
     }
-    return added;
-  } catch (error) {
-    return 0;
+
+    try {
+      const remaining = totalList != null ? totalList - curList(type).length : gap;
+      const page = await xcRestFetchListPage(profile.username, type, cursor, {
+        tabId,
+        userId: profile.userId,
+        preferTabContext: true,
+        pageSize: Math.min(200, Math.max(remaining + 5, 20)),
+        tabRetries: 2
+      });
+      const parsedCount = (page.users || []).length;
+      const added = addNativeUsers({ users: page.users || [] }, seen, profile.username, type);
+      trimListToFetchLimit(type);
+      totalAdded += added;
+
+      const nextCursor = page.nextCursor && page.nextCursor !== '0' ? page.nextCursor : null;
+      if (nextCursor && nextCursor !== cursor) {
+        restCursor = nextCursor;
+      } else {
+        restCursor = null;
+      }
+
+      if (added > 0) {
+        stalePasses = 0;
+        notifyProgress({
+          reason: 'collecting',
+          method: 'rest-v1.1',
+          addedLastPage: added,
+          status: `REST sniffer cursor: ${curList(type).length.toLocaleString()} / ${totalList.toLocaleString()} (+${added})`
+        });
+      } else if (parsedCount > 0 && restCursor) {
+        stalePasses = 0;
+      } else {
+        stalePasses += 1;
+        restCursor = null;
+        if (stalePasses >= 2) break;
+      }
+    } catch (error) {
+      restCursor = null;
+      break;
+    }
+
+    if (
+      options.scrollToLoad
+      && listFetchNeedsMore(type, totalList)
+      && pass < maxPages - 1
+      && (!restCursor || restCursor === '0')
+    ) {
+      try {
+        await scrollListStep(tabId);
+        await sleep(type === 'followers' ? 1500 : 2200);
+      } catch (error) {}
+    }
   }
+
+  return totalAdded;
 }
 
 async function recoverShortfallViaRest(tabId, profile, type, seen, totalList) {
@@ -3419,6 +4103,77 @@ async function recoverShortfallViaRest(tabId, profile, type, seen, totalList) {
         reason: 'collecting'
       });
     }
+
+    // For gentle followers small tail: if no new users, do extra gentle scroll to potentially advance the native cursor/sniffer, then retry once
+    if (type === 'followers' && !fastScrollEnabled && gap <= 30) {
+      try {
+        await scrollListToLoad(tabId);
+        await sleep(2000);
+        const freshCursor = await readNativeListCursorFromTab(tabId, listCfg(type).opName);
+        if (freshCursor && freshCursor !== lastResult.nextCursor) {
+          lastResult.nextCursor = freshCursor;
+          lastResult.hasValidCursor = true;
+          const retryTail = await xcRestTryShortfallRecovery(
+            profile.username,
+            type,
+            totalList,
+            curList(type).length,
+            lastResult,
+            requestOptions,
+            allAttempts
+          );
+          const retryRec = retryTail?.recovery;
+          if (retryRec?.users?.length) {
+            const added = addNativeUsers({ users: retryRec.users }, seen, profile.username, type);
+            if (added > 0) {
+              trimListToFetchLimit(type);
+              notifyProgress({
+                reason: 'collecting',
+                method: 'rest-v1.1',
+                addedLastPage: added,
+                status: `REST tail (post-scroll retry): ${curList(type).length.toLocaleString()} / ${totalList.toLocaleString()} (+${added})`
+              });
+              return added;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    // For small gentle follower tails: force a fresh screen_name fetch (cursor -1, sized to remaining + buffer).
+    // This mimics the successful full-page REST in fast mode for the tail without doing full-list bulk on large accounts.
+    // Extra pause keeps it gentle/stealthy.
+    if (type === 'followers' && !fastScrollEnabled && gap > 0 && gap <= 50) {
+      try {
+        await sleep(3000);
+        const fresh = await xcRestFetchListPage(profile.username, type, '-1', {
+          ...requestOptions,
+          pageSize: Math.min(totalList || (gap + 50), XC_REST_PAGE_SIZE),
+          preferUserId: false,
+          preferTabContext: true,
+          tabRetries: 2
+        });
+        if (fresh?.users?.length) {
+          const added = addNativeUsers({ users: fresh.users }, seen, profile.username, type);
+          if (added > 0) {
+            trimListToFetchLimit(type);
+            const attemptNote = xcRestFormatAttempts(fresh.attempts || []);
+            appendDebugStatusLog({
+              status: `REST tail (fresh full): +${added} parsed ${fresh.users.length}${attemptNote ? ` (${attemptNote})` : ''}`,
+              method: 'rest-v1.1',
+              reason: 'collecting'
+            });
+            notifyProgress({
+              reason: 'collecting',
+              method: 'rest-v1.1',
+              addedLastPage: added,
+              status: `REST tail (fresh): ${curList(type).length.toLocaleString()} / ${totalList.toLocaleString()} (+${added})`
+            });
+            return added;
+          }
+        }
+      } catch (e) {}
+    }
   } catch (error) {
     appendDebugStatusLog({
       status: `REST tail recovery failed: ${error.message || error}`,
@@ -3437,7 +4192,15 @@ async function recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen
 
   let totalAdded = 0;
   let lastSeq = 0;
-  const passes = fastScrollEnabled ? (gap <= 10 ? 4 : 2) : (gap <= 10 ? 8 : 12);
+  // More passes for small gaps in gentle mode on followers (patient overnight collection)
+  let passes;
+  if (fastScrollEnabled) {
+    passes = (gap <= 10 ? 4 : 2);
+  } else if (type === 'followers' && gap <= 25) {
+    passes = Math.min(25, Math.max(12, Math.ceil(gap * 1.2)));
+  } else {
+    passes = (gap <= 10 ? 8 : 12);
+  }
   const listenMs = fastScrollEnabled
     ? (type === 'followers' ? 7000 : 5000)
     : (type === 'followers' ? 16000 : 12000);
@@ -3453,7 +4216,7 @@ async function recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen
     status: `Scrolling ${cfg.label.toLowerCase()} to trigger native API (${gap.toLocaleString()} short)...`
   });
 
-  for (let pass = 0; pass < passes && !activeFetch?.cancelled && listFetchNeedsMore(type, totalList); pass += 1) {
+  for (let pass = 0; pass < passes && !isJobCancelled() && listFetchNeedsMore(type, totalList); pass += 1) {
     await scrollListToLoad(tabId);
     await sleep(await sleepAfterScrollStep(type, 'shortfall'));
 
@@ -3492,6 +4255,19 @@ async function recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen
       }
     } catch (error) {}
 
+    // For followers small gaps, interleave a quick REST recovery attempt (more reliable than pure sniffer)
+    if (type === 'followers' && gap != null && gap <= 30 && pass % 3 === 2) {
+      const restAdded = await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+      totalAdded += restAdded;
+      if (restAdded > 0) {
+        notifyProgress({
+          reason: 'collecting',
+          method: 'rest-v1.1',
+          status: `REST top-up during sniffer: +${restAdded} (now ${curList(type).length})`
+        });
+      }
+    }
+
     if (!listFetchNeedsMore(type, totalList)) break;
   }
 
@@ -3528,7 +4304,8 @@ async function recoverShortfallChain(tabId, profile, type, seen, totalList, opti
   if (listFetchNeedsMore(type, totalList)) {
     const gap = totalList != null ? totalList - curList(type).length : null;
     const runTailGap = async () => fetchListTailGap(tabId, profile, type, seen, totalList);
-    const tailGapAdded = gap != null && gap > 0 && gap <= 20
+    const tailThreshold = type === 'followers' ? gentleFollowersRecoveryCap(totalList) : 20;
+    const tailGapAdded = gap != null && gap > 0 && gap <= tailThreshold
       ? await withFastScrollRecoveryBoost(runTailGap)
       : await runTailGap();
     totalAdded += tailGapAdded;
@@ -3543,7 +4320,7 @@ async function recoverShortfallChain(tabId, profile, type, seen, totalList, opti
 
 async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalList, options = {}) {
   const gap = totalList != null ? totalList - curList(type).length : null;
-  if (gap == null || gap <= 0 || gap > 100 || !tabId) return 0;
+  if (gap == null || gap <= 0 || gap > 200 || !tabId) return 0;
 
   const cfg = listCfg(type);
   let totalAdded = 0;
@@ -3582,6 +4359,21 @@ async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalLi
 
   if (!listFetchNeedsMore(type, totalList)) return totalAdded;
 
+  if (type === 'followers') {
+    const restCursorAdded = await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList, {
+      maxPages: 8,
+      scrollToLoad: true
+    });
+    totalAdded += restCursorAdded;
+    if (!listFetchNeedsMore(type, totalList)) return totalAdded;
+
+    const restTailGap = totalList != null ? totalList - curList(type).length : null;
+    if (restTailGap != null && restTailGap > 0 && restTailGap <= 100) {
+      totalAdded += await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+    }
+    if (!listFetchNeedsMore(type, totalList)) return totalAdded;
+  }
+
   const scrollSnifferAdded = await recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen, totalList);
   totalAdded += scrollSnifferAdded;
   if (!listFetchNeedsMore(type, totalList)) return totalAdded;
@@ -3590,9 +4382,11 @@ async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalLi
   totalAdded += domAdded;
   if (!listFetchNeedsMore(type, totalList)) return totalAdded;
 
-  const restCursorAdded = await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList);
-  totalAdded += restCursorAdded;
-  if (!listFetchNeedsMore(type, totalList)) return totalAdded;
+  if (type !== 'followers') {
+    const restCursorAdded = await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList);
+    totalAdded += restCursorAdded;
+    if (!listFetchNeedsMore(type, totalList)) return totalAdded;
+  }
 
   if (!profile.userId) {
     try {
@@ -3605,8 +4399,7 @@ async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalLi
   const session = await getXSessionCookies();
   if (!session.ct0) return totalAdded;
 
-  let catalog = await prefetchQueryCatalog(true);
-  catalog = await resolveCatalogWithTabQueryIds(tabId, catalog);
+  let catalog = await buildGraphqlCatalog(tabId, type, true);
   const opNames = type === 'followers' ? ['Followers'] : [cfg.opName];
   const pageDelayMs = GRAPHQL_PAGE_DELAY_MS[type] || 600;
   const remainingGap = totalList != null ? totalList - curList(type).length : null;
@@ -3618,7 +4411,7 @@ async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalLi
     if (!listFetchNeedsMore(type, totalList)) break;
 
     const capturedOp = await readCapturedListOpNameFromTab(tabId, opName);
-    let captured = await readCapturedListTemplateFromTab(tabId, capturedOp || opName);
+    let captured = type === 'followers' ? null : await readCapturedListTemplateFromTab(tabId, capturedOp || opName);
     if (!captured?.url) {
       await scrollListToLoad(tabId);
       await sleep(await sleepAfterScrollStep(type, 'shortfall'));
@@ -3630,44 +4423,43 @@ async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalLi
     let zeroAddPages = 0;
     let droppedCaptured = false;
 
-    while (!activeFetch?.cancelled && pages < maxPages && listFetchNeedsMore(type, totalList)) {
+    while (!isJobCancelled() && pages < maxPages && listFetchNeedsMore(type, totalList)) {
       const requestCount = graphqlRequestCount(type, totalList, curList(type).length);
-      let res = await fetchListPageMerged(tabId, {
+      let res = await fetchListGraphqlPage(tabId, type, {
         opName: capturedOp || opName,
         userId: profile.userId,
         screenName: profile.username,
         cursor,
         count: requestCount,
         catalog,
-        ct0: session.ct0,
-        listPath: cfg.path,
-        capturedTemplate: captured
+        listPath: cfg.path
+      }, {
+        capturedTemplate: type === 'followers' ? null : captured,
+        retried: droppedCaptured
       });
 
       if (
         !res?.ok
         && !droppedCaptured
-        && captured?.url
-        && (res?.status === 404 || /404/.test(res?.error || ''))
+        && (res?.status === 404 || res?.status === 401 || /404|401|auth failed/i.test(res?.error || ''))
       ) {
         droppedCaptured = true;
         captured = null;
+        catalog = await buildGraphqlCatalog(tabId, type, true);
         appendDebugStatusLog({
-          status: `Tab recovery ${opName}: captured GraphQL URL 404 — retrying with fresh query catalog`,
+          status: `Tab recovery ${opName}: retrying in tab with live query id`,
           method: 'graphql-tab',
           reason: 'collecting'
         });
-        res = await fetchListPageMerged(tabId, {
+        res = await fetchListGraphqlPage(tabId, type, {
           opName: capturedOp || opName,
           userId: profile.userId,
           screenName: profile.username,
           cursor,
           count: requestCount,
-          catalog: await prefetchQueryCatalog(true),
-          ct0: session.ct0,
-          listPath: cfg.path,
-          capturedTemplate: null
-        });
+          catalog,
+          listPath: cfg.path
+        }, { capturedTemplate: null, retried: true });
       }
 
       if (!res?.ok) {
@@ -3757,23 +4549,32 @@ async function fetchListPageMerged(tabId, params) {
   const basePath = params.listPath || (params.opName === 'Followers' ? 'followers' : 'following');
   const listPath = await resolveListPagePath(tabId, params.screenName, basePath);
   const tabParams = { ...params, listPath };
-  const tabRes = await fetchListPageFromTab(tabId, tabParams);
+  let tabRes = await fetchListPageFromTab(tabId, tabParams);
 
-  const captured = params.capturedTemplate
-    || (params.opName === 'Followers' ? await readCapturedListTemplateFromTab(tabId, params.opName) : null);
-  if (tabRes?.ok && params.opName === 'Followers' && captured?.url) {
+  if (tabRes?.ok) {
+    return tabRes;
+  }
+
+  if (
+    params.opName === 'Followers'
+    && (tabRes?.status === 401 || /auth failed/i.test(tabRes?.error || ''))
+  ) {
     return tabRes;
   }
 
   const session = await getXSessionCookies();
   const workerOpName = await resolveFollowersWorkerOpName(tabId, params.opName);
+  let workerCatalog = params.catalog;
+  if (workerOpName === 'Followers') {
+    workerCatalog = await resolveCatalogWithTabQueryIds(tabId, workerCatalog);
+  }
   const workerRes = await fetchListPageWorker({
     opName: workerOpName,
     userId: params.userId,
     screenName: params.screenName,
     cursor: params.cursor,
     count: params.count,
-    catalog: params.catalog,
+    catalog: workerCatalog,
     ct0: session.ct0,
     listPath
   });
@@ -3840,7 +4641,7 @@ async function fetchFullListViaGraphql(tabId, profile, type, fetchTarget, totalL
     status: `Fetching full ${cfg.label.toLowerCase()} list via GraphQL...`
   });
 
-  while (!activeFetch?.cancelled && pages < maxPages) {
+  while (!isJobCancelled() && pages < maxPages) {
     const useCaptured = pages === 0
       && !cursor
       && (await tabIsOnListPage(tabId, profile.username, cfg.path));
@@ -4002,7 +4803,7 @@ async function fetchListFinalPartialPage(tabId, profile, type, seen, totalList, 
     let cursor = startCursor;
     let staleTailPasses = 0;
 
-    for (let pass = 0; pass < tailPasses && !activeFetch?.cancelled && listFetchNeedsMore(type, totalList); pass += 1) {
+    for (let pass = 0; pass < tailPasses && !isJobCancelled() && listFetchNeedsMore(type, totalList); pass += 1) {
       const countNow = graphqlRequestCount(type, totalList, curList(type).length);
       const res = await fetchListPageMerged(tabId, {
         opName: cfg.opName,
@@ -4078,7 +4879,7 @@ async function fetchListTailScrollNative(tabId, profile, type, seen, totalList, 
   await scrollListToTop(tabId);
   await sleep(fastScrollEnabled ? 800 : 2000);
 
-  for (let step = 0; step < maxSteps && !activeFetch?.cancelled && listFetchNeedsMore(type, totalList); step += 1) {
+  for (let step = 0; step < maxSteps && !isJobCancelled() && listFetchNeedsMore(type, totalList); step += 1) {
     await scrollListStep(tabId);
     await sleep(await sleepAfterScrollStep(type, 'tail'));
 
@@ -4111,7 +4912,8 @@ async function fetchListTailScrollNative(tabId, profile, type, seen, totalList, 
 
 async function fetchListTailGraphql(tabId, profile, type, seen, totalList, captured) {
   const cfg = listCfg(type);
-  const catalog = await prefetchQueryCatalog(false);
+  let catalog = await buildGraphqlCatalog(tabId, type, false);
+  let dropped404Recovery = false;
   const pageDelayMs = GRAPHQL_PAGE_DELAY_MS[type] || 600;
   const listPath = await resolveListPagePath(tabId, profile.username, cfg.path);
   const gap = totalList != null ? totalList - curList(type).length : null;
@@ -4128,7 +4930,7 @@ async function fetchListTailGraphql(tabId, profile, type, seen, totalList, captu
     status: `Tail GraphQL for ${gap != null ? gap.toLocaleString() : 'remaining'} ${cfg.label.toLowerCase()}...`
   });
 
-  while (!activeFetch?.cancelled && pages < 30 && listFetchNeedsMore(type, totalList)) {
+  while (!isJobCancelled() && pages < 30 && listFetchNeedsMore(type, totalList)) {
     if (!cursor) {
       await scrollListToLoad(tabId);
       await sleep(fastScrollEnabled ? pageDelayMs * 2 : await sleepAfterScrollStep(type, 'tail'));
@@ -4145,16 +4947,36 @@ async function fetchListTailGraphql(tabId, profile, type, seen, totalList, captu
     }
 
     const requestCount = graphqlRequestCount(type, totalList, curList(type).length);
-    const res = await fetchListPageMerged(tabId, {
+    let res = await fetchListGraphqlPage(tabId, type, {
       opName: cfg.opName,
       listPath,
       userId: profile.userId,
       screenName: profile.username,
       cursor,
       count: requestCount,
-      catalog,
-      capturedTemplate: captured || null
+      catalog
+    }, {
+      capturedTemplate: type === 'followers' ? null : (dropped404Recovery ? null : (captured || null)),
+      retried: dropped404Recovery
     });
+
+    if (
+      !res?.ok
+      && !dropped404Recovery
+      && (res?.status === 404 || res?.status === 401 || /404|401|auth failed/i.test(res?.error || ''))
+    ) {
+      dropped404Recovery = true;
+      catalog = await buildGraphqlCatalog(tabId, type, true);
+      res = await fetchListGraphqlPage(tabId, type, {
+        opName: cfg.opName,
+        listPath,
+        userId: profile.userId,
+        screenName: profile.username,
+        cursor,
+        count: requestCount,
+        catalog
+      }, { capturedTemplate: null, retried: true });
+    }
 
     if (!res?.ok) break;
 
@@ -4202,7 +5024,7 @@ async function fetchListTailDom(tabId, profile, type, seen, totalList) {
   let totalAdded = 0;
   const settleMs = type === 'followers' ? 2200 : 1500;
 
-  for (let pass = 0; pass < 2 && !activeFetch?.cancelled && listFetchNeedsMore(type, totalList); pass += 1) {
+  for (let pass = 0; pass < 2 && !isJobCancelled() && listFetchNeedsMore(type, totalList); pass += 1) {
     const gap = totalList != null ? totalList - curList(type).length : null;
     notifyProgress({
       reason: 'collecting',
@@ -4237,7 +5059,7 @@ async function fetchListTailGap(tabId, profile, type, seen, totalList, lastSeq =
   if (!listFetchNeedsMore(type, totalList)) return 0;
 
   const gap = totalList != null ? totalList - curList(type).length : null;
-  if (gap == null || gap <= 0 || gap > 80) return 0;
+  if (gap == null || gap <= 0 || gap > 200) return 0;
 
   let totalAdded = 0;
   const captured = await readCapturedListTemplateFromTab(tabId, cfg.opName);
@@ -4264,30 +5086,30 @@ async function fetchListTailGap(tabId, profile, type, seen, totalList, lastSeq =
     }
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList) && profile.userId) {
+  if (!isJobCancelled() && listFetchNeedsMore(type, totalList) && profile.userId) {
     totalAdded += await fetchListFinalPartialPage(tabId, profile, type, seen, totalList, captured);
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList) && profile.userId) {
+  if (!isJobCancelled() && listFetchNeedsMore(type, totalList) && profile.userId) {
     totalAdded += await fetchListTailCursorSweep(tabId, profile, type, seen, totalList, captured);
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList) && profile.userId) {
+  if (!isJobCancelled() && listFetchNeedsMore(type, totalList) && profile.userId) {
     totalAdded += await fetchListTailGraphql(tabId, profile, type, seen, totalList, captured);
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList)) {
+  if (!isJobCancelled() && listFetchNeedsMore(type, totalList)) {
     totalAdded += await fetchListTailScrollNative(tabId, profile, type, seen, totalList, lastSeq);
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList)) {
+  if (!isJobCancelled() && listFetchNeedsMore(type, totalList)) {
     totalAdded += await fetchListTailDom(tabId, profile, type, seen, totalList);
   }
 
   return totalAdded;
 }
 
-async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTarget, totalList) {
+async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTarget, totalList, options = {}) {
   const cfg = listCfg(type);
   const opName = type === 'followers'
     ? await resolveFollowersWorkerOpName(tabId, cfg.opName)
@@ -4306,10 +5128,16 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
   if (!listFetchNeedsMore(type, totalList)) return 0;
 
   const subscriptionCap = subscriptionInfo.fetchLimit;
-  const catalog = await prefetchQueryCatalog(false);
+  let catalog = await buildGraphqlCatalog(tabId, type, true);
   const pageSize = graphqlListPageCount(type);
   const pageDelayMs = GRAPHQL_PAGE_DELAY_MS[type] || 600;
-  let cursor = await readNativeListCursorFromTab(tabId, opName);
+  let cursor = options.restartFromTop ? null : await readNativeListCursorFromTab(tabId, opName);
+  if (options.restartFromTop) {
+    try {
+      await scrollListToTop(tabId);
+      await sleep(1200);
+    } catch (error) {}
+  }
   if (!cursor && seen.size > nativePageSize(type)) {
     await scrollListToLoad(tabId);
     await sleep(fastScrollEnabled ? pageDelayMs * 2 : await sleepAfterScrollStep(type, 'tail'));
@@ -4322,12 +5150,12 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
     }
   }
   const captured = await readCapturedListTemplateFromTab(tabId, opName);
-  const useCapturedEndpoint = !!captured?.url;
   const listPath = await resolveListPagePath(tabId, profile.username, cfg.path);
   let pages = 0;
   let totalAdded = 0;
   let cursorRetries = 0;
   const maxPages = 500;
+  let dropped404Recovery = false;
 
   const startPlan = planGraphqlListFetch(type, totalList, curList(type).length);
   jobState.method = 'graphql';
@@ -4339,10 +5167,15 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
       : `Collected ${curList(type).length.toLocaleString()} via native — continuing with GraphQL pages...`
   });
 
-  while (!activeFetch?.cancelled && pages < maxPages) {
+  while (!isJobCancelled() && pages < maxPages) {
     if (!listFetchNeedsMore(type, totalList)) break;
 
     const requestCount = graphqlRequestCount(type, totalList, curList(type).length);
+    const useCapturedTemplate = type !== 'followers'
+      && !dropped404Recovery
+      && pages === 0
+      && !cursor
+      && captured?.url;
     const fetchParams = {
       opName,
       listPath,
@@ -4350,20 +5183,67 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
       screenName: profile.username,
       cursor,
       count: requestCount,
-      catalog,
-      capturedTemplate: useCapturedEndpoint ? captured : (pages === 0 && !cursor ? captured : null)
+      catalog
     };
-    const res = useCapturedEndpoint
-      ? await fetchListPageFromTab(tabId, fetchParams)
-      : await fetchListPageMerged(tabId, fetchParams);
+    let res = await fetchListGraphqlPage(tabId, type, fetchParams, {
+      capturedTemplate: useCapturedTemplate ? captured : null,
+      retried: dropped404Recovery
+    });
+
+    if (
+      !res?.ok
+      && !dropped404Recovery
+      && (res?.status === 404 || res?.status === 401 || /404|401|auth failed/i.test(res?.error || ''))
+    ) {
+      dropped404Recovery = true;
+      catalog = await buildGraphqlCatalog(tabId, type, true);
+      appendDebugStatusLog({
+        reason: 'collecting',
+        method: 'graphql',
+        status: `GraphQL ${res?.status || 'error'} — retrying ${opName} in tab with live query id...`
+      });
+      res = await fetchListGraphqlPage(tabId, type, { ...fetchParams, catalog }, {
+        capturedTemplate: null,
+        retried: true
+      });
+    }
 
     if (!res?.ok) {
       console.warn('[X Cleaner] GraphQL page failed', res.error || res.status);
       notifyProgress({
         reason: 'collecting',
         method: 'graphql',
-        status: `GraphQL failed: ${res.error || `HTTP ${res.status || 0}`}. Collected ${curList(type).length.toLocaleString()} so far.`
+        status: `GraphQL failed: ${res?.error || `HTTP ${res?.status || 0}`}. Collected ${curList(type).length.toLocaleString()} so far.`
       });
+      if (listFetchNeedsMore(type, totalList)) {
+        // For followers, heavily prefer REST recoveries (which proved reliable) over more GraphQL
+        if (type === 'followers') {
+          totalAdded += await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList, {
+            maxPages: 20,
+            scrollToLoad: true
+          });
+          const tailGap = totalList != null ? totalList - curList(type).length : null;
+          if (listFetchNeedsMore(type, totalList) && tailGap != null && tailGap > 0) {
+            totalAdded += await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+          }
+          // Only try more GraphQL as last resort for followers
+          if (listFetchNeedsMore(type, totalList) && tailGap != null && tailGap > 50) {
+            totalAdded += await recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalList, { skipWarmup: true });
+          }
+        } else {
+          totalAdded += await recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList, {
+            maxPages: 16,
+            scrollToLoad: true
+          });
+          const tailGap = totalList != null ? totalList - curList(type).length : null;
+          if (listFetchNeedsMore(type, totalList) && tailGap != null && tailGap > 0 && tailGap <= 200) {
+            totalAdded += await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+          }
+          if (listFetchNeedsMore(type, totalList)) {
+            totalAdded += await recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalList, { skipWarmup: true });
+          }
+        }
+      }
       break;
     }
 
@@ -4403,7 +5283,9 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
 
     if (!nextCursor || nextCursor === cursor) {
       const tailGap = totalList != null ? totalList - curList(type).length : null;
-      const maxCursorRetries = type === 'followers' && tailGap != null && tailGap > 0 ? 15 : (tailGap != null && tailGap <= 20 ? 12 : 3);
+      const maxCursorRetries = tailGap != null && tailGap > 0
+        ? (type === 'followers' ? 15 : 18)
+        : (tailGap != null && tailGap <= 20 ? 12 : 3);
       if (listFetchNeedsMore(type, totalList) && cursorRetries < maxCursorRetries) {
         cursorRetries += 1;
         await scrollListToLoad(tabId);
@@ -4428,6 +5310,35 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
     await sleep(tailDelay);
   }
 
+  if (!options.skipPostRecovery && listFetchNeedsMore(type, totalList)) {
+    const gap = totalList != null ? totalList - curList(type).length : null;
+    if (gap != null && gap > 0) {
+      notifyProgress({
+        reason: 'collecting',
+        method: 'graphql',
+        status: `GraphQL paused — ${gap.toLocaleString()} short, running tail recovery...`
+      });
+      const tailAdded = await fetchListTailGap(tabId, profile, type, seen, totalList);
+      totalAdded += tailAdded;
+      if (
+        listFetchNeedsMore(type, totalList)
+        && !options.restartFromTop
+        && gap > Math.max(12, Math.floor(nativePageSize(type) / 2))
+        && profile.userId
+      ) {
+        totalAdded += await continueListFetchWithGraphql(
+          tabId,
+          profile,
+          type,
+          seen,
+          fetchTarget,
+          totalList,
+          { restartFromTop: true, skipPostRecovery: true }
+        );
+      }
+    }
+  }
+
   return totalAdded;
 }
 
@@ -4443,12 +5354,14 @@ async function runObserveListFetch(tabId, profile, type = listType) {
   const listUrl = `https://x.com/${resolvedUsername}/${cfg.path}`;
   await ensureSnifferInstalled(tabId);
 
+  throwIfCancelled();
   await chrome.tabs.update(tabId, {
     url: listUrl,
     active: true
   });
   const listNavSettleMs = type === 'followers' ? XC_FOLLOWERS_NAV_SETTLE_MS : XC_LIST_NAV_SETTLE_MS;
   await waitAfterTabNavigation(tabId, listNavSettleMs);
+  throwIfCancelled();
   await ensureSnifferInstalled(tabId);
 
   const listPageTotal = await scrapeListPageTotal(tabId, type);
@@ -4507,26 +5420,30 @@ async function runObserveListFetch(tabId, profile, type = listType) {
   const seen = buildSeenFromCurList(type, resolvedUsername);
   let lastSeq = 0;
   let stalePasses = 0;
+  let zeroParsePasses = 0;
   let passes = 0;
   let batchesWithAdds = 0;
   let tailRecoveryAttempts = 0;
   const fetchTarget = effectiveFetchTarget(effectiveTotal);
 
+  await ensureProfileUserId(tabId, profile);
+
   try {
     await startListObserverFromTab(tabId, resolvedUsername);
   } catch (error) {}
 
-  while (!activeFetch?.cancelled) {
+  while (!isJobCancelled()) {
     const remaining = remainingListCount(type, effectiveTotal, fetchTarget);
     const listenMs = observeListenTimeoutMs(type, passes, remaining);
     let added = 0;
     let parsedLastBatch = 0;
 
     const native = await waitForNativeList(tabId, cfg.opName, lastSeq, listenMs);
-    if (native?.users?.length) {
-      parsedLastBatch += native.users.length;
-      const nativeAdded = addNativeUsers(native, seen, resolvedUsername, type);
-      added += nativeAdded;
+    if (native) {
+      parsedLastBatch += native.rawCount != null ? native.rawCount : (native.users || []).length;
+      if (native.users?.length) {
+        added += addNativeUsers(native, seen, resolvedUsername, type);
+      }
       if (native.seq) lastSeq = Math.max(lastSeq, native.seq);
     }
 
@@ -4561,9 +5478,12 @@ async function runObserveListFetch(tabId, profile, type = listType) {
     passes += 1;
     if (added > 0) {
       stalePasses = 0;
+      zeroParsePasses = 0;
       batchesWithAdds += 1;
     } else {
       stalePasses += 1;
+      if (parsedLastBatch === 0) zeroParsePasses += 1;
+      else zeroParsePasses = 0;
     }
 
     const targetLabel = fetchTarget != null ? fetchTarget.toLocaleString() : '—';
@@ -4572,6 +5492,17 @@ async function runObserveListFetch(tabId, profile, type = listType) {
       : '';
     const atTail = nativeLikelyAtTail(type, curList(type).length, effectiveTotal);
     const tailNote = atTail ? ' [tail]' : '';
+    let stuckNote = '';
+    if (zeroParsePasses >= 3 && curList(type).length === 0) {
+      try {
+        const diag = await readObserveDiagnosticsFromTab(tabId, cfg.opName);
+        if (diag) {
+          stuckNote = ` — diag sniffer v${diag.snifferVersion || 0}, gql:${diag.capturedGql ? 'yes' : 'no'}, q:${diag.queueLen || 0}, raw:${diag.latestRaw || 0}, kept:${diag.latestKept || 0}, cells:${diag.userCells || 0}, root:${diag.listRoot ? 'yes' : 'no'}`;
+        }
+      } catch (error) {
+        stuckNote = ' — hard-refresh x.com & open Following tab';
+      }
+    }
     notifyProgress({
       reason: 'collecting',
       method: 'observe',
@@ -4580,7 +5511,7 @@ async function runObserveListFetch(tabId, profile, type = listType) {
       parsedLastPage: parsedLastBatch,
       addedLastPage: added,
       fetchTarget,
-      status: `Observe ${curList(type).length.toLocaleString()} / ${targetLabel}${capNote} ${cfg.label.toLowerCase()} (+${added}, parsed ${parsedLastBatch}${tailNote})`
+      status: `Observe ${curList(type).length.toLocaleString()} / ${targetLabel}${capNote} ${cfg.label.toLowerCase()} (+${added}, parsed ${parsedLastBatch}${tailNote}${stuckNote})`
     });
 
     if (subscriptionInfo.fetchLimit != null && curList(type).length >= subscriptionInfo.fetchLimit) break;
@@ -4596,17 +5527,26 @@ async function runObserveListFetch(tabId, profile, type = listType) {
     const gap = effectiveTotal != null ? effectiveTotal - collected : null;
     const staleLimit = nativeStalePassLimit(type, effectiveTotal, collected);
     const stillShort = listFetchNeedsMore(type, effectiveTotal);
+    const followersGentleGap = type === 'followers' ? gentleFollowersRecoveryCap(effectiveTotal) : 25;
     if (atTail && stalePasses >= 3 && !stillShort) break;
-    if (atTail && stillShort && gap != null && gap <= 25 && stalePasses >= 20) break;
+    if (atTail && stillShort && gap != null && gap <= followersGentleGap && stalePasses >= 25) break;
     if (collected > 0 && stalePasses >= staleLimit && !stillShort) break;
-    if (collected > 0 && stillShort && gap != null && gap <= 25 && stalePasses >= 25) break;
-    if (passes > 1500) break;
+    if (collected > 0 && stillShort && gap != null && gap <= followersGentleGap && stalePasses >= 30) break;
+    if (passes > 2000) break;
+
+    if (await observeTryGraphqlHandoff(tabId, profile, type, seen, fetchTarget, effectiveTotal, passes)) {
+      break;
+    }
+
+    if (isJobCancelled() || !jobState.isScraping) break;
 
     const onListPage = await tabIsOnListPage(tabId, resolvedUsername, cfg.path);
     if (!onListPage) {
+      if (isJobCancelled() || !jobState.isScraping) break;
       await chrome.tabs.update(tabId, { url: listUrl });
       await waitForTabComplete(tabId);
-      await sleep(1200);
+      await sleep(1200, { cancellable: true });
+      if (isJobCancelled()) break;
       try {
         await startListObserverFromTab(tabId, resolvedUsername);
       } catch (error) {}
@@ -4616,9 +5556,9 @@ async function runObserveListFetch(tabId, profile, type = listType) {
     if (
       stillShort &&
       gap != null &&
-      gap <= 15 &&
+      gap <= (type === 'followers' ? Math.min(50, gentleFollowersRecoveryCap(effectiveTotal)) : 15) &&
       stalePasses >= 4 &&
-      tailRecoveryAttempts < 2
+      tailRecoveryAttempts < 3
     ) {
       tailRecoveryAttempts += 1;
       const recovered = await observeRecoverShortfall(tabId, profile, type, seen, effectiveTotal);
@@ -4628,7 +5568,8 @@ async function runObserveListFetch(tabId, profile, type = listType) {
       }
     }
 
-    if (stillShort && gap != null && gap <= 25 && (stalePasses >= 2 || passes % 4 === 0)) {
+    const nudgeGap = type === 'followers' ? Math.min(60, gentleFollowersRecoveryCap(effectiveTotal)) : 25;
+    if (stillShort && gap != null && gap <= nudgeGap && (stalePasses >= 2 || passes % 4 === 0)) {
       appendDebugStatusLog({
         reason: 'scroll-step',
         method: 'observe',
@@ -4638,11 +5579,12 @@ async function runObserveListFetch(tabId, profile, type = listType) {
     } else {
       await scrollListStep(tabId);
     }
-    await sleep(await sleepAfterScrollStep(type, 'native-loop'));
+    await sleep(observeLoopPaceMs(type, added), { cancellable: true });
+    if (isJobCancelled()) break;
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, effectiveTotal)) {
-    await observeRecoverShortfall(tabId, profile, type, seen, effectiveTotal);
+  if (!isJobCancelled() && listFetchNeedsMore(type, effectiveTotal)) {
+    await observeFinishShortfall(tabId, profile, type, seen, effectiveTotal);
   }
 
   try {
@@ -4653,7 +5595,7 @@ async function runObserveListFetch(tabId, profile, type = listType) {
   jobState.isScraping = false;
   jobState.method = 'observe';
   jobState.count = curList(type).length;
-  if (activeFetch?.cancelled) {
+  if (isJobCancelled()) {
     jobState.reason = 'stopped';
     if (!String(jobState.status || '').toLowerCase().includes('stopped')) {
       jobState.status = 'Stopped.';
@@ -4662,9 +5604,15 @@ async function runObserveListFetch(tabId, profile, type = listType) {
   } else {
     jobState.reason = curList(type).length > 0 ? 'complete' : 'observe-empty';
     const shortBy = effectiveTotal != null ? Math.max(0, effectiveTotal - curList(type).length) : 0;
+    const isSmallGap = shortBy > 0 && (
+      shortBy <= 20 ||
+      (effectiveTotal > 0 && shortBy / effectiveTotal < 0.08)
+    );
     jobState.status = curList(type).length > 0
       ? shortBy > 0
-        ? `Observe complete — ${curList(type).length.toLocaleString()} / ${effectiveTotal.toLocaleString()} ${cfg.label.toLowerCase()} (short by ${shortBy}; profile count may include hidden/deactivated accounts)`
+        ? isSmallGap
+          ? `Observe complete — ${curList(type).length.toLocaleString()} ${cfg.label.toLowerCase()} (X profile reported ${effectiveTotal.toLocaleString()}; ${shortBy} may be deactivated/hidden)`
+          : `Observe complete — ${curList(type).length.toLocaleString()} / ${effectiveTotal.toLocaleString()} ${cfg.label.toLowerCase()} (short by ${shortBy}; profile count may include hidden/deactivated accounts)`
         : `Observe complete — ${curList(type).length.toLocaleString()} ${cfg.label.toLowerCase()}`
       : 'Observe returned 0 — scroll the list manually, then retry';
   }
@@ -4891,14 +5839,14 @@ async function runNativeListFetch(tabId, profile, type = listType) {
       reason: 'collecting'
     });
     await fetchListTailGap(tabId, profile, type, seen, totalList, lastSeq);
-    if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList)) {
+    if (!isJobCancelled() && listFetchNeedsMore(type, totalList)) {
       await recoverShortfallChain(tabId, profile, type, seen, totalList, { skipWarmup: true });
     }
     if (curList(type).length > 0) {
       trimListToFetchLimit(type);
       snapshotListRaw(type);
       jobState.isScraping = false;
-      jobState.reason = activeFetch?.cancelled ? 'stopped' : 'complete';
+      jobState.reason = isJobCancelled() ? 'stopped' : 'complete';
       jobState.count = curList(type).length;
       const shortBy = totalList != null ? Math.max(0, totalList - curList(type).length) : 0;
       jobState.status = shortBy > 0
@@ -4910,7 +5858,7 @@ async function runNativeListFetch(tabId, profile, type = listType) {
     }
   }
 
-  while (!activeFetch?.cancelled) {
+  while (!isJobCancelled()) {
     const remaining = remainingListCount(type, totalList, fetchTarget);
     const listenMs = nativeListenTimeoutMs(type, passes, remaining);
     const native = await waitForNativeList(
@@ -5016,20 +5964,20 @@ async function runNativeListFetch(tabId, profile, type = listType) {
     await sleep(await sleepAfterScrollStep(type, 'native-loop'));
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList) && profile.userId) {
+  if (!isJobCancelled() && listFetchNeedsMore(type, totalList) && profile.userId) {
     await continueListFetchWithGraphql(tabId, profile, type, seen, fetchTarget, totalList);
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList)) {
+  if (!isJobCancelled() && listFetchNeedsMore(type, totalList)) {
     await fetchListTailGap(tabId, profile, type, seen, totalList, lastSeq);
   }
 
-  if (!activeFetch?.cancelled && listFetchNeedsMore(type, totalList) && profile.userId) {
+  if (!isJobCancelled() && listFetchNeedsMore(type, totalList) && profile.userId) {
     await recoverShortfallViaWorkerGraphql(tabId, profile, type, seen, totalList);
   }
 
   if (curList().length === 0) {
-    if (activeFetch?.cancelled) {
+    if (isJobCancelled()) {
       jobState.isScraping = false;
       jobState.reason = 'stopped';
       notifyProgress({ status: 'Stopped.' });
@@ -5043,7 +5991,7 @@ async function runNativeListFetch(tabId, profile, type = listType) {
   trimListToFetchLimit(type);
   snapshotListRaw(type);
 
-  const reason = activeFetch?.cancelled ? 'stopped' : 'complete';
+  const reason = isJobCancelled() ? 'stopped' : 'complete';
   jobState.isScraping = false;
   jobState.reason = reason;
   restoredTypes[type] = false;
@@ -5063,7 +6011,7 @@ async function runNativeListFetch(tabId, profile, type = listType) {
     finalCount >= fetchTarget &&
     (totalList == null || fetchTarget < totalList)
   ) {
-    doneStatus = `Free tier limit reached (${XC_FREE_FETCH_LIMIT}). Subscribe @d2fl to export full lists.`;
+    doneStatus = `Free tier limit reached (${XC_FREE_FETCH_LIMIT}). Resets every 24 hours — export up to ${XC_FREE_FETCH_LIMIT} records anytime.`;
   }
 
   notifyProgress({
@@ -5073,6 +6021,21 @@ async function runNativeListFetch(tabId, profile, type = listType) {
   });
   persistDebugStatusLog();
   schedulePersist(true, type);
+}
+
+function buildFilterClientResponse(extra = {}) {
+  const payload = {
+    ok: extra.ok !== false,
+    ...buildHudState(),
+    ...extra
+  };
+  if (extra.error) {
+    payload.ok = false;
+    payload.error = extra.error;
+    payload.status = extra.error;
+    payload.reason = payload.reason || 'error';
+  }
+  return normalizeClientState(payload);
 }
 
 function finishEmptyFilter(type = listType) {
@@ -5090,16 +6053,157 @@ function finishEmptyFilter(type = listType) {
     reason: 'filtered',
     isScraping: false,
     isEnriching: false,
-    status: `All accounts removed by filters (${curRaw(type).length.toLocaleString()} still in raw — switch list or clear filters to restore).`
+    status: `Filtered: 0 remaining after filters (0 / ${curRaw(type).length.toLocaleString()} qualified as inactive / unfollow candidates). Original data is preserved in the raw snapshot — use "clear filters" or switch list to restore the full list.`
   });
   schedulePersist(true, type);
-  return normalizeClientState({
-    ok: true,
-    ...jobState,
+  return buildFilterClientResponse({
     count: 0,
     rawCount: curRaw(type).length,
     removed: jobState.filterRemoved
   });
+}
+
+async function applyInactiveLastPostFilter(working, type, inactiveMonths, jobTabId) {
+  const inactiveLabel = listCfg(type).label.toLowerCase();
+  const candidateLabel = 'unfollow candidates'; // last post filter is following-only
+  const activityCache = await loadActivityCache();
+  const now = Date.now();
+  syncWorkingFromRaw(working, type);
+
+  const parts = partitionInactiveFilterCandidates(working, inactiveMonths, activityCache, now, type);
+  // Note: inactiveMonths comes from UI input (not hardcoded 6); passed to both last-post cutoff and age pre-qual (tooYoung).
+  const inactiveByKey = new Map();
+  const rememberInactive = (user) => {
+    const key = (user.username || '').toLowerCase();
+    if (!key || inactiveByKey.has(key)) return;
+    inactiveByKey.set(key, user);
+  };
+
+  for (const user of parts.resolvedInactive) rememberInactive(user);
+
+  const agePhaseStatus = parts.needsLookup.length > 0
+    ? `Last post (${inactiveMonths} mo): ${parts.resolvedInactive.length.toLocaleString()} ${candidateLabel} by account age — checking last tweet for ${parts.needsLookup.length.toLocaleString()} more...`
+    : `Last post (${inactiveMonths} mo): ${parts.resolvedInactive.length.toLocaleString()} ${candidateLabel} by account age — no last-tweet lookups needed`;
+
+  setCurList(Array.from(inactiveByKey.values()), type);
+  jobState.filterPhase = 'inactive-age';
+  notifyProgress({
+    reason: 'filtering',
+    filterPhase: 'inactive-age',
+    isEnriching: false,
+    enrichProcessed: parts.resolvedInactive.length,
+    enrichTotal: parts.resolvedInactive.length + parts.needsLookup.length,
+    status: agePhaseStatus
+  });
+
+  let enrichCancelled = false;
+  if (parts.needsLookup.length > 0) {
+    activeEnrich = { running: true, cancelled: false };
+    jobState.isEnriching = true;
+    jobState.reason = 'enriching';
+    jobState.filterPhase = 'inactive';
+    jobState.enrichTotal = parts.needsLookup.length;
+    jobState.enrichProcessed = 0;
+
+    try {
+      const enriched = await enrichLastActiveForUsers(jobTabId, parts.needsLookup, type, {
+        batchSize: INACTIVE_LOOKUP_BATCH_SIZE,
+        batchDelayMs: INACTIVE_LOOKUP_DELAY_MS,
+        onProgress: (progress) => {
+          const status = progress.waiting
+            ? `Last post (${inactiveMonths} mo): ${inactiveByKey.size.toLocaleString()} by account age — pausing… last-tweet ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`
+            : `Last post (${inactiveMonths} mo): ${inactiveByKey.size.toLocaleString()} by account age — last-tweet ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`;
+          notifyProgress({
+            reason: 'enriching',
+            isEnriching: true,
+            enrichProcessed: progress.processed,
+            enrichTotal: progress.total,
+            status
+          });
+        }
+      });
+
+      for (const user of enriched) {
+        if (classifyInactiveAfterLookup(user, parts.cutoffMs)) {
+          rememberInactive(user);
+        }
+      }
+
+      // Sync last_active dates for ALL freshly looked-up accounts back to the main list (raw + live)
+      // so that enrichment results are stored for the full list (and visible/exported), not just the filtered inactive ones.
+      for (const user of enriched) {
+        if (user.last_active_ms !== undefined) {
+          const rawRow = findRawUserByHandle(type, user.username);
+          if (rawRow && (rawRow.last_active_ms == null || rawRow.last_active_ms === undefined)) {
+            rawRow.last_active_ms = user.last_active_ms;
+          }
+          const live = findListUserByHandle(type, user.username);
+          if (live && (live.last_active_ms == null || live.last_active_ms === undefined)) {
+            live.last_active_ms = user.last_active_ms;
+          }
+        }
+      }
+
+      // Transfer newly hydrated last_active_ms for any mutuals also to the followers list
+      // (so hydration picked up for mutuals during last-post filter transfers to followers set as well)
+      try {
+        const followersUsers = usersForMutuals('followers');
+        const fMap = new Map(followersUsers.map(u => [(u.username || '').toLowerCase(), u]));
+        for (const user of enriched) {
+          if (user.last_active_ms != null) {
+            const k = (user.username || '').toLowerCase();
+            const fUser = fMap.get(k);
+            if (fUser && fUser.last_active_ms == null) {
+              fUser.last_active_ms = user.last_active_ms;
+              const fLive = findListUserByHandle('followers', k);
+              if (fLive && fLive.last_active_ms == null) fLive.last_active_ms = user.last_active_ms;
+              const fRaw = findRawUserByHandle('followers', k);
+              if (fRaw && fRaw.last_active_ms == null) fRaw.last_active_ms = user.last_active_ms;
+            }
+          }
+        }
+      } catch (e) {}
+
+      enrichCancelled = !!activeEnrich?.cancelled;
+    } finally {
+      activeEnrich = null;
+      jobState.isEnriching = false;
+    }
+  }
+
+  if (enrichCancelled) {
+    syncLastActiveIntoRaw(Array.from(inactiveByKey.values()), type);
+    setCurList(Array.from(inactiveByKey.values()), type);
+    schedulePersist(true, type);
+    return { cancelled: true };
+  }
+
+  const finalInactive = Array.from(inactiveByKey.values());
+  syncLastActiveIntoRaw(finalInactive, type);
+  setCurList(finalInactive, type);
+  schedulePersist(true, type);
+
+  const removedYoung = parts.tooYoung.length;
+  const removedActive = parts.resolvedActive.length;
+  const lookupUnresolved = parts.needsLookup.filter(
+    (user) => !inactiveByKey.has((user.username || '').toLowerCase())
+  ).length;
+
+  const summaryParts = [];
+  if (removedYoung > 0) summaryParts.push(`too new (${removedYoung.toLocaleString()})`);
+  if (removedActive > 0) summaryParts.push(`active (${removedActive.toLocaleString()})`);
+  if (lookupUnresolved > 0) summaryParts.push(`no tweet date (${lookupUnresolved.toLocaleString()})`);
+
+  return {
+    cancelled: false,
+    working: finalInactive,
+    removedYoung,
+    removedActive,
+    lookupUnresolved,
+    summaryParts,
+    inactiveLabel,
+    candidateLabel
+  };
 }
 
 async function filterList(options = {}) {
@@ -5112,17 +6216,26 @@ async function filterList(options = {}) {
   const type = listType;
   const source = curRaw(type).length ? curRaw(type) : curList(type);
   if (!source.length) {
-    return { ok: false, error: `No ${listCfg(type).label.toLowerCase()} collected yet.` };
+    return buildFilterClientResponse({
+      ok: false,
+      error: `No ${listCfg(type).label.toLowerCase()} collected yet.`
+    });
   }
 
   if (isListTypeSwitchLocked()) {
-    return { ok: false, error: 'Wait until collection finishes before filtering.' };
+    return buildFilterClientResponse({
+      ok: false,
+      error: 'Wait until collection finishes before filtering.'
+    });
   }
 
   jobState.isScraping = false;
 
   if (activeEnrich?.running) {
-    return { ok: false, error: 'Activity lookup already running.' };
+    return buildFilterClientResponse({
+      ok: false,
+      error: 'Activity lookup already running.'
+    });
   }
 
   if (!curRaw(type).length) {
@@ -5153,10 +6266,17 @@ async function filterList(options = {}) {
 
   try {
   const removeBlue = !!options.removeBlue;
-  const removeInactive = !!options.removeInactive;
+  let removeInactive = !!options.removeInactive;
   const removeMutuals = !!options.removeMutuals;
   const botCheck = !!options.botCheck;
   const inactiveMonths = normalizeInactiveMonths(options.inactiveMonths);
+
+  if (removeInactive && type !== 'following') {
+    notifyProgress({
+      status: 'Last post filter applies to Following only — skipped on Followers.'
+    });
+    removeInactive = false;
+  }
 
   if (!removeBlue && !removeInactive && !removeMutuals && !botCheck) {
     setCurList(curRaw(type).slice(), type);
@@ -5166,13 +6286,9 @@ async function filterList(options = {}) {
     jobState.filterPhase = null;
     notifyProgress({ status: `${curList(type).length.toLocaleString()} accounts ready (filters cleared).` });
     schedulePersist(true, type);
-    return attachHudReady({
-      ok: true,
-      ...jobState,
-      count: curList(type).length,
-      rawCount: curRaw(type).length,
+    return attachHudReady(buildFilterClientResponse({
       removed: 0
-    }, filterHudReady);
+    }), filterHudReady);
   }
 
   let working = curRaw(type).slice();
@@ -5191,10 +6307,10 @@ async function filterList(options = {}) {
     const otherCfg = listCfg(ctx.otherType);
 
     if (!mutualDetectionAvailable(type, ctx)) {
-      return {
+      return buildFilterClientResponse({
         ok: false,
         error: `Remove mutuals needs ${otherCfg.label} collected (or relationship flags on this list). Fetch ${otherCfg.label.toLowerCase()} first.`
-      };
+      });
     }
 
     const refresh = refreshMutualFlagsFromOtherList(type);
@@ -5259,95 +6375,38 @@ async function filterList(options = {}) {
 
   if (removeInactive) {
     throwIfCancelled();
+    await ensureRestored();
+    refreshMutualFlagsFromOtherList(type); // transfer any last_active hydration for mutuals across lists
     if (!(await ensureJobTabId())) {
-      return { ok: false, error: 'No X tab available for activity lookup.' };
-    }
-
-    const inactiveLabel = listCfg(type).label.toLowerCase();
-    syncWorkingFromRaw(working, type);
-    const activityCache = await loadActivityCache();
-    const now = Date.now();
-    for (const user of working) {
-      hydrateLastActiveFromStoredSources(user, type, activityCache, now);
-    }
-    const lookupNeeded = countLastActiveLookupNeeded(working, activityCache, now, type);
-
-    if (lookupNeeded > 0) {
-      setCurList(working, type);
-      activeEnrich = { running: true, cancelled: false };
-      jobState.isEnriching = true;
-      jobState.reason = 'enriching';
-      jobState.filterPhase = 'inactive';
-      jobState.enrichTotal = lookupNeeded;
-      jobState.enrichProcessed = 0;
-      notifyProgress({
-        reason: 'enriching',
-        isEnriching: true,
-        enrichProcessed: 0,
-        enrichTotal: lookupNeeded,
-        status: `REST lookup: last tweet for ${lookupNeeded.toLocaleString()} ${inactiveLabel} (${inactiveMonths} mo threshold)...`
-      });
-    } else {
-      notifyProgress({
-        reason: 'filtering',
-        filterPhase: 'inactive',
-        status: `Last post (${inactiveMonths} mo): using saved tweet dates — no new lookups`
+      return buildFilterClientResponse({
+        ok: false,
+        error: 'No X tab available for activity lookup.'
       });
     }
 
-    let enrichCancelled = false;
-    try {
-      working = await enrichLastActiveForUsers(jobTabId, working, type, (progress) => {
-        if (progress.fromCache) return;
-        const status = progress.waiting
-          ? `Waiting… checked ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}`
-          : `REST last-tweet lookup ${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()}...`;
-        notifyProgress({
-          reason: 'enriching',
-          isEnriching: true,
-          enrichProcessed: progress.processed,
-          enrichTotal: progress.total,
-          status
-        });
-      });
-      enrichCancelled = !!activeEnrich?.cancelled;
-    } finally {
-      activeEnrich = null;
-      jobState.isEnriching = false;
-    }
-
-    if (enrichCancelled) {
-      syncLastActiveIntoRaw(working, type);
-      setCurList(working, type);
-      schedulePersist(true, type);
+    const inactiveResult = await applyInactiveLastPostFilter(
+      working,
+      type,
+      inactiveMonths,
+      jobTabId
+    );
+    if (inactiveResult.cancelled) {
       return await finishStoppedJob();
     }
 
-    syncLastActiveIntoRaw(working, type);
-    schedulePersist(true, type);
-
-    const beforeInactive = working.length;
-    const datedCount = working.filter((user) => user.last_active_ms != null).length;
-    // Keep inactive accounts only — export list = accounts with no recent posts.
-    working = working.filter((user) => isInactiveAccount(user.last_active_ms, inactiveMonths));
-    setCurList(working, type);
-    const activeRemoved = beforeInactive - working.length;
-    if (activeRemoved > 0) {
-      parts.push(`active (${activeRemoved.toLocaleString()})`);
-    }
-    if (datedCount < beforeInactive) {
-      parts.push(`no date (${(beforeInactive - datedCount).toLocaleString()} skipped)`);
+    working = inactiveResult.working;
+    if (inactiveResult.summaryParts.length) {
+      parts.push(...inactiveResult.summaryParts);
     }
     jobState.filterRemoved = curRaw(type).length - working.length;
     jobState.filterPhase = 'inactive';
-    const candidateLabel = type === 'following' ? 'unfollow candidates' : 'inactive accounts';
     notifyProgress({
       reason: 'filtering',
       filterPhase: 'inactive',
       isEnriching: false,
-      enrichProcessed: beforeInactive,
-      enrichTotal: beforeInactive,
-      status: `Last post (${inactiveMonths} mo): ${working.length.toLocaleString()} ${candidateLabel} (−${activeRemoved.toLocaleString()} active${datedCount < beforeInactive ? `, ${(beforeInactive - datedCount).toLocaleString()} without tweet date` : ''})`
+      enrichProcessed: working.length,
+      enrichTotal: working.length,
+      status: `Last post (${inactiveMonths} mo): ${working.length.toLocaleString()} ${inactiveResult.candidateLabel}${inactiveResult.summaryParts.length ? ` (−${inactiveResult.summaryParts.join(', ')})` : ''}`
     });
     if (!working.length) return finishEmptyFilter(type);
     appliedFilters.push('inactive');
@@ -5365,10 +6424,10 @@ async function filterList(options = {}) {
       const followingCfg = listCfg('following');
 
       if (!mutualDetectionAvailable('followers', mutualCtx)) {
-        return {
+        return buildFilterClientResponse({
           ok: false,
           error: 'Bot check needs you_follow on follower rows (included in a REST Followers fetch) or a Following list to cross-check. Re-fetch Followers if relationship flags are missing.'
-        };
+        });
       }
 
       const mutualRefresh = refreshMutualFlagsFromOtherList('followers');
@@ -5384,7 +6443,10 @@ async function filterList(options = {}) {
       let candidates = working.filter((user) => !isYouFollowingAccount(user, mutualCtx));
 
       if (!(await ensureJobTabId())) {
-        return { ok: false, error: 'No X tab available for bot-check profile enrichment.' };
+        return buildFilterClientResponse({
+          ok: false,
+          error: 'No X tab available for bot-check profile enrichment.'
+        });
       }
 
       const sparseCount = candidates.filter((user) => !hasReliableProfileForBotCheck(user)).length;
@@ -5480,17 +6542,13 @@ async function filterList(options = {}) {
   jobState.count = curList(type).length;
 
   notifyProgress({
-    status: `Filtered: ${curList(type).length.toLocaleString()} remaining (removed ${jobState.filterRemoved.toLocaleString()}${parts.length ? ` — ${parts.join(', ')}` : ''})`
+    status: `Filtered: ${curList(type).length.toLocaleString()} remaining after filters (removed ${jobState.filterRemoved.toLocaleString()} from the original ${curRaw(type).length.toLocaleString()} in raw${parts.length ? ` — ${parts.join(', ')}` : ''})`
   });
   schedulePersist(true, type);
 
-  return {
-    ok: true,
-    ...jobState,
-    count: curList(type).length,
-    rawCount: curRaw(type).length,
+  return buildFilterClientResponse({
     removed: jobState.filterRemoved
-  };
+  });
   } catch (error) {
     activeEnrich = null;
     jobState.isEnriching = false;
@@ -5789,7 +6847,7 @@ async function runGraphqlWorkerListFetch(tabId, profile, type = listType) {
   let activeOpName = opCandidates[0];
   let pages = 0;
 
-  for (let opIdx = 0; opIdx < opCandidates.length && !activeFetch?.cancelled; opIdx += 1) {
+  for (let opIdx = 0; opIdx < opCandidates.length && !isJobCancelled(); opIdx += 1) {
     activeOpName = opCandidates[opIdx];
     cursor = null;
     pages = 0;
@@ -5807,7 +6865,7 @@ async function runGraphqlWorkerListFetch(tabId, profile, type = listType) {
       });
     }
 
-    while (!activeFetch?.cancelled && pages < 500) {
+    while (!isJobCancelled() && pages < 500) {
       if (!listFetchNeedsMore(type, totalList)) break;
 
       const requestCount = graphqlRequestCount(type, totalList, curList(type).length);
@@ -6178,8 +7236,9 @@ async function runExportFlow(requestedType = listType, options = {}) {
   if (activeFetch?.running) {
     return { ok: false, error: 'Collection already running.' };
   }
-  if (activeFetch?.cancelled) {
+  if (activeFetch?.cancelled || jobCancelled) {
     activeFetch = null;
+    jobCancelled = false;
   }
 
   if (options.fastScroll != null) {
@@ -6296,9 +7355,32 @@ async function runExportFlowJob(tab, type, options, username) {
   const fetchMode = normalizeFetchMode(options.fetchMode || jobState.fetchMode || (await getFetchMode()));
 
   try {
+    jobCancelled = false;
     activeFetch = { running: true, cancelled: false };
 
-    const useObservePath = !fastScrollEnabled && fetchMode === 'auto';
+    let useObservePath = !fastScrollEnabled && fetchMode === 'auto';
+
+    // If the target list (or either) is <500 from profile, do the fastest possible for the *first* get.
+    // Gentle observe's first pass often only captures ~35 for followers. For small lists a full REST page is fine and stealthy.
+    if (useObservePath) {
+      try {
+        const u = username || await detectHandle(tab.id);
+        if (u) {
+          const prof = await resolveProfileViaRest(u, tab.id);
+          const followingT = prof?.totalFollowing || 0;
+          const followersT = prof?.totalFollowers || 0;
+          const thisT = (type === 'followers' ? followersT : followingT);
+          if ((followingT > 0 && followingT < 500) || (followersT > 0 && followersT < 500) || (thisT > 0 && thisT < 500)) {
+            useObservePath = false;
+            appendDebugStatusLog({
+              reason: 'start',
+              status: `Small list (<500) — forcing fastest initial fetch (full REST) for the first get`
+            });
+          }
+        }
+      } catch (e) {}
+    }
+
     appendDebugStatusLog({
       reason: 'start',
       fetchMode,
@@ -6593,7 +7675,30 @@ async function runExportFlowJob(tab, type, options, username) {
       ...debugStatusPayload()
     };
   } finally {
+    const hadRunningFetch = !!activeFetch?.running;
     activeFetch = null;
+    if (hadRunningFetch && !jobState.isScraping && jobTabId) {
+      const payload = normalizeClientState({
+        type: 'scrapeStatus',
+        ok: true,
+        ...jobState,
+        totalList: totalForType(),
+        fetchTarget: effectiveFetchTarget(totalForType()),
+        storedCounts: {
+          following: listStore.following.list.length,
+          followers: listStore.followers.list.length
+        },
+        listStats: buildListStats(),
+        mutuals: computeMutuals(),
+        ...subscriptionPayload(),
+        ...debugStatusPayload()
+      });
+      chrome.runtime.sendMessage(payload).catch(() => {});
+      sendHudMessage(jobTabId, {
+        action: 'updateHud',
+        ...buildHudState()
+      }).catch(() => {});
+    }
   }
 }
 
@@ -6613,6 +7718,7 @@ function jobLooksBusy() {
 }
 
 function cancelActiveWork() {
+  jobCancelled = true;
   if (activeFetch) {
     activeFetch.cancelled = true;
     activeFetch.running = false;
@@ -6628,7 +7734,7 @@ function cancelActiveWork() {
 }
 
 function isJobCancelled() {
-  return !!(activeFetch?.cancelled || activeEnrich?.cancelled);
+  return jobCancelled || !!(activeFetch?.cancelled || activeEnrich?.cancelled);
 }
 
 function throwIfCancelled() {
@@ -6725,48 +7831,154 @@ function buildExportFilterSuffix(type = listType) {
   return `_${filters.join('_')}`;
 }
 
-async function exportCSV() {
+function sanitizeExportFilenamePart(value) {
+  return String(value || '')
+    .replace(/[<>:"/\\|?*@]/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 80) || 'user';
+}
+
+function waitForDownloadComplete(downloadId, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      chrome.downloads.onChanged.removeListener(onChanged);
+      clearTimeout(timer);
+    };
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+
+    const onChanged = (delta) => {
+      if (delta.id !== downloadId) return;
+      if (delta.error?.current) {
+        finish(reject, new Error(delta.error.current));
+        return;
+      }
+      if (delta.state?.current === 'complete') {
+        chrome.downloads.search({ id: downloadId }, (items) => {
+          if (chrome.runtime.lastError) {
+            finish(resolve, { id: downloadId });
+            return;
+          }
+          finish(resolve, items?.[0] || { id: downloadId });
+        });
+        return;
+      }
+      if (delta.state?.current === 'interrupted') {
+        finish(reject, new Error('Download interrupted'));
+      }
+    };
+
+    chrome.downloads.onChanged.addListener(onChanged);
+    const timer = setTimeout(() => {
+      finish(reject, new Error('Download timed out'));
+    }, timeoutMs);
+
+    chrome.downloads.search({ id: downloadId }, (items) => {
+      if (chrome.runtime.lastError) return;
+      const item = items?.[0];
+      if (!item) return;
+      if (item.state === 'complete') {
+        finish(resolve, item);
+      } else if (item.state === 'interrupted') {
+        finish(reject, new Error(item.error || 'Download interrupted'));
+      }
+    });
+  });
+}
+
+async function downloadCsvFile(csvContent, filename) {
+  const blob = new Blob(['\ufeff', csvContent], { type: 'text/csv;charset=utf-8' });
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('Could not encode CSV for download.'));
+    reader.readAsDataURL(blob);
+  });
+
+  const downloadId = await chrome.downloads.download({
+    url: dataUrl,
+    filename,
+    saveAs: true
+  });
+
+  return waitForDownloadComplete(downloadId);
+}
+
+function rowsForExport(type = listType) {
+  const rows = curList(type).slice();
+  const cap = subscriptionInfo.fetchLimit;
+  if (cap == null) return { rows, capped: false, total: rows.length };
+  const limited = rows.slice(0, cap);
+  return {
+    rows: limited,
+    capped: limited.length < rows.length,
+    total: rows.length
+  };
+}
+
+async function exportCSV(options = {}) {
+  const requestedType = options.listType || listType;
+  if (LIST_CONFIG[requestedType]) {
+    listType = requestedType;
+    jobState.listType = requestedType;
+  }
+
   await ensureRestored();
+  if (!curList().length) {
+    await restoreListState(listType);
+  }
 
   if (!curList().length) {
     return { ok: false, error: `No ${listCfg().label.toLowerCase()} collected yet.` };
   }
 
+  await applyFreeTierWindow(jobState.username);
   await refreshSubscription(jobState.username);
-  if (!subscriptionInfo.canExport) {
-    return {
-      ok: false,
-      error: `Export requires a @d2fl subscription. Subscribe at ${XC_PRO_CHECKOUT_URL}`,
-      ...subscriptionPayload()
-    };
+
+  const exportRows = rowsForExport(listType);
+  if (!exportRows.rows.length) {
+    return { ok: false, error: `No ${listCfg().label.toLowerCase()} collected yet.` };
   }
 
-  if (!(await ensureJobTabId())) {
-    return { ok: false, error: 'No X tab available for download.' };
-  }
-
-  const owner = jobState.username || 'user';
+  const owner = sanitizeExportFilenamePart(jobState.username);
   const cfg = listCfg();
   const date = new Date().toISOString().slice(0, 10);
   const filterSuffix = buildExportFilterSuffix();
   const filename = `x_${cfg.path}_${owner}_${date}${filterSuffix}.csv`;
-  const csvContent = buildCsv(curList());
+  const csvContent = buildCsv(exportRows.rows);
 
-  await executeOnTab(jobTabId, injectedXCleanerApiCall, [{
-    action: 'downloadCsv',
-    csvContent,
-    filename
-  }]);
+  let downloadItem = null;
+  try {
+    downloadItem = await downloadCsvFile(csvContent, filename);
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(error?.message || error || 'CSV download failed.')
+    };
+  }
 
+  const exportedCount = exportRows.rows.length;
+  const capNote = exportRows.capped
+    ? ` (free tier: first ${exportedCount.toLocaleString()} of ${exportRows.total.toLocaleString()})`
+    : '';
+  const savedPath = downloadItem?.filename || filename;
   jobState.reason = 'exported';
-  notifyProgress();
+  jobState.count = curList().length;
+  jobState.status = `Exported ${exportedCount.toLocaleString()} accounts to ${savedPath}${capNote}`;
+  notifyProgress({ status: jobState.status, reason: 'exported' });
   return {
     ok: true,
-    ...jobState,
-    count: curList().length,
+    ...normalizeClientState(getStatus()),
     exported: true,
-    filename,
-    isFiltered: isExportFiltered()
+    exportedCount,
+    filename: savedPath,
+    isFiltered: isExportFiltered(),
+    status: jobState.status
   };
 }
 
@@ -6777,7 +7989,9 @@ async function getStatusAsync() {
   await ensureRestored();
   await restoreDebugStatusLogFromStorage();
   if (jobState.username) {
-    await hydrateSubscriptionFromStorage(jobState.username);
+    await applyFreeTierWindow(jobState.username);
+  } else {
+    await hydrateSubscriptionFromStorage(null);
   }
   const fetchMode = await getFetchMode();
   await loadFastScrollPref();
@@ -6905,6 +8119,15 @@ chrome.runtime.onStartup.addListener(() => {
   bootstrapSubscription().catch(() => {});
 });
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (jobTabId === tabId) {
+    cancelActiveWork();
+    activeFetch = null;
+    activeEnrich = null;
+    jobTabId = null;
+  }
+});
+
 configureActionPopupForDebugLog();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -6913,7 +8136,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   (async () => {
-    if (message.action === 'syncFromFocusedTab') {
+    try {
+      if (message.action === 'syncFromFocusedTab') {
       await syncActiveAccountFromTab({
         tabId: message.tabId,
         username: message.username || null,
@@ -6943,7 +8167,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse(await dismissHud());
         break;
       case 'exportCSV':
-        sendResponse(await exportCSV());
+        sendResponse(await exportCSV({ listType: message.listType }));
         break;
       case 'getListPreview':
         sendResponse(await getListPreview(message.listType));
@@ -7034,8 +8258,37 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         break;
       case 'getStatus':
       case 'getJobState':
+        if (message.handoffAfterHud) {
+          const handoff = await ensurePopupHudHandoff(message);
+          if (!handoff.ok) {
+            sendResponse({
+              ...handoff,
+              ...(await getStatusAsync())
+            });
+            break;
+          }
+        }
+        reconcileIdleJobState();
+        if (
+          message.syncFromTab !== false
+          && !jobState.isScraping
+          && !activeFetch?.running
+        ) {
+          await syncActiveAccountFromTab({
+            tabId: message.tabId,
+            username: message.username || null,
+            refreshSub: message.refreshSub !== false,
+            forceSubRefresh: !!message.force
+          });
+        }
         await restoreDebugStatusLogFromStorage();
-        sendResponse(await getStatusAsync());
+        const statusPayload = await getStatusAsync();
+        if (message.handoffAfterHud) {
+          notifyProgress();
+          sendResponse({ ...statusPayload, hudReady: true });
+        } else {
+          sendResponse(statusPayload);
+        }
         break;
       case 'openSubscribe':
         chrome.tabs.create({
@@ -7046,6 +8299,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         break;
       default:
         sendResponse({ ok: false, error: 'Unknown action.' });
+    }
+    } catch (err) {
+      try {
+        sendResponse({ ok: false, error: String(err && err.message || err) });
+      } catch (e) {}
     }
   })();
 

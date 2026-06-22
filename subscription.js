@@ -7,6 +7,8 @@ const XC_PRO_OWNER_HANDLES = new Set(['alt_d2fl', 'd2fl', 'd2fl_alt']);
 const XC_FREE_FETCH_LIMIT = 200;
 const XC_SUB_STATE_KEY = 'xfr_fetch_subscription_state';
 const XC_SUB_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const XC_FREE_TIER_WINDOW_MS = XC_SUB_CACHE_TTL_MS;
+const XC_FREE_TIER_WINDOW_KEY = 'xc_free_tier_window';
 
 function xcNormalizeHandle(handle) {
   return (handle || '').trim().replace(/^@+/, '').toLowerCase();
@@ -38,8 +40,8 @@ function xcGetFetchLimit(isSubscribed) {
   return isSubscribed ? null : XC_FREE_FETCH_LIMIT;
 }
 
-function xcCanExport(isSubscribed) {
-  return !!isSubscribed;
+function xcCanExport(_isSubscribed) {
+  return true;
 }
 
 function xcBuildSubscriptionInfo(handle, isSubscribed, source = null, extra = {}) {
@@ -48,11 +50,41 @@ function xcBuildSubscriptionInfo(handle, isSubscribed, source = null, extra = {}
     isSubscribed: !!isSubscribed,
     subscriptionSource: source,
     fetchLimit,
-    canExport: xcCanExport(isSubscribed),
+    canExport: true,
     freeFetchLimit: XC_FREE_FETCH_LIMIT,
+    freeTierWindowMs: XC_FREE_TIER_WINDOW_MS,
     checkoutUrl: XC_PRO_CHECKOUT_URL,
     requiredCreator: XC_REQUIRED_CREATOR,
     ...extra
+  };
+}
+
+async function xcEnsureFreeTierWindow(handle) {
+  const normalized = xcNormalizeHandle(handle);
+  if (!normalized) {
+    return { reset: false, windowStart: null, resetsAt: null };
+  }
+
+  const res = await chrome.storage.local.get(XC_FREE_TIER_WINDOW_KEY);
+  const windows = res[XC_FREE_TIER_WINDOW_KEY] || {};
+  const entry = windows[normalized];
+  const now = Date.now();
+
+  if (entry?.windowStart && now - entry.windowStart < XC_FREE_TIER_WINDOW_MS) {
+    return {
+      reset: false,
+      windowStart: entry.windowStart,
+      resetsAt: entry.windowStart + XC_FREE_TIER_WINDOW_MS
+    };
+  }
+
+  const reset = !!(entry?.windowStart);
+  windows[normalized] = { windowStart: now };
+  await chrome.storage.local.set({ [XC_FREE_TIER_WINDOW_KEY]: windows });
+  return {
+    reset,
+    windowStart: now,
+    resetsAt: now + XC_FREE_TIER_WINDOW_MS
   };
 }
 
@@ -275,5 +307,8 @@ function xcFormatSubscriptionStatus(info, handle) {
     }
     return `Subscribed — unlimited fetch & export (${label})`;
   }
-  return `Free — fetch up to ${XC_FREE_FETCH_LIMIT} • export requires @${XC_REQUIRED_CREATOR} (${label})`;
+  const resetsNote = info.freeTierResetsAt
+    ? ` • resets ${new Date(info.freeTierResetsAt).toLocaleString()}`
+    : ' • resets every 24h';
+  return `Free — up to ${XC_FREE_FETCH_LIMIT} records per 24h (fetch & export)${resetsNote} (${label})`;
 }

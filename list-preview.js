@@ -1,4 +1,4 @@
-// list-preview.js — spreadsheet-style preview of first 5 records (popup + HUD)
+// list-preview.js — spreadsheet-style preview of first N records (5 for free, 10 for non-free / subscribed users)
 
 if (!globalThis.__xcListPreviewReady) {
   globalThis.__xcListPreviewReady = true;
@@ -70,6 +70,25 @@ function xcFormatPreviewCell(value) {
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   const text = String(value).replace(/\s+/g, ' ').trim();
   return text.length > 120 ? `${text.slice(0, 117)}...` : text;
+}
+
+function xcNormalizePreviewHandle(value) {
+  const handle = String(value || '').replace(/^@+/, '').trim();
+  if (!handle || !/^[A-Za-z0-9_]{1,15}$/.test(handle)) return '';
+  return handle;
+}
+
+function xcPreviewProfileUrl(value) {
+  const handle = xcNormalizePreviewHandle(value);
+  return handle ? `https://x.com/${encodeURIComponent(handle)}` : '';
+}
+
+function xcFormatPreviewUsername(value) {
+  const handle = xcNormalizePreviewHandle(value);
+  if (!handle) return xcFormatPreviewCell(value);
+  const display = String(value || '').trim();
+  if (display.startsWith('@')) return xcFormatPreviewCell(display);
+  return `@${handle}`;
 }
 
 function xcInjectListPreviewStyles(doc) {
@@ -176,6 +195,14 @@ function xcInjectListPreviewStyles(doc) {
       font-style: italic;
       text-align: center;
     }
+    #${XC_LIST_PREVIEW_OVERLAY_ID} .xc-preview-profile-link {
+      color: #1d9bf0;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    #${XC_LIST_PREVIEW_OVERLAY_ID} .xc-preview-profile-link:hover {
+      text-decoration: underline;
+    }
   `;
   doc.head.appendChild(style);
 }
@@ -191,7 +218,8 @@ function xcShowListPreviewModal(doc, payload = {}) {
   xcCloseListPreviewModal(doc);
 
   const columns = Array.isArray(payload.columns) ? payload.columns : [];
-  const rows = Array.isArray(payload.rows) ? payload.rows.slice(0, XC_LIST_PREVIEW_MAX_ROWS) : [];
+  const maxRows = (payload.previewLimit != null ? payload.previewLimit : XC_LIST_PREVIEW_MAX_ROWS);
+  const rows = Array.isArray(payload.rows) ? payload.rows.slice(0, maxRows) : [];
   const listLabel = payload.listLabel || payload.listType || 'List';
   const total = payload.total != null ? payload.total : rows.length;
 
@@ -208,7 +236,7 @@ function xcShowListPreviewModal(doc, payload = {}) {
   header.className = 'xc-preview-header';
   const title = doc.createElement('div');
   title.className = 'xc-preview-title';
-  title.textContent = `${listLabel} — first ${XC_LIST_PREVIEW_MAX_ROWS} of ${total.toLocaleString()}`;
+  title.textContent = `${listLabel} — first ${maxRows} of ${total.toLocaleString()}`;
   const closeBtn = doc.createElement('button');
   closeBtn.type = 'button';
   closeBtn.className = 'xc-preview-close';
@@ -248,8 +276,26 @@ function xcShowListPreviewModal(doc, payload = {}) {
       for (const col of columns) {
         const td = doc.createElement('td');
         const key = col.key || col.label;
-        td.textContent = xcFormatPreviewCell(row?.[key]);
-        td.title = row?.[key] != null ? String(row[key]) : '';
+        const rawValue = row?.[key];
+        if (key === 'username') {
+          const profileUrl = xcPreviewProfileUrl(rawValue);
+          if (profileUrl) {
+            const link = doc.createElement('a');
+            link.className = 'xc-preview-profile-link';
+            link.href = profileUrl;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.textContent = xcFormatPreviewUsername(rawValue);
+            link.title = `Open @${xcNormalizePreviewHandle(rawValue)} on X to verify`;
+            td.appendChild(link);
+          } else {
+            td.textContent = xcFormatPreviewCell(rawValue);
+            td.title = rawValue != null ? String(rawValue) : '';
+          }
+        } else {
+          td.textContent = xcFormatPreviewCell(rawValue);
+          td.title = rawValue != null ? String(rawValue) : '';
+        }
         tr.appendChild(td);
       }
       tbody.appendChild(tr);
@@ -261,7 +307,7 @@ function xcShowListPreviewModal(doc, payload = {}) {
   const foot = doc.createElement('div');
   foot.className = 'xc-preview-foot';
   foot.textContent = rows.length
-    ? `Showing ${rows.length} row(s). Scroll horizontally for all columns.`
+    ? `Showing ${rows.length} row(s). Click a username to open that profile on X. Scroll horizontally for all columns.`
     : 'Collect or import a list, then open View again.';
 
   windowEl.appendChild(header);

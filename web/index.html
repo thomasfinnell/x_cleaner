@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="canonical" href="https://d2fl.com/cleaner/">
+  <title>X Cleaner — Download &amp; Install</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --text: #e7e9ea;
+      --muted: #71767b;
+      --bg: #000;
+      --card: #16181c;
+      --border: #2f3336;
+      --accent: #1d9bf0;
+      --accent-hover: #1a8cd8;
+      --success: #00ba7c;
+      --warn: #ffd400;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --text: #0f1419;
+        --muted: #536471;
+        --bg: #f7f9f9;
+        --card: #ffffff;
+        --border: #cfd9de;
+        --accent-hover: #0c7abf;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      font-size: 16px;
+    }
+    main {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 40px 20px 72px;
+    }
+    h1, h2, h3 { line-height: 1.25; }
+    h1 {
+      font-size: 2rem;
+      margin: 0 0 0.35rem;
+      letter-spacing: -0.02em;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin-bottom: 2rem;
+    }
+    h2 {
+      font-size: 1.2rem;
+      margin: 2.5rem 0 1rem;
+      padding-bottom: 0.4rem;
+      border-bottom: 1px solid var(--border);
+    }
+    h3 {
+      font-size: 1rem;
+      margin: 1.25rem 0 0.5rem;
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 0.8rem;
+    }
+    p, li { margin: 0.55rem 0; }
+    ul, ol { padding-left: 1.3rem; }
+    a { color: var(--accent); }
+    a:hover { color: var(--accent-hover); }
+
+    .hero-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px 26px;
+      margin: 1.5rem 0 2rem;
+    }
+    .hero-card h2 {
+      margin: 0 0 0.75rem;
+      padding: 0;
+      border: none;
+      font-size: 1.15rem;
+    }
+    .hero-card p:last-child { margin-bottom: 0; }
+    .feature-list {
+      list-style: none;
+      padding: 0;
+      margin: 1rem 0 0;
+      display: grid;
+      gap: 0.5rem;
+    }
+    .feature-list li {
+      margin: 0;
+      padding-left: 1.5rem;
+      position: relative;
+    }
+    .feature-list li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      color: var(--success);
+      font-weight: 700;
+    }
+
+    .download-card {
+      background: linear-gradient(135deg, rgba(29, 155, 240, 0.12), rgba(29, 155, 240, 0.04));
+      border: 1px solid var(--accent);
+      border-radius: 16px;
+      padding: 24px 26px;
+      text-align: center;
+      margin: 2rem 0;
+    }
+    .download-card p { margin: 0.5rem 0 1.25rem; color: var(--muted); font-size: 0.95rem; }
+    .btn {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff !important;
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 1rem;
+      padding: 12px 28px;
+      border-radius: 999px;
+      transition: background 0.15s;
+    }
+    .btn:hover { background: var(--accent-hover); }
+    .btn-sub {
+      display: block;
+      margin-top: 0.75rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin: 1rem 0;
+    }
+    .card.warn {
+      border-color: rgba(255, 212, 0, 0.45);
+      background: rgba(255, 212, 0, 0.06);
+    }
+    .card strong { display: block; margin-bottom: 0.35rem; }
+
+    code, kbd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.88em;
+      background: rgba(127, 127, 127, 0.15);
+      padding: 0.15em 0.45em;
+      border-radius: 4px;
+    }
+    kbd {
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+    }
+
+    .steps { counter-reset: step; list-style: none; padding: 0; }
+    .steps > li {
+      counter-increment: step;
+      margin: 0 0 1.1rem;
+      padding-left: 2.6rem;
+      position: relative;
+    }
+    .steps > li::before {
+      content: counter(step);
+      position: absolute;
+      left: 0;
+      top: 0.1rem;
+      width: 1.75rem;
+      height: 1.75rem;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 50%;
+      font-size: 0.85rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .checklist { list-style: none; padding: 0; }
+    .checklist li {
+      padding-left: 1.6rem;
+      position: relative;
+      margin: 0.4rem 0;
+    }
+    .checklist li::before {
+      content: "☐";
+      position: absolute;
+      left: 0;
+      color: var(--muted);
+    }
+
+    footer {
+      margin-top: 3rem;
+      padding-top: 1.25rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>X Cleaner</h1>
+    <p class="meta">
+      Chrome extension v0.98 · by <a href="https://d2fl.com">d2fl</a> ·
+      Copyright © 2026 d2fl. All rights reserved.
+    </p>
+
+    <section class="hero-card" aria-labelledby="what-heading">
+      <h2 id="what-heading">What it does</h2>
+      <p>
+        <strong>X Cleaner</strong> exports your X (Twitter) <strong>Following</strong> and <strong>Followers</strong> lists to CSV.
+        Filter locally (mutuals, inactive accounts by last post, bots, verified) and hand results off to
+        <a href="https://d2fl.com/remover">X Follower Remover</a> or use offline.
+      </p>
+      <ul class="feature-list">
+        <li>Collect Following or Followers independently (per-branch isolation)</li>
+        <li>Fast mode (bulk REST/GraphQL — riskier, faster) or Gentle mode (sniffer + scroll/DOM — low risk, overnight safe)</li>
+        <li>Cross-populate mutual flags (you follow / follows you) automatically during collection and CSV loads</li>
+        <li>Last-post enrichment for inactive filter (timeline fallback + cached nulls, exact UI months)</li>
+        <li>Fresh-start, filters, and archives apply only to the selected branch — never wipe the other</li>
+        <li>Export CSV (full lists require @d2fl subscription) or load prior CSVs</li>
+        <li>All data stays in your browser — no central servers or tracking</li>
+      </ul>
+    </section>
+
+    <section class="download-card" aria-labelledby="download-heading">
+      <h2 id="download-heading" style="margin:0 0 0.5rem;border:none;padding:0;font-size:1.25rem;">Download</h2>
+      <p>Unzip the file, then load the folder in Chrome. See installation steps below.</p>
+      <a class="btn" href="./x_cleaner_v0.98.zip" download>Download x_cleaner_v0.98.zip</a>
+      <span class="btn-sub">~1 MB · Desktop Chrome / Chromium only</span>
+    </section>
+
+    <div class="card warn">
+      <strong>Before you start</strong>
+      <ul>
+        <li>Use the <strong>web version of X</strong> at <a href="https://x.com">x.com</a> — not the mobile app.</li>
+        <li>You must be <strong>logged into</strong> the account you want to export.</li>
+        <li><strong>Gentle mode (unchecked)</strong> is strongly recommended for large lists or repeated runs. <strong>Fast mode</strong> uses more API calls and carries higher risk of rate limits or flags.</li>
+        <li>Start small. X may limit aggressive collection.</li>
+        <li>Full CSV export requires an active <a href="https://x.com/d2fl/creator-subscriptions/subscribe">@d2fl</a> subscription. Free tier is limited to ~200 records.</li>
+      </ul>
+    </div>
+
+    <h2>Installation</h2>
+
+    <h3>Step 1 — Download and unzip</h3>
+    <ol class="steps">
+      <li>Click the download button above and save the zip file.</li>
+      <li>Unzip it to a folder on your <strong>local hard drive</strong> (not Google Drive or other cloud-sync folders if you have problems).
+        <ul>
+          <li><strong>Windows:</strong> right-click → <em>Extract All…</em></li>
+          <li><strong>Mac:</strong> double-click the zip</li>
+        </ul>
+      </li>
+      <li>After unzipping, open the folder and confirm <code>manifest.json</code> is there alongside <code>background.js</code>, <code>popup.html</code>, and the <code>icons</code> folder.</li>
+    </ol>
+
+    <div class="card warn">
+      <strong>Important</strong>
+      In Chrome, select the <em>unzipped folder that contains <code>manifest.json</code></em> — not the zip file itself, and not a parent folder that only contains another subfolder.
+    </div>
+
+    <h3>Step 2 — Load in Chrome</h3>
+    <ol class="steps">
+      <li>Open Chrome and go to <code>chrome://extensions</code></li>
+      <li>Turn on <strong>Developer mode</strong> (toggle, top right)</li>
+      <li>Click <strong>Load unpacked</strong></li>
+      <li>Select the unzipped folder (the one with <code>manifest.json</code> at the top level)</li>
+      <li>Pin the extension from the puzzle-piece icon in the toolbar</li>
+    </ol>
+
+    <h2>How to use</h2>
+
+    <h3>First-time setup</h3>
+    <ol class="steps">
+      <li>Open <a href="https://x.com">x.com</a> and log in.</li>
+      <li>Click the extension icon → <strong>Open Control Panel</strong> (or the in-page HUD).</li>
+      <li>Click <strong>Claim / Use open X tab</strong> to detect your logged-in account.</li>
+      <li>Select <strong>Following</strong> or <strong>Followers</strong> branch. These are independent — collections and fresh-starts on one never affect the other.</li>
+      <li>Leave <strong>Fast</strong> unchecked for Gentle mode (recommended). Check Fast only when you need speed and accept the extra risk.</li>
+      <li>Click <strong>Start Collection</strong>. The extension collects in the background using your session.</li>
+      <li>After the list loads, apply <strong>Filters</strong> (mutuals, verified, inactive for Following, bots for Followers).</li>
+      <li>Export CSV when ready, or <strong>Load CSV</strong> to merge/replace from a previous export. Overlapping names get mutual flags set automatically.</li>
+    </ol>
+
+    <h3>Fast vs Gentle modes</h3>
+    <div class="card">
+      <p><strong>Gentle (default, lower risk)</strong>: Uses the page sniffer + natural scroll/DOM interactions. Much safer profile for large lists or long-running overnight jobs. Slower but gentle on X's systems.</p>
+      <p style="margin-bottom:0;"><strong>Fast (higher risk)</strong>: Direct bulk calls via REST and GraphQL. Fast for big accounts but more likely to trigger rate limits or account scrutiny. Use only when necessary and with caution.</p>
+    </div>
+
+    <h3>Fresh start, per-branch only</h3>
+    <p>
+      The Fresh start checkbox (when starting a collection) clears only the selected branch (Following or Followers).
+      The other branch's data, caches, and archives remain untouched.
+    </p>
+
+    <h3>After closing Chrome or switching accounts</h3>
+    <p>Data is saved per-X-account and per-branch in local browser storage. Reopen, claim the tab, and pick up where you left off. Switching accounts automatically cleans up and isolates data.</p>
+
+    <h2>Troubleshooting</h2>
+    <ul>
+      <li><strong>Load unpacked fails</strong> — unzip first; select the folder that directly contains <code>manifest.json</code>; copy to a local disk path and retry.</li>
+      <li><strong>No X account detected</strong> — open x.com while logged in, then click Claim / Use open X tab.</li>
+      <li><strong>Nothing in export / limited to 200</strong> — subscribe at <a href="https://x.com/d2fl/creator-subscriptions/subscribe">@d2fl</a> for unlimited exports.</li>
+      <li><strong>Stale or missing last-post dates</strong> — a fresh collection or filter will re-enrich using lookup + timeline fallback. Old nulls are re-checked.</li>
+      <li><strong>Mutual flags not showing</strong> — ensure both branches have been collected (or load overlapping CSVs); flags are populated live during add and on CSV import.</li>
+    </ul>
+
+    <h2>Quick checklist</h2>
+    <ul class="checklist">
+      <li>Zip downloaded and unzipped to local disk</li>
+      <li>Folder contains <code>manifest.json</code> at the top level</li>
+      <li><code>chrome://extensions</code> → Developer mode on → Load unpacked</li>
+      <li>Extension pinned in toolbar</li>
+      <li>Logged into x.com · account claimed in Control Panel</li>
+      <li>Branch chosen · Fast/Gentle selected · Start Collection clicked</li>
+      <li>Filters applied as needed · CSV exported or loaded</li>
+    </ul>
+
+    <footer>
+      <p>
+        <strong>Support:</strong>
+        <a href="mailto:admin@d2fl.com">admin@d2fl.com</a> (general) ·
+        <a href="mailto:support@d2fl.com">support@d2fl.com</a> (technical) ·
+        <a href="https://d2fl.com">d2fl.com</a>
+      </p>
+      <p>
+        <a href="https://d2fl.com/cleaner/privacy-policy.html">Privacy Policy</a>
+      </p>
+      <p style="margin-top:1rem;font-size:0.85rem;">
+        Unofficial tool, not affiliated with X Corp. Use at your own risk and comply with X's Terms of Service.
+      </p>
+    </footer>
+  </main>
+</body>
+</html>

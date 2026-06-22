@@ -1,6 +1,8 @@
-// On-page HUD for X Cleaner (collection runs via GraphQL in the background)
+// On-page modal for X Cleaner — full-screen blur + page lock while collecting
 var HUD_ID = 'xcleaner-hud';
 var HUD_DISMISSED_KEY = 'xc_hud_dismissed';
+var HUD_PAGE_BLOCK_CLASS = 'xcleaner-page-blocked';
+var hudPageBlockerInstalled = false;
 var FILTER_MONTHS_MIN = 1;
 var FILTER_MONTHS_MAX = 24;
 var FILTER_MONTHS_DEFAULT = 6;
@@ -10,6 +12,7 @@ var FAST_SCROLL_WARN = 'Fast mode uses REST bulk + aggressive scrolling and may 
 var EXT_VERSION = chrome.runtime.getManifest().version || '';
 let lastHudDebugStatusLog = [];
 let lastHudDebugStatusLogEnabled = true;
+let lastHudPayload = {};
 let pendingHudListType = null;
 let hudCurrentListType = 'following';
 
@@ -198,11 +201,89 @@ function setHudDismissed(dismissed) {
   } catch (error) {}
 }
 
+function isHudBlockingState(state = {}) {
+  return !!(
+    state.isScraping
+    || state.isEnriching
+    || state.reason === 'filtering'
+    || state.reason === 'loading-profile'
+    || state.reason === 'waiting-native'
+    || state.reason === 'collecting'
+    || state.reason === 'profile-loaded'
+  );
+}
+
+function flashBlockingNotice(hud) {
+  const notice = hud?.querySelector('#xcleaner-blocking-notice');
+  if (!notice) return;
+  notice.hidden = false;
+  notice.classList.add('is-flash');
+  clearTimeout(flashBlockingNotice._timer);
+  flashBlockingNotice._timer = setTimeout(() => {
+    notice.classList.remove('is-flash');
+  }, 1400);
+}
+
+function setHudBlockingMode(hud, blocking) {
+  if (!hud) return;
+  hud.classList.toggle('is-blocking', blocking);
+  document.documentElement.classList.toggle(HUD_PAGE_BLOCK_CLASS, blocking);
+  const closeBtn = hud.querySelector('#xcleaner-close');
+  if (closeBtn) closeBtn.style.display = blocking ? 'none' : '';
+  const notice = hud.querySelector('#xcleaner-blocking-notice');
+  if (notice) notice.hidden = !blocking;
+  if (!blocking) notice?.classList.remove('is-flash');
+}
+
+function installHudPageBlocker(hud) {
+  if (hudPageBlockerInstalled || !hud) return;
+  hudPageBlockerInstalled = true;
+
+  const blockOutside = (event) => {
+    if (!hud.classList.contains('is-blocking')) return;
+    const panel = hud.querySelector('.xc-panel');
+    if (panel && (panel === event.target || panel.contains(event.target))) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') {
+      event.stopImmediatePropagation();
+    }
+    flashBlockingNotice(hud);
+    return false;
+  };
+
+  for (const type of ['pointerdown', 'click', 'mousedown', 'touchstart', 'keydown', 'wheel']) {
+    document.addEventListener(type, blockOutside, true);
+  }
+
+  hud.querySelector('.xc-backdrop')?.addEventListener('click', () => {
+    if (hud.classList.contains('is-blocking')) flashBlockingNotice(hud);
+  });
+}
+
 async function hideHud() {
+  try {
+    const result = await sendToBackground({ action: 'dismissHud' });
+    if (result?.ok === false) {
+      setHudDismissed(false);
+      const statusEl = document.getElementById(HUD_ID)?.querySelector('#xcleaner-status');
+      if (statusEl) statusEl.textContent = 'Could not stop collection — use Stop or reload the extension.';
+      return;
+    }
+  } catch (error) {
+    setHudDismissed(false);
+    const statusEl = document.getElementById(HUD_ID)?.querySelector('#xcleaner-status');
+    if (statusEl) statusEl.textContent = 'Extension unreachable — collection may still be running.';
+    return;
+  }
+
   setHudDismissed(true);
   const hud = document.getElementById(HUD_ID);
-  if (hud) hud.remove();
-  await sendToBackground({ action: 'dismissHud' });
+  if (hud) {
+    setHudBlockingMode(hud, false);
+    hud.remove();
+  }
+  document.documentElement.classList.remove(HUD_PAGE_BLOCK_CLASS);
 }
 
 function selectedHudListType() {
@@ -249,12 +330,17 @@ function ensureHudStatusLogElements(hud) {
 
 function ensureHud() {
   let hud = document.getElementById(HUD_ID);
+  if (hud && !hud.querySelector('.xc-panel')) {
+    hud.remove();
+    hud = null;
+  }
   if (hud) {
     const titleEl = hud.querySelector('.xc-title');
     if (titleEl && EXT_VERSION) {
       titleEl.textContent = `X Cleaner v${EXT_VERSION}`;
     }
     ensureHudStatusLogElements(hud);
+    installHudPageBlocker(hud);
     return hud;
   }
 
@@ -262,19 +348,63 @@ function ensureHud() {
   hud.id = HUD_ID;
   hud.innerHTML = `
     <style>
+      html.${HUD_PAGE_BLOCK_CLASS},
+      html.${HUD_PAGE_BLOCK_CLASS} body {
+        overflow: hidden !important;
+      }
       #${HUD_ID} {
         position: fixed;
-        top: 12px;
-        right: 12px;
+        inset: 0;
         z-index: 2147483646;
-        width: 270px;
-        background: rgba(0, 0, 0, 0.9);
-        color: #fff;
-        border: 1px solid #2f3336;
-        border-radius: 12px;
-        padding: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px 16px;
+        pointer-events: none;
         font: 13px/1.4 Arial, sans-serif;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        color: #fff;
+      }
+      #${HUD_ID} .xc-backdrop {
+        position: absolute;
+        inset: 0;
+        pointer-events: auto;
+        background: transparent;
+        transition: background 0.2s ease, backdrop-filter 0.2s ease;
+      }
+      #${HUD_ID}.is-blocking .xc-backdrop {
+        background: rgba(15, 20, 25, 0.62);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+      }
+      #${HUD_ID} .xc-panel {
+        position: relative;
+        z-index: 1;
+        pointer-events: auto;
+        width: min(420px, 100%);
+        max-height: min(92vh, 920px);
+        overflow-x: hidden;
+        overflow-y: auto;
+        background: rgba(0, 0, 0, 0.94);
+        border: 1px solid #2f3336;
+        border-radius: 16px;
+        padding: 14px 14px 12px;
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+      }
+      #${HUD_ID} .xc-blocking-notice {
+        margin: 0 0 10px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(29, 155, 240, 0.45);
+        background: rgba(29, 155, 240, 0.12);
+        color: #8ecdf8;
+        font-size: 11px;
+        line-height: 1.4;
+        font-weight: 700;
+      }
+      #${HUD_ID} .xc-blocking-notice.is-flash {
+        border-color: #ffd400;
+        background: rgba(255, 212, 0, 0.14);
+        color: #ffe58f;
       }
       #${HUD_ID} .xc-header {
         display: flex;
@@ -312,7 +442,7 @@ function ensureHud() {
       }
       #${HUD_ID} .xc-fresh-start input { margin-top: 2px; }
       #${HUD_ID} .xc-start { background: #e7e9ea; color: #0f1419; }
-      #${HUD_ID} .xc-method { color: #8b98a5; font-size: 11px; margin-bottom: 6px; }
+      #${HUD_ID} .xc-method { display: none; }
       #${HUD_ID} .xc-toggle {
         display: flex;
         gap: 6px;
@@ -560,8 +690,13 @@ function ensureHud() {
         line-height: 1.2;
       }
     </style>
+    <div class="xc-backdrop" aria-hidden="true"></div>
+    <div class="xc-panel" role="dialog" aria-modal="true" aria-labelledby="xcleaner-title">
+    <div class="xc-blocking-notice" id="xcleaner-blocking-notice" hidden>
+      Collection in progress — X is locked. Press Stop to cancel, or wait until complete.
+    </div>
     <div class="xc-header">
-      <div class="xc-title">X Cleaner${EXT_VERSION ? ` v${EXT_VERSION}` : ''}</div>
+      <div class="xc-title" id="xcleaner-title">X Cleaner${EXT_VERSION ? ` v${EXT_VERSION}` : ''}</div>
       <button class="xc-close" id="xcleaner-close" type="button" title="Close panel" aria-label="Close panel">×</button>
     </div>
     <label class="xc-fast-scroll" title="Fast uses aggressive scrolling and may reduce reach on X">
@@ -603,7 +738,7 @@ function ensureHud() {
     <div class="xc-filter">
       <div class="xc-filter-title">Pre-export filter</div>
       <label><input type="checkbox" id="xcleaner-remove-blue"> Remove Verified</label>
-      <label class="xc-months-filter">
+      <label class="xc-months-filter" title="Following only: keeps accounts older than N months with no recent posts. Filters by account age first, then checks last tweet slowly.">
         <input type="checkbox" id="xcleaner-remove-inactive">
         <span>Last post &gt;</span>
         <span class="xc-months-stepper">
@@ -625,8 +760,8 @@ function ensureHud() {
         <button class="xc-subscribe" id="xcleaner-subscribe" type="button">Subscribe @d2fl</button>
       </div>
     </div>
-    <button class="xc-view" id="xcleaner-view" type="button" title="Preview first 5 records in the active list">View</button>
-    <button class="xc-export" id="xcleaner-export" title="Requires @d2fl subscription">Export CSV</button>
+    <button class="xc-view" id="xcleaner-view" type="button" title="Preview first 5/10 records in the active list (more for subscribers)">View</button>
+    <button class="xc-export" id="xcleaner-export" title="Download CSV">Export CSV</button>
     <div class="xc-import">
       <div class="xc-import-title">Load CSV</div>
       <label><input type="radio" name="xc-import-mode" id="xcleaner-import-replace" value="replace" checked> Replace list</label>
@@ -639,9 +774,11 @@ function ensureHud() {
       <input id="xcleaner-import-followers-input" type="file" accept=".csv,text/csv" hidden>
       <div class="xc-import-hint" id="xcleaner-import-info">X Cleaner export or one handle per line. Free tier: 200 records max.</div>
     </div>
+    </div>
   `;
 
   document.documentElement.appendChild(hud);
+  installHudPageBlocker(hud);
   wireHudFilterMonthSteppers(hud);
 
   wireHudStatusLogClick(hud);
@@ -685,6 +822,10 @@ function ensureHud() {
   });
 
   hud.querySelector('#xcleaner-close').addEventListener('click', () => {
+    if (hud.classList.contains('is-blocking')) {
+      const statusEl = hud.querySelector('#xcleaner-status');
+      if (statusEl) statusEl.textContent = 'Stopping collection before close...';
+    }
     void hideHud();
   });
 
@@ -729,8 +870,22 @@ function ensureHud() {
     hudOpenListPreview(selectedHudListType());
   });
 
-  hud.querySelector('#xcleaner-export').addEventListener('click', () => {
-    sendToBackground({ action: 'exportCSV' });
+  hud.querySelector('#xcleaner-export').addEventListener('click', async () => {
+    const exportBtn = hud.querySelector('#xcleaner-export');
+    const statusEl = hud.querySelector('#xcleaner-status');
+    if (exportBtn.disabled) return;
+    exportBtn.disabled = true;
+    const result = await sendToBackground({
+      action: 'exportCSV',
+      listType: selectedHudListType()
+    });
+    if (result?.ok) {
+      updateHud(result);
+      if (result.status) statusEl.textContent = result.status;
+      return;
+    }
+    exportBtn.disabled = false;
+    statusEl.textContent = result?.error || 'Export failed.';
   });
 
   hud.querySelector('#xcleaner-sub-refresh').addEventListener('click', async () => {
@@ -777,14 +932,21 @@ function ensureHud() {
         botCheck,
         inactiveMonths: readHudFilterMonths(hud, '#xcleaner-inactive-months')
       });
-      if (result) updateHud(result);
-      else if (!isExtensionContextValid()) {
-        statusEl.textContent = 'Extension reloaded — refresh this X tab, then try again.';
-      } else if (result?.error) {
+      if (!result) {
+        statusEl.textContent = isExtensionContextValid()
+          ? 'Filter failed — no response from extension.'
+          : 'Extension reloaded — refresh this X tab, then try again.';
+        return;
+      }
+      updateHud(result);
+      if (result.error) {
         statusEl.textContent = result.error;
       }
     } catch (error) {
       statusEl.textContent = String(error?.message || error || 'Filter failed.');
+    } finally {
+      const refreshed = await sendToBackground({ action: 'getStatus' });
+      if (refreshed) updateHud(refreshed);
     }
   });
 
@@ -878,6 +1040,34 @@ function syncHudListTypeUi(hud, type = 'following') {
   hud.querySelector('#xcleaner-mode-followers').checked = type === 'followers';
   hud.querySelector('#xcleaner-following-card')?.classList.toggle('active', type !== 'followers');
   hud.querySelector('#xcleaner-followers-card')?.classList.toggle('active', type === 'followers');
+
+  // Last post filter only for following; bot check only for followers
+  const inactiveLabel = hud.querySelector('#xcleaner-remove-inactive')?.closest('label');
+  const inactiveChk = hud.querySelector('#xcleaner-remove-inactive');
+  const isFollowing = type === 'following';
+  if (inactiveChk) {
+    inactiveChk.disabled = !isFollowing;
+    if (!isFollowing) inactiveChk.checked = false;
+  }
+  if (inactiveLabel) {
+    inactiveLabel.style.opacity = isFollowing ? '' : '0.5';
+    if (!isFollowing) {
+      const stepper = inactiveLabel.querySelector('.xc-months-stepper');
+      if (stepper) stepper.style.pointerEvents = 'none';
+    }
+  }
+
+  const botChk = hud.querySelector('#xcleaner-bot-check');
+  const isFollowers = type === 'followers';
+  if (botChk) {
+    botChk.disabled = !isFollowers;
+    if (!isFollowers) botChk.checked = false;
+  }
+  // ensure bot label also reflects
+  const botLabel = botChk?.closest('label');
+  if (botLabel) {
+    botLabel.style.opacity = isFollowers ? '' : '0.5';
+  }
 }
 
 async function switchHudListType(hud, nextType) {
@@ -914,7 +1104,10 @@ function formatHudSubscriptionStatus(state) {
     }
     return `Subscribed — unlimited fetch & export (${handle})`;
   }
-  return `Free — fetch up to ${freeLimit} • export requires @d2fl (${handle})`;
+  if (state.freeTierResetsAt) {
+    return `Free — up to ${freeLimit} records per 24h (fetch & export) • resets ${new Date(state.freeTierResetsAt).toLocaleString()} (${handle})`;
+  }
+  return `Free — up to ${freeLimit} records per 24h (fetch & export) (${handle})`;
 }
 
 function formatTotalForState(state) {
@@ -963,6 +1156,16 @@ function hudFormatListTotal(total) {
 function updateHud(state = {}) {
   if (isHudDismissed()) return;
 
+  const merged = {
+    ...lastHudPayload,
+    ...state,
+    listStats: state.listStats || lastHudPayload.listStats,
+    storedCounts: state.storedCounts || lastHudPayload.storedCounts,
+    mutuals: state.mutuals || lastHudPayload.mutuals
+  };
+  lastHudPayload = merged;
+  state = merged;
+
   const hud = ensureHud();
   const count = state.count || 0;
   const type = state.listType || hudCurrentListType || 'following';
@@ -970,20 +1173,7 @@ function updateHud(state = {}) {
   const uiType = pendingHudListType || type;
   const label = listLabel(type).toLowerCase();
 
-  const scrollNote = state.fastScrollLabel || (state.fastScroll ? 'fast scroll' : 'observe + gentle scroll');
-  const engineNote = state.fetchModeLabel || state.fetchMode || 'auto';
-  const activeMethod = state.method === 'rest-v1.1'
-    ? 'REST v1.1'
-    : state.method === 'graphql-worker'
-      ? 'GraphQL worker'
-      : state.method === 'observe'
-        ? 'observe'
-        : (state.method === 'native-sniffer' ? 'sniffer' : engineNote);
-  const limitNote = state.isSubscribed
-    ? 'unlimited'
-    : `up to ${state.fetchLimit || 200}`;
-  hud.querySelector('#xcleaner-method').textContent =
-    `Collect ${listLabel(type)} via ${activeMethod}, ${scrollNote} (${limitNote})`;
+
   const fastScrollEl = hud.querySelector('#xcleaner-fast-scroll');
   if (fastScrollEl && state.fastScroll != null && fastScrollEl.checked !== !!state.fastScroll) {
     fastScrollEl.checked = !!state.fastScroll;
@@ -1040,8 +1230,6 @@ function updateHud(state = {}) {
   const statusEl = hud.querySelector('#xcleaner-status');
   const busy = !!state.isScraping;
   const filterBusy = !!state.isEnriching || state.reason === 'filtering';
-  const canExport = !!state.canExport;
-
   let subText = formatHudSubscriptionStatus(state);
   if (state.sniffFailed && state.sniffError) {
     subText += ` — ⚠ ${state.sniffError}`;
@@ -1060,19 +1248,24 @@ function updateHud(state = {}) {
   const hudType = pendingHudListType || selectedHudListType();
   const previewCount = hudCountForListType(state, hudType);
   const canView = hudCanViewListPreview(state, hudType);
+  const isNonFree = !!state.isSubscribed || state.canExport === true;
+  const previewRowsLabel = isNonFree ? '10' : '5';
+  const freeNote = isNonFree ? '' : ' (free — up to 5 rows)';
   if (viewBtn) {
     viewBtn.disabled = !canView;
     viewBtn.title = canView
       ? previewCount > 0
         ? busy
-          ? `Preview first 5 ${listLabel(hudType).toLowerCase()} (${previewCount.toLocaleString()} loaded so far)`
-          : `Preview first 5 ${listLabel(hudType).toLowerCase()} records`
-        : `Preview first 5 ${listLabel(hudType).toLowerCase()} (free — up to 5 rows)`
+          ? `Preview first ${previewRowsLabel} ${listLabel(hudType).toLowerCase()} (${previewCount.toLocaleString()} loaded so far)`
+          : `Preview first ${previewRowsLabel} ${listLabel(hudType).toLowerCase()} records`
+        : `Preview first ${previewRowsLabel} ${listLabel(hudType).toLowerCase()}${freeNote}`
       : 'Collect or import a list first';
   }
-  exportBtn.disabled = count === 0 || busy || !canExport;
-  exportBtn.classList.toggle('export-locked', count > 0 && !canExport);
-  exportBtn.title = canExport ? 'Download CSV' : 'Export requires @d2fl subscription';
+  exportBtn.disabled = count === 0 || busy;
+  exportBtn.classList.remove('export-locked');
+  exportBtn.title = count > 0
+    ? `Download CSV (${count.toLocaleString()} records${state.fetchLimit != null ? `, free max ${state.fetchLimit}` : ''})`
+    : 'Collect or import a list first';
   const filterSourceCount = hudRawCountForListType(state, hudType);
   const canFilter = filterSourceCount > 0;
   filterBtn.disabled = !canFilter || busy || filterBusy;
@@ -1112,9 +1305,7 @@ function updateHud(state = {}) {
   } else if (state.reason === 'filtered') {
     statusEl.textContent = state.status || `Filtered to ${count.toLocaleString()} accounts.`;
   } else if (state.reason === 'complete') {
-    statusEl.textContent = state.status || (state.canExport
-      ? 'Complete. Start again, filter, or export CSV any time.'
-      : 'Complete (free tier). Filter here; subscribe @d2fl to export.');
+    statusEl.textContent = state.status || 'Complete. Start again, filter, or export CSV any time.';
   } else if (state.reason === 'exported') {
     statusEl.textContent = `Exported ${count.toLocaleString()} accounts.`;
   } else if (state.reason === 'stopped' && count > 0) {
@@ -1128,6 +1319,7 @@ function updateHud(state = {}) {
   }
 
   renderDebugStatusLog(hud, state);
+  setHudBlockingMode(hud, isHudBlockingState(state));
 }
 
 if (!globalThis.__xcCleanerMessageHooked) {

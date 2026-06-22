@@ -153,7 +153,10 @@ function formatSubscriptionStatus(state) {
     }
     return `Subscribed — unlimited fetch & export (${handle})`;
   }
-  return `Free — fetch up to ${FREE_FETCH_LIMIT} • export requires @d2fl (${handle})`;
+  if (state.freeTierResetsAt) {
+    return `Free — up to ${FREE_FETCH_LIMIT} records per 24h (fetch & export) • resets ${new Date(state.freeTierResetsAt).toLocaleString()} (${handle})`;
+  }
+  return `Free — up to ${FREE_FETCH_LIMIT} records per 24h (fetch & export) (${handle})`;
 }
 
 function renderSubscription(state) {
@@ -300,19 +303,7 @@ function renderProgress(state) {
   syncListTypeUi(pendingListType || currentListType);
 
   accountEl.textContent = username ? `@${username}` : '@—';
-  const limitNote = state.isSubscribed
-    ? 'unlimited'
-    : `up to ${state.fetchLimit || FREE_FETCH_LIMIT}`;
-  const engineNote = state.fetchModeLabel || state.fetchMode || 'auto';
-  const activeMethod = state.method === 'rest-v1.1'
-    ? 'REST v1.1'
-    : state.method === 'graphql-worker'
-      ? 'GraphQL worker'
-      : state.method === 'observe'
-        ? 'observe'
-        : (state.method === 'native-sniffer' ? 'sniffer' : engineNote);
-  const scrollNote = state.fastScrollLabel || (state.fastScroll ? 'fast scroll' : 'gentle scroll');
-  methodEl.textContent = `Collect ${listLabel()} via ${activeMethod}, ${scrollNote} (${limitNote})`;
+
   if (fastScrollEl && state.fastScroll != null && fastScrollEl.checked !== !!state.fastScroll) {
     fastScrollEl.checked = !!state.fastScroll;
   }
@@ -328,25 +319,28 @@ function renderProgress(state) {
   if (freshStartEl) freshStartEl.disabled = busy;
   if (fastScrollEl) fastScrollEl.disabled = busy;
   stopBtn.style.display = busy ? 'block' : 'none';
-  const canExport = !!state.canExport;
   const previewType = pendingListType || selectedListType();
   const previewCount = xcCountForListType(state, previewType);
+  const activeCount = previewCount;
   const canView = canViewListPreview(state, previewType);
+  const isNonFree = !!state.isSubscribed || state.canExport === true;
+  const previewRowsLabel = isNonFree ? '10' : '5';
+  const freeNote = isNonFree ? '' : ' (free — up to 5 rows)';
   if (viewBtn) {
     viewBtn.disabled = !canView;
     viewBtn.title = canView
       ? previewCount > 0
         ? busy
-          ? `Preview first 5 ${listLabel(previewType).toLowerCase()} (${previewCount.toLocaleString()} loaded so far)`
-          : `Preview first 5 ${listLabel(previewType).toLowerCase()} records`
-        : `Preview first 5 ${listLabel(previewType).toLowerCase()} (free — up to 5 rows)`
+          ? `Preview first ${previewRowsLabel} ${listLabel(previewType).toLowerCase()} (${previewCount.toLocaleString()} loaded so far)`
+          : `Preview first ${previewRowsLabel} ${listLabel(previewType).toLowerCase()} records`
+        : `Preview first ${previewRowsLabel} ${listLabel(previewType).toLowerCase()}${freeNote}`
       : 'Collect or import a list first';
   }
-  exportBtn.disabled = count === 0 || !canExport;
-  exportBtn.classList.toggle('export-locked', count > 0 && !canExport);
-  exportBtn.title = canExport
-    ? 'Download CSV'
-    : 'Export requires @d2fl subscription';
+  exportBtn.disabled = activeCount === 0 || busy;
+  exportBtn.classList.remove('export-locked');
+  exportBtn.title = activeCount > 0
+    ? `Download CSV (${activeCount.toLocaleString()} records${state.fetchLimit != null ? `, free max ${state.fetchLimit}` : ''})`
+    : 'Collect or import a list first';
   const filterSourceCount = typeof xcRawCountForListType === 'function'
     ? xcRawCountForListType(state, previewType)
     : (state.rawCount || count);
@@ -419,10 +413,7 @@ function statusMessage(state) {
 
   if (state.reason === 'complete') {
     if (state.status) return state.status;
-    if (state.canExport) {
-      return `Collection complete. Filter or export ${label} CSV from here or the X page panel.`;
-    }
-    return `Collection complete (free tier). Filter in-app; subscribe @d2fl to export.`;
+    return `Collection complete. Filter or export ${label} CSV from here or the X page panel.`;
   }
 
   if (state.reason === 'end-of-list') {
@@ -439,9 +430,7 @@ function statusMessage(state) {
   }
 
   if (state.count > 0) {
-    return state.canExport
-      ? `Ready to export collected ${label}.`
-      : `${state.count.toLocaleString()} ${label} loaded. Export requires @d2fl subscription.`;
+    return `Ready to export collected ${label}.`;
   }
 
   return `Select Following or Followers, then start collection. Progress also appears on the X page panel.`;
@@ -487,10 +476,24 @@ function canViewListPreview(state = {}, type = 'following') {
   return false;
 }
 
-async function refreshStatus() {
-  await sendBackground('syncFromFocusedTab', { refreshSub: false });
-  const result = await sendBackground('getStatus');
-  if (result?.ok !== false) {
+async function refreshStatus(options = {}) {
+  const result = await sendBackground('getStatus', {
+    syncFromTab: options.syncFromTab !== false,
+    refreshSub: !!options.refreshSub,
+    force: !!options.force,
+    handoffAfterHud: !!options.handoffAfterHud
+  });
+  if (result?.ok === false && result?.error) {
+    setStatus(result.error, true);
+    return result;
+  }
+  if (result?.hudReady) {
+    return result;
+  }
+  if (result) {
+    if (result?.fastScroll != null && fastScrollEl) {
+      fastScrollEl.checked = !!result.fastScroll;
+    }
     updateUI(result);
     if (shouldKeepStatusPolling(result)) {
       startPolling();
@@ -498,6 +501,7 @@ async function refreshStatus() {
       stopPolling();
     }
   }
+  return result;
 }
 
 function startPolling() {
@@ -628,8 +632,9 @@ filterBtn.addEventListener('click', async () => {
 checkSubBtn.addEventListener('click', async () => {
   checkSubBtn.disabled = true;
   setStatus('Opening on-page panel on your X tab...');
-  const result = await sendBackground('checkSubscription', {
+  const result = await refreshStatus({
     syncFromTab: true,
+    refreshSub: true,
     force: true,
     handoffAfterHud: true
   });
@@ -654,10 +659,17 @@ viewBtn?.addEventListener('click', () => {
   xcOpenListPreview((listType) => sendBackground('getListPreview', { listType }), selectedListType());
 });
 
-exportBtn.addEventListener('click', () => {
+exportBtn.addEventListener('click', async () => {
   if (exportBtn.disabled) return;
-  sendBackground('exportCSV');
-  closePopup();
+  exportBtn.disabled = true;
+  const result = await sendBackground('exportCSV', { listType: selectedListType() });
+  if (result?.ok) {
+    updateUI(result);
+    if (result.status) setStatus(result.status);
+    return;
+  }
+  exportBtn.disabled = false;
+  setStatus(result?.error || 'Export failed.', true);
 });
 
 async function handleCsvImport(listType, file) {
@@ -744,14 +756,6 @@ chrome.storage.local.get(FAST_SCROLL_PREF_KEY, (res) => {
   fastScrollEl.checked = !!res[FAST_SCROLL_PREF_KEY];
 });
 
-refreshStatus();
-
-sendBackground('getJobState').then((state) => {
-  if (state?.fastScroll != null && fastScrollEl) {
-    fastScrollEl.checked = !!state.fastScroll;
-  }
-  if (state) updateUI(state);
-  if (shouldKeepStatusPolling(state)) startPolling();
-});
+refreshStatus({ syncFromTab: true, refreshSub: false });
 
 window.addEventListener('unload', stopPolling);

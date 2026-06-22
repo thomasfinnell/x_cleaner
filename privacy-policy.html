@@ -1,0 +1,172 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="canonical" href="https://d2fl.com/cleaner/privacy-policy.html">
+  <title>Privacy Policy — X Cleaner</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --text: #e7e9ea;
+      --muted: #71767b;
+      --bg: #000;
+      --card: #16181c;
+      --border: #2f3336;
+      --accent: #1d9bf0;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --text: #0f1419;
+        --muted: #536471;
+        --bg: #f7f9f9;
+        --card: #ffffff;
+        --border: #cfd9de;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      font-size: 16px;
+    }
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    h1, h2 { line-height: 1.25; }
+    h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+    .meta { color: var(--muted); font-size: 0.95rem; margin-bottom: 2rem; }
+    h2 {
+      font-size: 1.15rem;
+      margin-top: 2rem;
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.35rem;
+      border-bottom: 1px solid var(--border);
+    }
+    p, li { margin: 0.6rem 0; }
+    ul { padding-left: 1.25rem; }
+    a { color: var(--accent); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin: 1rem 0;
+    }
+    footer {
+      margin-top: 3rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Privacy Policy</h1>
+    <p class="meta">
+      <strong>X Cleaner</strong> Chrome Extension<br>
+      Operated by d2fl<br>
+      Effective date: June 21, 2026<br>
+      Last updated: June 21, 2026
+    </p>
+
+    <p>
+      This Privacy Policy describes how the <strong>X Cleaner</strong> browser extension
+      (“Extension,” “we,” “us”) handles information when you install and use it. The Extension helps
+      logged-in X (x.com) users collect, filter, and export their following or followers lists.
+    </p>
+
+    <div class="card">
+      <strong>Summary:</strong> The Extension stores your lists, filters, and settings locally in your browser.
+      It interacts with X only while you use it. We do not sell your data, run advertising trackers,
+      or operate a separate analytics service for this Extension. Fast mode uses more X API calls (riskier);
+      Gentle mode is lower-profile for small or overnight use.
+    </div>
+
+    <h2>1. Information we process</h2>
+    <p>Depending on how you use the Extension, the following information may be processed:</p>
+    <ul>
+      <li><strong>Your X account handle</strong> — detected from an open, logged-in X tab.</li>
+      <li><strong>List data</strong> — usernames and profile details (counts, bio, created date, etc.) from collection (following or followers) or CSV you load.</li>
+      <li><strong>Enrichment data</strong> — computed locally: last-post timestamps (via timeline fallback), mutual flags (you_follow / follows_you), bot signals, verified status, inactive status (Following only).</li>
+      <li><strong>Activity / status logs</strong> — local timestamps and results of collections and filters.</li>
+      <li><strong>Extension settings</strong> — fetch mode (Fast riskier vs Gentle low-risk), fresh-start per branch only, filter options (mutuals, verified, inactive, bots), delays.</li>
+      <li><strong>Usage limits</strong> — local free-tier counters (200 records).</li>
+      <li><strong>Subscription status</strong> — Pro eligibility cached locally (X @d2fl subscription check or built-in owner accounts).</li>
+      <li><strong>X session data</strong> — cookies/session used only in your browser to verify subscription status on X; not sent to d2fl servers.</li>
+    </ul>
+
+    <h2>2. Where data is stored</h2>
+    <p>
+      • <strong>chrome.storage.local</strong> — per-branch lists (following/followers), settings, activity cache (incl. last-post with full-attempt markers), enrich archive (per-branch for fresh-start hydration), subscription cache.<br>
+      • <strong>chrome.storage.session</strong> — short-lived flags (cleared on browser session end).
+    </p>
+    <p>We do not operate a central server database for your lists or logs. All data stays on your device.</p>
+
+    <h2>3. How we use information</h2>
+    <ul>
+      <li>Collect lists in Fast (bulk, riskier) or Gentle (sniffer + DOM, lower risk) mode.</li>
+      <li>Cross-populate mutual flags (you_follow + follows_you) and related data (e.g. last post) when collecting one branch if the user appears in the other — and the same for CSV loads.</li>
+      <li>Run filters (mutuals, verified, inactive/last-post for Following only, bots for Followers only).</li>
+      <li>Support fresh start per branch only (clears cache/persist for selected branch; archives enrichments for that branch only to re-hydrate on re-collect; other branch untouched).</li>
+      <li>Save progress locally for resume; enforce free-tier limits.</li>
+      <li>Determine Pro status for unlimited export.</li>
+      <li>Display progress in popup and on-page HUD.</li>
+    </ul>
+
+    <h2>4. Network activity and third parties</h2>
+    <p>The Extension communicates with <strong>X (x.com / twitter.com)</strong> only. It does not upload your lists, mutual flags, last-post data, logs, or personal data to d2fl during normal operation.</p>
+    <p>Clicking Subscribe @d2fl opens X’s website; X’s policies apply. We are not affiliated with X Corp.</p>
+    <p>Fast mode performs more aggressive X API calls (higher risk of temporary limits or detection). Gentle mode prefers page-native signals for lower profile.</p>
+
+    <h2>5. Permissions</h2>
+    <table style="border-collapse:collapse;width:100%;max-width:100%;">
+      <tr><th style="text-align:left;border:1px solid var(--border);padding:6px;">Permission</th><th style="text-align:left;border:1px solid var(--border);padding:6px;">Purpose</th></tr>
+      <tr><td style="border:1px solid var(--border);padding:6px;">storage</td><td style="border:1px solid var(--border);padding:6px;">Save per-branch lists, settings, caches, logs locally</td></tr>
+      <tr><td style="border:1px solid var(--border);padding:6px;">tabs</td><td style="border:1px solid var(--border);padding:6px;">Open/focus X tab and handoff to HUD</td></tr>
+      <tr><td style="border:1px solid var(--border);padding:6px;">scripting</td><td style="border:1px solid var(--border);padding:6px;">Run actions and capture on X when you start a session</td></tr>
+      <tr><td style="border:1px solid var(--border);padding:6px;">activeTab</td><td style="border:1px solid var(--border);padding:6px;">Interact with your active X tab</td></tr>
+      <tr><td style="border:1px solid var(--border);padding:6px;">cookies</td><td style="border:1px solid var(--border);padding:6px;">Read X session cookies for subscription verification</td></tr>
+      <tr><td style="border:1px solid var(--border);padding:6px;">x.com / twitter.com</td><td style="border:1px solid var(--border);padding:6px;">Required for all Extension functionality</td></tr>
+    </table>
+
+    <h2>6. Data sharing and sale</h2>
+    <p>We do <strong>not</strong> sell or share your data for marketing. Data stays on your device unless you export a CSV yourself. Cross-branch mutual detection and last-post enrichment happen locally only.</p>
+
+    <h2>7. Deletion</h2>
+    <ul>
+      <li>Clear lists or use Stop in the UI/HUD.</li>
+      <li>Fresh start checkbox for the selected branch only (other branch remains).</li>
+      <li>Uninstall the Extension from Chrome (local storage removed).</li>
+      <li>Clear browser extension data.</li>
+    </ul>
+
+    <h2>8. Children</h2>
+    <p>Not directed to children under 13.</p>
+
+    <h2>9. Security</h2>
+    <p>Data remains on your device under Chrome’s extension model. No remote transmission of your lists or enrichments.</p>
+
+    <h2>10. Changes</h2>
+    <p>We may update this policy; the date above will change.</p>
+
+    <h2>11. Contact</h2>
+    <p>
+      admin@d2fl.com<br>
+      support@d2fl.com<br>
+      https://d2fl.com
+    </p>
+
+    <footer>
+      Copyright © 2026 d2fl. All rights reserved.
+    </footer>
+  </main>
+</body>
+</html>

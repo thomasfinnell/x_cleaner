@@ -296,7 +296,7 @@ function xcRestMapApiUser(raw, listType) {
 
   const isBlue = xcRestDetectBlue(raw);
 
-  return {
+  const mapped = {
     username: screenName,
     display_name: raw.name || '',
     friends_count: raw.friends_count ?? null,
@@ -309,6 +309,17 @@ function xcRestMapApiUser(raw, listType) {
     you_follow: listType === 'following' ? true : (raw.following ?? null),
     follows_you: listType === 'followers' ? true : (raw.followed_by ?? null)
   };
+
+  // Capture last post time if the (non-skipped) response includes status (following lists)
+  const statusCreated = raw?.status?.created_at;
+  if (statusCreated) {
+    const ts = Date.parse(statusCreated);
+    if (!Number.isNaN(ts)) {
+      mapped.last_active_ms = ts;
+    }
+  }
+
+  return mapped;
 }
 
 function xcRestMapVerifyCredentials(response) {
@@ -430,7 +441,8 @@ function injectedRestUsersLookup(request) {
 
   const query = new URLSearchParams({
     screen_name: handles.join(','),
-    include_entities: 'false'
+    // no include_entities (or minimal) following samples approach for user detail
+    skip_status: 'false'
   });
 
   const headers = {
@@ -596,7 +608,8 @@ async function xcRestUsersLookupBatch(screenNames, options = {}) {
 
   const query = new URLSearchParams({
     screen_name: handles.join(','),
-    include_entities: 'false'
+    // no include_entities (or minimal) following samples approach for user detail
+    skip_status: 'false'
   });
   const url = `${XC_REST_API_ORIGIN}/users/lookup.json?${query.toString()}`;
   const label = 'worker@x.com';
@@ -690,7 +703,12 @@ function xcRestBuildListUrl(listType, params) {
   const query = new URLSearchParams();
   query.set('count', String(params.count || XC_REST_PAGE_SIZE));
   query.set('cursor', String(params.cursor ?? '-1'));
-  query.set('skip_status', 'true');
+  // Omit skip_status for 'following' lists (informed by samples best practice in
+  // Remove_src/samples/src/background/api/friendships.ts and core.ts) so the
+  // response users can include `status.created_at` (last post time).
+  if (listType !== 'following') {
+    query.set('skip_status', 'true');
+  }
   if (params.userId) {
     query.set('user_id', String(params.userId));
   } else if (params.screenName) {
@@ -777,9 +795,13 @@ function injectedRestListFetch(request) {
 
   const query = new URLSearchParams({
     count: String(count),
-    cursor,
-    skip_status: 'true'
+    cursor
   });
+  // Omit skip_status for 'following' (samples best practice) to allow status in response
+  // for last post enrichment on Following lists. Keep for followers.
+  if (listType !== 'following') {
+    query.set('skip_status', 'true');
+  }
   if (request.userId) {
     query.set('user_id', String(request.userId));
   } else if (screenName) {
