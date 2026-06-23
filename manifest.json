@@ -1,8 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "X Cleaner - Export Following",
-  "version": "0.98",
-  "description": "Export your X (Twitter) Following list to CSV",
+  "name": "X Cleaner",
+  "short_name": "X Cleaner",
+  "version": "0.98.2",
+  "description": "Export and filter your X following & followers lists to CSV. All processing is local in your browser.",
+  "author": "d2fl",
+  "homepage_url": "https://d2fl.com/cleaner",
   "permissions": [
     "activeTab",
     "scripting",
@@ -49,5 +52,6 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "incognito": "not_allowed"
 }

@@ -422,7 +422,8 @@ async function maybeGentleDwellPause(type = listType) {
   notifyProgress({
     status: `Gentle pace — pausing ${Math.round(dwellMs / 1000)}s before next scroll...`
   });
-  await sleep(dwellMs);
+  await sleep(dwellMs, { cancellable: true });
+  if (isJobCancelled()) return;
 }
 
 async function scrollListStep(tabId) {
@@ -458,14 +459,16 @@ async function scrollListToLoad(tabId, options = {}) {
   if (fastScrollEnabled || aggressive) {
     await executeOnTab(tabId, injectedScrollListToLoad);
     if (!fastScrollEnabled && aggressive) {
-      await sleep(scrollJitterMs(1800, 0.25));
+      await sleep(scrollJitterMs(1800, 0.25), { cancellable: true });
+      if (isJobCancelled()) return;
       await executeOnTab(tabId, injectedScrollListToLoad);
     }
     return;
   }
   for (let i = 0; i < 2; i += 1) {
     await scrollListStep(tabId);
-    await sleep(scrollJitterMs(3500, 0.3));
+    await sleep(scrollJitterMs(3500, 0.3), { cancellable: true });
+    if (isJobCancelled()) return;
   }
 }
 
@@ -476,12 +479,13 @@ async function scrollListToTop(tabId) {
 async function pacedNudgeTabScroll(tabId, amount = 900) {
   if (fastScrollEnabled) {
     await nudgeTabListScroll(tabId, amount);
-    await sleep(amount > 800 ? 550 : 300);
+    await sleep(amount > 800 ? 550 : 300, { cancellable: true });
     return;
   }
   await gentleScrollStepFromTab(tabId, gentleScrollStepCount);
   gentleScrollStepCount += 1;
-  await sleep(await sleepAfterScrollStep(listType, 'nudge'));
+  await sleep(await sleepAfterScrollStep(listType, 'nudge'), { cancellable: true });
+  if (isJobCancelled()) return;
   await maybeGentleDwellPause(listType);
 }
 
@@ -514,9 +518,11 @@ async function observeFinishShortfall(tabId, profile, type, seen, totalList, opt
   await ensureProfileUserId(tabId, profile);
   try {
     await scrollListToTop(tabId);
-    await sleep(scrollJitterMs(fastScrollEnabled ? 800 : 1500, 0.2));
+    await sleep(scrollJitterMs(fastScrollEnabled ? 800 : 1500, 0.2), { cancellable: true });
+    if (isJobCancelled()) return totalAdded;
     await scrollListToLoad(tabId, { gap, aggressive: true });
-    await sleep(scrollJitterMs(fastScrollEnabled ? 1200 : 1800, 0.2));
+    await sleep(scrollJitterMs(fastScrollEnabled ? 1200 : 1800, 0.2), { cancellable: true });
+    if (isJobCancelled()) return totalAdded;
   } catch (error) {}
 
   try {
@@ -576,6 +582,7 @@ async function observeFinishShortfall(tabId, profile, type, seen, totalList, opt
       maxPages: type === 'following' ? 16 : 12,
       scrollToLoad: true
     });
+    if (isJobCancelled()) return totalAdded;
     gap = totalList != null ? totalList - curList(type).length : null;
     const restTailCap = type === 'following' ? 200 : Math.min(50, gentleFollowersRecoveryCap(totalList));
     if (gap > 0 && gap <= restTailCap && listFetchNeedsMore(type, totalList)) {
@@ -1222,9 +1229,9 @@ function syncLastActiveIntoRaw(working, type = listType) {
   return upgraded;
 }
 
-async function enrichSparseProfilesViaLookup(tabId, users, type, onProgress) {
+async function enrichSparseProfilesViaLookup(tabId, users, type, onProgress, needsFn = (u) => !hasReliableProfileForBotCheck(u)) {
   const enriched = users.map((user) => ({ ...user }));
-  const needsLookup = enriched.filter((user) => !hasReliableProfileForBotCheck(user));
+  const needsLookup = enriched.filter(needsFn);
   if (!needsLookup.length) {
     return { users: enriched, lookedUp: 0, upgraded: 0 };
   }
@@ -1326,6 +1333,25 @@ async function ensureReliableProfilesForBotCheck(tabId, type, working, onProgres
   }
 
   return { users: working, stats };
+}
+
+async function ensureCoreProfileStats(tabId, type, onProgress) {
+  const working = curList(type) || [];
+  let sparse = working.filter((u) => !hasCoreProfileStats(u));
+  if (!sparse.length || !tabId) return { lookedUp: 0, upgraded: 0 };
+
+  // First give sniffer a chance (free data from page)
+  try {
+    await passiveSnifferEnrichPass(tabId, type, jobState.username);
+    syncWorkingFromRaw(working, type);
+  } catch (e) {}
+
+  sparse = working.filter((u) => !hasCoreProfileStats(u));
+  if (!sparse.length) return { lookedUp: 0, upgraded: 0 };
+
+  // Batched lookup to pull friends/followers/tweet/created (the "everything" pass)
+  const result = await enrichSparseProfilesViaLookup(tabId, working, type, onProgress, (u) => !hasCoreProfileStats(u));
+  return { lookedUp: result.lookedUp || sparse.length, upgraded: result.upgraded || 0 };
 }
 
 async function nudgeTabListScroll(tabId, amount = 900) {
@@ -1725,6 +1751,15 @@ function hasReliableProfileForBotCheck(user) {
     return true;
   }
   return false;
+}
+
+function hasCoreProfileStats(user) {
+  if (!user) return false;
+  const hasF = user.friends_count != null && user.friends_count !== '';
+  const hasFl = user.followers_count != null && user.followers_count !== '';
+  const hasT = user.tweet_count != null && user.tweet_count !== '';
+  const hasC = !!user.created_at;
+  return hasF || hasFl || hasT || hasC;
 }
 
 function hasNoBio(user) {
@@ -2157,7 +2192,7 @@ async function refreshBlueFlagsFromSniffer(type) {
   syncBlueFlagsIntoRaw(type);
   if (!(await ensureJobTabId())) return 0;
   await pacedNudgeTabScroll(jobTabId, 900);
-  await sleep(450);
+  await sleep(450, { cancellable: true });
   return upgradeListFromSnifferDrain(jobTabId, type, jobState.username);
 }
 
@@ -2630,6 +2665,13 @@ async function getListPreview(requestedType = listType) {
   if (!curList(type).length) {
     await restoreListState(type);
   }
+
+  // Make sure the preview rows (what people click "View" on early) have the
+  // rich data (counts etc) for quick verification, especially first batch / free tier.
+  if (jobTabId && curList(type).length > 0) {
+    await ensureCoreProfileStats(jobTabId, type, null).catch(() => {});
+  }
+
   const cfg = listCfg(type);
   const isNonFree = !!subscriptionInfo.isSubscribed || subscriptionInfo.canExport === true;
   const previewLimit = isNonFree ? 10 : 5;
@@ -3597,7 +3639,8 @@ async function observeTryGraphqlHandoff(tabId, profile, type, seen, fetchTarget,
   if (restartFromTop) {
     try {
       await scrollListToTop(tabId);
-      await sleep(1000);
+      await sleep(1000, { cancellable: true });
+      if (isJobCancelled()) return true;
     } catch (error) {}
   }
 
@@ -3616,11 +3659,12 @@ async function observeTryGraphqlHandoff(tabId, profile, type, seen, fetchTarget,
       maxPages: type === 'followers' ? 12 : 16,
       scrollToLoad: true
     });
-    if (!listFetchNeedsMore(type, totalList)) return true;
+    if (isJobCancelled() || !listFetchNeedsMore(type, totalList)) return true;
 
     const tailGap = totalList != null ? totalList - curList(type).length : null;
     if (tailGap != null && tailGap > 0 && tailGap <= 200) {
       await recoverShortfallViaRest(tabId, profile, type, seen, totalList);
+      if (isJobCancelled()) return true;
     }
     if (!listFetchNeedsMore(type, totalList)) return true;
 
@@ -3758,6 +3802,7 @@ async function fetchListGraphqlPage(tabId, type, fetchParams, options = {}) {
 }
 
 async function recoverShortfallViaWorkerGraphql(tabId, profile, type, seen, totalList) {
+  if (isJobCancelled()) return 0;
   const gap = totalList != null ? totalList - curList(type).length : null;
   if (gap == null || gap <= 0 || gap > 200) return 0;
 
@@ -3870,7 +3915,8 @@ async function recoverShortfallViaWorkerGraphql(tabId, profile, type, seen, tota
 
       stalePages = 0;
       cursor = nextCursor;
-      await sleep(requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs);
+      await sleep(requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs, { cancellable: true });
+      if (isJobCancelled()) return totalAdded;
     }
 
     if (!listFetchNeedsMore(type, totalList) || totalAdded > 0) break;
@@ -3947,6 +3993,7 @@ async function warmRestListPageContext(tabId, profile, type = listType) {
 }
 
 async function recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, totalList, options = {}) {
+  if (isJobCancelled()) return 0;
   const cfg = listCfg(type);
   const gap = totalList != null ? totalList - curList(type).length : null;
   if (!tabId || !gap || gap <= 0) return 0;
@@ -3956,7 +4003,7 @@ async function recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, 
   let stalePasses = 0;
   let restCursor = null;
 
-  for (let pass = 0; pass < maxPages && listFetchNeedsMore(type, totalList); pass += 1) {
+  for (let pass = 0; pass < maxPages && !isJobCancelled() && listFetchNeedsMore(type, totalList); pass += 1) {
     let cursor = restCursor;
     if (!cursor || cursor === '0') {
       cursor = await readNativeListCursorFromTab(tabId, cfg.opName);
@@ -3966,10 +4013,12 @@ async function recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, 
             const remaining = totalList != null ? totalList - curList(type).length : gap;
             if (remaining != null && remaining <= 20) {
               await scrollListToLoad(tabId, { gap: remaining, aggressive: true });
-              await sleep(type === 'followers' ? 1200 : 1800);
+              await sleep(type === 'followers' ? 1200 : 1800, { cancellable: true });
+              if (isJobCancelled()) return totalAdded;
             } else {
               await scrollListStep(tabId);
-              await sleep(type === 'followers' ? 1800 : 2500);
+              await sleep(type === 'followers' ? 1800 : 2500, { cancellable: true });
+              if (isJobCancelled()) return totalAdded;
             }
           } catch (error) {}
           cursor = await readNativeListCursorFromTab(tabId, cfg.opName);
@@ -4027,7 +4076,8 @@ async function recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, 
     ) {
       try {
         await scrollListStep(tabId);
-        await sleep(type === 'followers' ? 1500 : 2200);
+        await sleep(type === 'followers' ? 1500 : 2200, { cancellable: true });
+        if (isJobCancelled()) return totalAdded;
       } catch (error) {}
     }
   }
@@ -4036,6 +4086,7 @@ async function recoverShortfallViaRestSnifferCursor(tabId, profile, type, seen, 
 }
 
 async function recoverShortfallViaRest(tabId, profile, type, seen, totalList) {
+  if (isJobCancelled()) return 0;
   const gap = totalList != null ? totalList - curList(type).length : null;
   if (gap == null || gap <= 0 || gap > 100 || !profile?.username) return 0;
 
@@ -4108,7 +4159,8 @@ async function recoverShortfallViaRest(tabId, profile, type, seen, totalList) {
     if (type === 'followers' && !fastScrollEnabled && gap <= 30) {
       try {
         await scrollListToLoad(tabId);
-        await sleep(2000);
+        await sleep(2000, { cancellable: true });
+        if (isJobCancelled()) return 0;
         const freshCursor = await readNativeListCursorFromTab(tabId, listCfg(type).opName);
         if (freshCursor && freshCursor !== lastResult.nextCursor) {
           lastResult.nextCursor = freshCursor;
@@ -4145,7 +4197,8 @@ async function recoverShortfallViaRest(tabId, profile, type, seen, totalList) {
     // Extra pause keeps it gentle/stealthy.
     if (type === 'followers' && !fastScrollEnabled && gap > 0 && gap <= 50) {
       try {
-        await sleep(3000);
+        await sleep(3000, { cancellable: true });
+        if (isJobCancelled()) return 0;
         const fresh = await xcRestFetchListPage(profile.username, type, '-1', {
           ...requestOptions,
           pageSize: Math.min(totalList || (gap + 50), XC_REST_PAGE_SIZE),
@@ -4218,7 +4271,8 @@ async function recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen
 
   for (let pass = 0; pass < passes && !isJobCancelled() && listFetchNeedsMore(type, totalList); pass += 1) {
     await scrollListToLoad(tabId);
-    await sleep(await sleepAfterScrollStep(type, 'shortfall'));
+    await sleep(await sleepAfterScrollStep(type, 'shortfall'), { cancellable: true });
+    if (isJobCancelled()) return totalAdded;
 
     const native = await waitForNativeList(tabId, cfg.opName, lastSeq, listenMs);
     if (native?.users?.length) {
@@ -4275,6 +4329,7 @@ async function recoverShortfallViaNativeScrollSniffer(tabId, profile, type, seen
 }
 
 async function recoverShortfallChain(tabId, profile, type, seen, totalList, options = {}) {
+  if (isJobCancelled()) return { totalAdded: 0, summary: 'cancelled' };
   const notes = [];
   let totalAdded = 0;
 
@@ -4319,6 +4374,7 @@ async function recoverShortfallChain(tabId, profile, type, seen, totalList, opti
 }
 
 async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalList, options = {}) {
+  if (isJobCancelled()) return 0;
   const gap = totalList != null ? totalList - curList(type).length : null;
   if (gap == null || gap <= 0 || gap > 200 || !tabId) return 0;
 
@@ -4414,7 +4470,8 @@ async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalLi
     let captured = type === 'followers' ? null : await readCapturedListTemplateFromTab(tabId, capturedOp || opName);
     if (!captured?.url) {
       await scrollListToLoad(tabId);
-      await sleep(await sleepAfterScrollStep(type, 'shortfall'));
+      await sleep(await sleepAfterScrollStep(type, 'shortfall'), { cancellable: true });
+      if (isJobCancelled()) return totalAdded;
       captured = await readCapturedListTemplateFromTab(tabId, capturedOp || opName);
     }
     let cursor = null;
@@ -4503,7 +4560,8 @@ async function recoverShortfallViaTabGraphql(tabId, profile, type, seen, totalLi
 
       stalePages = 0;
       cursor = nextCursor;
-      await sleep(requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs);
+      await sleep(requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs, { cancellable: true });
+      if (isJobCancelled()) return totalAdded;
     }
 
     if (!listFetchNeedsMore(type, totalList) || totalAdded > 0) break;
@@ -4599,7 +4657,8 @@ async function fetchListPageWithRetry(tabId, params, options = {}) {
     lastRes = res;
     if (res?.ok) return res;
     if (attempt < retries - 1) {
-      await sleep(900 * (attempt + 1));
+      await sleep(900 * (attempt + 1), { cancellable: true });
+      if (isJobCancelled()) return lastRes;
     }
   }
 
@@ -4692,7 +4751,8 @@ async function fetchFullListViaGraphql(tabId, profile, type, fetchTarget, totalL
     if (!nextCursor || nextCursor === cursor) {
       if (likelyMore && pageAdded > 0 && stalePages < 2) {
         stalePages += 1;
-        await sleep(pageDelayMs * 2);
+        await sleep(pageDelayMs * 2, { cancellable: true });
+      if (isJobCancelled()) break;
         continue;
       }
       break;
@@ -4701,7 +4761,8 @@ async function fetchFullListViaGraphql(tabId, profile, type, fetchTarget, totalL
     cursor = nextCursor;
     pages += 1;
     if (pageAdded === 0) stalePages += 1;
-    await sleep(pageDelayMs);
+    await sleep(pageDelayMs, { cancellable: true });
+    if (isJobCancelled()) break;
   }
 
   return { users: ordered, lastCursor: lastValidCursor };
@@ -4764,7 +4825,8 @@ async function fetchListTailCursorSweep(tabId, profile, type, seen, totalList, c
       if (!nextCursor || nextCursor === cursor || visited.has(nextCursor)) break;
       visited.add(nextCursor);
       cursor = nextCursor;
-      await sleep(pageDelayMs);
+      await sleep(pageDelayMs, { cancellable: true });
+    if (isJobCancelled()) break;
     }
   }
 
@@ -4877,11 +4939,13 @@ async function fetchListTailScrollNative(tabId, profile, type, seen, totalList, 
   });
 
   await scrollListToTop(tabId);
-  await sleep(fastScrollEnabled ? 800 : 2000);
+  await sleep(fastScrollEnabled ? 800 : 2000, { cancellable: true });
+  if (isJobCancelled()) return 0;
 
   for (let step = 0; step < maxSteps && !isJobCancelled() && listFetchNeedsMore(type, totalList); step += 1) {
     await scrollListStep(tabId);
-    await sleep(await sleepAfterScrollStep(type, 'tail'));
+    await sleep(await sleepAfterScrollStep(type, 'tail'), { cancellable: true });
+    if (isJobCancelled()) return totalAdded;
 
     const native = await waitForNativeList(tabId, cfg.opName, seq, listenMs);
     let added = 0;
@@ -4933,7 +4997,8 @@ async function fetchListTailGraphql(tabId, profile, type, seen, totalList, captu
   while (!isJobCancelled() && pages < 30 && listFetchNeedsMore(type, totalList)) {
     if (!cursor) {
       await scrollListToLoad(tabId);
-      await sleep(fastScrollEnabled ? pageDelayMs * 2 : await sleepAfterScrollStep(type, 'tail'));
+      await sleep(fastScrollEnabled ? pageDelayMs * 2 : await sleepAfterScrollStep(type, 'tail'), { cancellable: true });
+      if (isJobCancelled()) return totalAdded;
       cursor = await readNativeListCursorFromTab(tabId, cfg.opName);
       if (!cursor && spareCursorIdx < spareCursors.length) {
         cursor = spareCursors[spareCursorIdx];
@@ -5000,7 +5065,8 @@ async function fetchListTailGraphql(tabId, profile, type, seen, totalList, captu
     if (!nextCursor || nextCursor === cursor) {
       if (parsedCount > 0 && listFetchNeedsMore(type, totalList) && staleCursorPasses < 8) {
         staleCursorPasses += 1;
-        await sleep(pageDelayMs);
+        await sleep(pageDelayMs, { cancellable: true });
+    if (isJobCancelled()) break;
         continue;
       }
       staleCursorPasses += 1;
@@ -5013,7 +5079,8 @@ async function fetchListTailGraphql(tabId, profile, type, seen, totalList, captu
     cursor = nextCursor;
     pages += 1;
     const tailDelay = requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs;
-    await sleep(tailDelay);
+    await sleep(tailDelay, { cancellable: true });
+    if (isJobCancelled()) return totalAdded;
   }
 
   return totalAdded;
@@ -5033,7 +5100,8 @@ async function fetchListTailDom(tabId, profile, type, seen, totalList) {
     });
 
     await scrollListToLoad(tabId);
-    await sleep(fastScrollEnabled ? settleMs : await sleepAfterScrollStep(type, 'tail'));
+    await sleep(fastScrollEnabled ? settleMs : await sleepAfterScrollStep(type, 'tail'), { cancellable: true });
+    if (isJobCancelled()) return totalAdded;
 
     const scraped = await collectVisibleListUsersFromTab(tabId, profile.username);
     const added = addNativeUsers({ users: scraped?.users || [] }, seen, profile.username, type);
@@ -5135,12 +5203,14 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
   if (options.restartFromTop) {
     try {
       await scrollListToTop(tabId);
-      await sleep(1200);
+      await sleep(1200, { cancellable: true });
+      if (isJobCancelled()) return totalAdded;
     } catch (error) {}
   }
   if (!cursor && seen.size > nativePageSize(type)) {
     await scrollListToLoad(tabId);
-    await sleep(fastScrollEnabled ? pageDelayMs * 2 : await sleepAfterScrollStep(type, 'tail'));
+    await sleep(fastScrollEnabled ? pageDelayMs * 2 : await sleepAfterScrollStep(type, 'tail'), { cancellable: true });
+    if (isJobCancelled()) return totalAdded;
     cursor = await readNativeListCursorFromTab(tabId, opName);
     if (!cursor) {
       const resumeCursors = (await readNativeListTailCursorsFromTab(tabId, opName, 4)) || [];
@@ -5277,7 +5347,8 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
       cursorRetries = 0;
       cursor = nextCursor;
       pages += 1;
-      await sleep(requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs);
+      await sleep(requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs, { cancellable: true });
+      if (isJobCancelled()) break;
       continue;
     }
 
@@ -5289,7 +5360,8 @@ async function continueListFetchWithGraphql(tabId, profile, type, seen, fetchTar
       if (listFetchNeedsMore(type, totalList) && cursorRetries < maxCursorRetries) {
         cursorRetries += 1;
         await scrollListToLoad(tabId);
-        await sleep(pageDelayMs * 2);
+        await sleep(pageDelayMs * 2, { cancellable: true });
+      if (isJobCancelled()) break;
         const refreshed = await readNativeListCursorFromTab(tabId, opName);
         if (refreshed && refreshed !== cursor) {
           cursor = refreshed;
@@ -5458,6 +5530,12 @@ async function runObserveListFetch(tabId, profile, type = listType) {
       } catch (error) {}
     }
 
+    // Early enrich on first data so the initial batch (what people test first, and free tier)
+    // has the per-user counts, created dates and tweet numbers visible for verification.
+    if (tabId && curList(type).length > 0 && passes <= 2) {
+      ensureCoreProfileStats(tabId, type, null).catch(() => {});
+    }
+
     try {
       const observed = await drainListObserverFromTab(tabId);
       if (observed?.users?.length) {
@@ -5590,6 +5668,19 @@ async function runObserveListFetch(tabId, profile, type = listType) {
   try {
     await stopListObserverFromTab(tabId);
   } catch (error) {}
+
+  if (!isJobCancelled() && tabId) {
+    try {
+      await ensureCoreProfileStats(tabId, type, (prog) => {
+        if (prog && prog.total) {
+          notifyProgress({
+            reason: 'collecting',
+            status: `Enriching profile stats ${prog.processed || 0}/${prog.total}...`
+          });
+        }
+      });
+    } catch (e) {}
+  }
 
   snapshotListRaw(type);
   jobState.isScraping = false;
@@ -5956,12 +6047,14 @@ async function runNativeListFetch(tabId, profile, type = listType) {
     if (!onListPage) {
       await chrome.tabs.update(tabId, { url: listUrl });
       await waitForTabComplete(tabId);
-      await sleep(1200);
+      await sleep(1200, { cancellable: true });
+      if (isJobCancelled()) break;
       continue;
     }
 
     await scrollListToLoad(tabId);
-    await sleep(await sleepAfterScrollStep(type, 'native-loop'));
+    await sleep(await sleepAfterScrollStep(type, 'native-loop'), { cancellable: true });
+    if (isJobCancelled()) break;
   }
 
   if (!isJobCancelled() && listFetchNeedsMore(type, totalList) && profile.userId) {
@@ -6698,7 +6791,8 @@ async function resolveProfileViaRest(fallbackUsername, tabId = null) {
     let probeOk = false;
     const probeBearer = await xcRestWaitForBearer(tabId, { maxMs: 12000 });
     if (probeBearer) {
-      await sleep(2000);
+      await sleep(2000, { cancellable: true });
+      if (isJobCancelled()) return null;
       await xcRestPrepareSession(tabId);
     } else {
       attempts.push('list probe: bearer not captured yet (open x.com/home, wait for feed)');
@@ -6911,7 +7005,8 @@ async function runGraphqlWorkerListFetch(tabId, profile, type = listType) {
       if (added === 0 && parsedCount === 0) break;
 
       cursor = nextCursor;
-      await sleep(requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs);
+      await sleep(requestCount === 1 ? Math.min(pageDelayMs, 450) : pageDelayMs, { cancellable: true });
+      if (isJobCancelled()) break;
     }
 
     if (gotUsers || curList(type).length > 0 || !listFetchNeedsMore(type, totalList)) break;
@@ -7047,6 +7142,12 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
     } catch (error) {}
   }
 
+  // Early core stats enrich for the first visible batch (testers + free users want
+  // to verify counts, created date, tweet numbers right away from the first pages).
+  if (tabId && curList(type).length > 0) {
+    ensureCoreProfileStats(tabId, type, null).catch(() => {});
+  }
+
   if (tailOnly) {
     let result = {
       collected: curList(type).length,
@@ -7155,6 +7256,15 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
     }
   }
 
+  if (isJobCancelled()) {
+    // stop immediately, do not continue to recovery passes
+    jobState.isScraping = false;
+    jobState.reason = 'stopped';
+    jobState.status = 'Stopped.';
+    notifyProgress({ reason: 'stopped', isScraping: false });
+    return { ok: true, count: curList(type).length, reason: 'stopped' };
+  }
+
   let shortBy = totalList != null && curList(type).length < totalList
     ? totalList - curList(type).length
     : (result.shortfall || 0);
@@ -7190,11 +7300,12 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
     try {
       if (fastScrollEnabled) {
         await executeOnTab(tabId, () => window.scrollTo(0, Math.max(document.body.scrollHeight, 2400)));
-        await sleep(700);
+        await sleep(700, { cancellable: true });
       } else {
         await scrollListStep(tabId);
-        await sleep(await sleepAfterScrollStep(type, 'nudge'));
+        await sleep(await sleepAfterScrollStep(type, 'nudge'), { cancellable: true });
       }
+      if (isJobCancelled()) { /* will be caught higher or finalize as stopped */ }
       const blueMerged = await upgradeListFromSnifferDrain(tabId, type, profile.username);
       if (blueMerged > 0) {
         appendDebugStatusLog({
@@ -7204,6 +7315,29 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
         });
       }
     } catch (error) {}
+  }
+
+  if (!isJobCancelled() && tabId) {
+    try {
+      await ensureCoreProfileStats(tabId, type, (prog) => {
+        if (prog && prog.total) {
+          notifyProgress({
+            reason: 'collecting',
+            status: `Enriching profile stats ${prog.processed || 0}/${prog.total}...`
+          });
+        }
+      });
+    } catch (e) {}
+  }
+
+  if (isJobCancelled()) {
+    snapshotListRaw(type);
+    jobState.isScraping = false;
+    jobState.reason = 'stopped';
+    jobState.status = 'Stopped.';
+    jobState.method = 'rest-v1.1';
+    notifyProgress({ reason: 'stopped', isScraping: false });
+    return { ok: true, count: curList(type).length, reason: 'stopped' };
   }
 
   snapshotListRaw(type);
@@ -7234,6 +7368,9 @@ async function runRestListFetch(tabId, profile, type = listType, options = {}) {
 
 async function runExportFlow(requestedType = listType, options = {}) {
   if (activeFetch?.running) {
+    return { ok: false, error: 'Collection already running.' };
+  }
+  if (jobState.isScraping || jobLooksBusy()) {
     return { ok: false, error: 'Collection already running.' };
   }
   if (activeFetch?.cancelled || jobCancelled) {

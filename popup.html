@@ -50,30 +50,6 @@
       line-height: 1.35;
     }
     #status { font-size: 13px; line-height: 1.4; color: #222; margin-bottom: 6px; }
-    #statusLogLabel {
-      display: none;
-      font-size: 10px;
-      color: #888;
-      margin-bottom: 4px;
-    }
-    #statusLog {
-      display: none;
-      margin: 0 0 8px;
-      padding: 6px 8px;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      background: #f4f8fb;
-      color: #234;
-      font-family: Consolas, "Courier New", monospace;
-      font-size: 10px;
-      line-height: 1.35;
-      max-height: calc(10px * 1.35 * 10 + 12px);
-      overflow-y: auto;
-      overflow-x: hidden;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    #statusLog.is-visible, #statusLogLabel.is-visible { display: block; }
     .mutuals-filter {
       display: block;
       font-size: 12px;
@@ -367,8 +343,6 @@
     <div id="importInfo" class="import-hint">X Cleaner export or one handle per line. Free tier: 200 records max.</div>
   </fieldset>
   <div id="status">Requires an open, logged-in x.com tab. Reload at chrome://extensions after update.</div>
-  <div id="statusLogLabel">Status log</div>
-  <div id="statusLog" title="Click to copy status log"></div>
   <div class="hint">Requires an open, logged-in x.com tab.</div>
   <script src="list-preview.js"></script>
   <script src="popup.js"></script>

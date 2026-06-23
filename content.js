@@ -329,6 +329,14 @@ function ensureHudStatusLogElements(hud) {
 }
 
 function ensureHud() {
+  // Extra guard: refuse to create the HUD on non-list pages (e.g. profiles
+  // opened by clicking a username in the list viewer). The tab-specific check
+  // keeps the collection HUD only on the relevant /following or /followers page.
+  const currentState = lastHudPayload || {};
+  if (!isOnRelevantHudPage(currentState) && !currentState.isScraping) {
+    return null;
+  }
+
   let hud = document.getElementById(HUD_ID);
   if (hud && !hud.querySelector('.xc-panel')) {
     hud.remove();
@@ -835,7 +843,10 @@ function ensureHud() {
     const fastScroll = !!hud.querySelector('#xcleaner-fast-scroll')?.checked;
     const statusEl = hud.querySelector('#xcleaner-status');
     const startBtn = hud.querySelector('#xcleaner-start');
+    const stopBtn = hud.querySelector('#xcleaner-stop');
     if (startBtn) startBtn.disabled = true;
+    if (stopBtn) stopBtn.style.display = 'block';
+    setHudBlockingMode(hud, true);
     statusEl.textContent = forceRefresh
       ? `Fresh start — clearing cached ${listLabel(listType).toLowerCase()}...`
       : `Starting ${listLabel(listType).toLowerCase()} collection...`;
@@ -850,12 +861,16 @@ function ensureHud() {
       if (result?.ok === false) {
         statusEl.textContent = result?.error || 'Could not start collection.';
         if (startBtn) startBtn.disabled = false;
+        if (stopBtn) stopBtn.style.display = 'none';
+        setHudBlockingMode(hud, false);
         return;
       }
       if (result) updateHud(result);
     } catch (error) {
       statusEl.textContent = String(error?.message || error || 'Could not start collection.');
       if (startBtn) startBtn.disabled = false;
+      if (stopBtn) stopBtn.style.display = 'none';
+      setHudBlockingMode(hud, false);
     }
   });
 
@@ -1156,6 +1171,15 @@ function hudFormatListTotal(total) {
 function updateHud(state = {}) {
   if (isHudDismissed()) return;
 
+  // Do not render/keep the HUD panel on tabs that are not the active list collection page.
+  // This fixes the problem where clicking a username in the viewer opens a profile
+  // tab that gets the full HUD overlay on top of it.
+  if (!isOnRelevantHudPage(state) && !state.isScraping) {
+    const existing = document.getElementById(HUD_ID);
+    if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+    return;
+  }
+
   const merged = {
     ...lastHudPayload,
     ...state,
@@ -1228,7 +1252,7 @@ function updateHud(state = {}) {
   const subRefreshBtn = hud.querySelector('#xcleaner-sub-refresh');
   const subSubscribeBtn = hud.querySelector('#xcleaner-subscribe');
   const statusEl = hud.querySelector('#xcleaner-status');
-  const busy = !!state.isScraping;
+  const busy = !!state.isScraping || state.reason === 'collecting';
   const filterBusy = !!state.isEnriching || state.reason === 'filtering';
   let subText = formatHudSubscriptionStatus(state);
   if (state.sniffFailed && state.sniffError) {
@@ -1355,6 +1379,22 @@ if (!globalThis.__xcCleanerMessageHooked) {
   });
 }
 
+function isOnRelevantHudPage(state = {}) {
+  // Only render the HUD panel on the actual list collection page for this job.
+  // This prevents the HUD from appearing on profile tabs opened from the viewer,
+  // or other x.com pages.
+  try {
+    if (!state || !state.username) return false;
+    const u = String(state.username).toLowerCase().replace(/^@+/, '');
+    const path = (location.pathname || '').toLowerCase();
+    const isListPage = path === `/${u}/following` || path === `/${u}/followers` ||
+                       path === `/${u}/following/` || path === `/${u}/followers/`;
+    return isListPage;
+  } catch (e) {
+    return false;
+  }
+}
+
 function syncHudFromBackground() {
   if (isHudDismissed()) return;
 
@@ -1367,7 +1407,7 @@ function syncHudFromBackground() {
       (stored.followers || 0) > 0 ||
       (state.listStats?.following?.count || 0) > 0 ||
       (state.listStats?.followers?.count || 0) > 0;
-    if (
+    const shouldShow = (
       state.isScraping ||
       state.count > 0 ||
       hasStoredList ||
@@ -1382,8 +1422,13 @@ function syncHudFromBackground() {
       state.reason === 'enriching' ||
       state.isEnriching ||
       state.debugStatusLogEnabled
-    ) {
-      updateHud(state);
+    );
+    if (shouldShow) {
+      // Only actually create/render the HUD UI if we are on the list page for the job.
+      // Profile tabs opened via viewer links will hit x.com/@handle and skip the panel.
+      if (isOnRelevantHudPage(state) || state.isScraping) {
+        updateHud(state);
+      }
     }
   }).catch(() => {});
 }

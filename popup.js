@@ -69,8 +69,6 @@ const followersCardEl = document.getElementById('followersCard');
 const followingCountEl = document.getElementById('followingCount');
 const followersCountEl = document.getElementById('followersCount');
 const statusEl = document.getElementById('status');
-const statusLogEl = document.getElementById('statusLog');
-const statusLogLabelEl = document.getElementById('statusLogLabel');
 const mutualsEl = document.getElementById('mutuals');
 const subStatusEl = document.getElementById('subStatus');
 const checkSubBtn = document.getElementById('checkSubBtn');
@@ -101,8 +99,6 @@ const FREE_FETCH_LIMIT = 200;
 let pollTimer = null;
 let currentListType = 'following';
 let pendingListType = null;
-let lastDebugStatusLog = [];
-let lastDebugStatusLogEnabled = true;
 
 function selectedListType() {
   return modeFollowersEl.checked ? 'followers' : 'following';
@@ -176,45 +172,7 @@ function setStatus(text, isError = false) {
   statusEl.style.color = isError ? '#b00020' : '#222';
 }
 
-function renderDebugStatusLog(state = {}) {
-  if (!statusLogEl || !statusLogLabelEl) return;
-  const enabled = state.debugStatusLogEnabled != null
-    ? !!state.debugStatusLogEnabled
-    : lastDebugStatusLogEnabled;
-  const merged = typeof xcPickDebugStatusLog === 'function'
-    ? xcPickDebugStatusLog(state.debugStatusLog, lastDebugStatusLog)
-    : (Array.isArray(state.debugStatusLog) && state.debugStatusLog.length
-      ? state.debugStatusLog
-      : lastDebugStatusLog);
-  if (merged.length) {
-    lastDebugStatusLog = merged;
-    lastDebugStatusLogEnabled = enabled;
-  }
-  const lines = merged;
-  const showLog = enabled;
-  statusLogEl.classList.toggle('is-visible', showLog);
-  statusLogLabelEl.classList.toggle('is-visible', showLog);
-  if (!showLog) {
-    statusLogEl.textContent = '';
-    return;
-  }
-  statusLogEl.textContent = lines.length ? lines.join('\n') : '(waiting for status updates...)';
-  statusLogEl.scrollTop = statusLogEl.scrollHeight;
-  statusLogEl.title = lines.length ? 'Click to copy status log' : '';
-}
-
-if (statusLogEl) {
-  statusLogEl.addEventListener('click', async () => {
-    const text = statusLogEl.textContent || '';
-    if (!text || text.startsWith('(waiting')) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setStatus('Status log copied to clipboard.');
-    } catch (error) {
-      setStatus('Could not copy log — select text and copy manually.');
-    }
-  });
-}
+// Debug status log UI removed for production / Web Store cleanliness (guarded off in background)
 
 function mutualsSummaryLine(mutuals) {
   if (!mutuals || (mutuals.mutualCount == null && !mutuals.hasRelationshipData && !mutuals.hasBoth)) {
@@ -437,14 +395,9 @@ function statusMessage(state) {
 }
 
 function updateUI(state = {}) {
-  const merged = {
-    debugStatusLogEnabled: lastDebugStatusLogEnabled,
-    debugStatusLog: lastDebugStatusLog,
-    ...state
-  };
+  const merged = { ...state };
   renderProgress(merged);
   setStatus(statusMessage(merged));
-  renderDebugStatusLog(merged);
 }
 
 function shouldKeepStatusPolling(state = {}) {
@@ -577,6 +530,7 @@ fastScrollEl?.addEventListener('change', async () => {
 });
 
 startBtn.addEventListener('click', async () => {
+  if (startBtn.disabled) return;
   const listType = selectedListType();
   const forceRefresh = !!freshStartEl?.checked;
   const fetchMode = 'auto';
@@ -603,7 +557,6 @@ stopBtn.addEventListener('click', async () => {
   if (result) updateUI(result);
   const refreshed = await sendBackground('getStatus');
   if (refreshed) updateUI(refreshed);
-  if (!lastDebugStatusLogEnabled) closePopup();
 });
 
 filterBtn.addEventListener('click', async () => {
@@ -631,22 +584,20 @@ filterBtn.addEventListener('click', async () => {
 
 checkSubBtn.addEventListener('click', async () => {
   checkSubBtn.disabled = true;
-  setStatus('Opening on-page panel on your X tab...');
-  const result = await refreshStatus({
+  setStatus('Refreshing subscription status...');
+  const result = await sendBackground('checkSubscription', {
     syncFromTab: true,
-    refreshSub: true,
-    force: true,
-    handoffAfterHud: true
+    force: true
   });
-  if (result?.hudReady) {
-    closePopup();
-    return;
-  }
   checkSubBtn.disabled = false;
-  setStatus(
-    result?.error || 'Could not open on-page panel — keep an x.com tab open and try again.',
-    true
-  );
+  if (result && result.ok !== false) {
+    updateUI(result);
+  }
+  if (result?.error) {
+    setStatus(result.error, true);
+  } else if (!result) {
+    setStatus('Refresh failed.', true);
+  }
 });
 
 upgradeBtn.addEventListener('click', () => {

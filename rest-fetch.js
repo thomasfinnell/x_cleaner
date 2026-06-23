@@ -1061,7 +1061,8 @@ async function xcRestFetchListPage(screenName, listType, cursor = '-1', options 
 }
 
 function xcRestSleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  // Use cancellable sleep so stop button can interrupt rest/page delays immediately
+  return sleep(ms, { cancellable: true });
 }
 
 function xcRestFormatAttempts(attempts) {
@@ -1198,6 +1199,11 @@ async function xcRestFetchFullList(screenName, listType, options = {}) {
           });
         }
         await xcRestSleep(waitMs);
+        if (shouldCancel()) {
+          const error = new Error('Job cancelled');
+          error.code = 'XC_CANCELLED';
+          throw error;
+        }
         continue;
       }
       if (collected > 0) {
@@ -1236,6 +1242,11 @@ async function xcRestFetchFullList(screenName, listType, options = {}) {
       cursor = result.nextCursor;
       if (pageDelayMs > 0) {
         await xcRestSleep(pageDelayMs);
+        if (shouldCancel()) {
+          const error = new Error('Job cancelled');
+          error.code = 'XC_CANCELLED';
+          throw error;
+        }
       }
       continue;
     }
