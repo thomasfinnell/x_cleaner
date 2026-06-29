@@ -2,6 +2,8 @@
 
 Version: 0.99
 
+**v0.99.2 changes:** Core REST fetch is now more robust (adaptive rate limiting with header respect, progressive backoff using server reset times, light jitter on delays) while keeping all existing behavior.
+
 Export your X (Twitter) **Following** and **Followers** lists to CSV. Filter lists (mutuals, inactive, bots, etc.) and load CSV files for offline editing or handoff to [X Follower Remover](https://github.com/thomasfinnell/X-follower-Remover).
 
 ## How it works
