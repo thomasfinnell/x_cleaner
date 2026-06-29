@@ -10,9 +10,46 @@ const XC_REST_PAGE_DELAY_MS = 350;
 const XC_REST_LOOKUP_BATCH_SIZE = 100;
 const XC_REST_LOOKUP_DELAY_MS = 350;
 const XC_REST_RATE_LIMIT_BACKOFF_MS = 60000;
+
+// Small helper for jittered sleep (less predictable timing)
+function xcRestJitteredSleep(baseMs, jitterFraction = 0.3) {
+  const jitter = Math.floor(Math.random() * (baseMs * jitterFraction));
+  return xcRestSleep(baseMs + jitter);
+}
 const XC_REST_MAX_PAGES = 500;
 
 const XC_REST_API_ORIGIN = 'https://api.x.com/1.1';
+
+// Simple RateLimiter (ported/adapted from PLGMKY for more adaptive pacing)
+class RateLimiter {
+  constructor(cooldownMs, maxAttempts) {
+    this.cooldownMs = cooldownMs;
+    this.maxAttempts = maxAttempts;
+    this.lastRequestTime = 0;
+    this.attempts = 0;
+  }
+  canMakeRequest() {
+    const now = Date.now();
+    if (now - this.lastRequestTime < this.cooldownMs) return false;
+    if (this.attempts >= this.maxAttempts) return false;
+    return true;
+  }
+  recordAttempt() {
+    this.lastRequestTime = Date.now();
+    this.attempts++;
+  }
+  reset() {
+    this.attempts = 0;
+  }
+  getLastRequestTime() {
+    return this.lastRequestTime;
+  }
+}
+
+// Shared REST rate limiter - starts permissive, only tightens after real 429s
+let restRateLimiter = new RateLimiter(800, 30); // ~0.8s initial spacing, 30 attempts
+let restConsecutiveRateErrors = 0;
+let restRateLimitResetTime = null;
 const XC_REST_LIST_ENDPOINTS = {
   following: `${XC_REST_API_ORIGIN}/friends/list.json`,
   followers: `${XC_REST_API_ORIGIN}/followers/list.json`
@@ -241,7 +278,13 @@ async function xcRestMakeApiRequest(url, method = 'GET', body = null, options = 
 
   let response;
   try {
+    // Basic adaptive pacing using the limiter (only really enforces after errors)
+    if (restConsecutiveRateErrors > 0 && !restRateLimiter.canMakeRequest()) {
+      const wait = Math.max(1000, 800 - (Date.now() - restRateLimiter.getLastRequestTime()));
+      await xcRestSleep(wait);
+    }
     response = await fetch(url, requestOptions);
+    restRateLimiter.recordAttempt();
   } catch (error) {
     if (error?.name === 'AbortError') {
       const err = new Error(`REST request timed out (${Math.round(timeoutMs / 1000)}s)`);
@@ -251,6 +294,13 @@ async function xcRestMakeApiRequest(url, method = 'GET', body = null, options = 
     throw error;
   } finally {
     clearTimeout(timeoutId);
+  }
+
+  // Parse rate limit headers if present (more robust than blind waits)
+  const resetHdr = response.headers.get('x-rate-limit-reset');
+  const remainingHdr = response.headers.get('x-rate-limit-remaining');
+  if (resetHdr) {
+    restRateLimitResetTime = parseInt(resetHdr, 10) * 1000;
   }
 
   const text = await response.text();
@@ -265,11 +315,32 @@ async function xcRestMakeApiRequest(url, method = 'GET', body = null, options = 
   }
 
   if (!response.ok) {
+    if (response.status === 429) {
+      restConsecutiveRateErrors = (restConsecutiveRateErrors || 0) + 1;
+      const now = Date.now();
+      let waitMs = XC_REST_RATE_LIMIT_BACKOFF_MS;
+      if (restRateLimitResetTime && restRateLimitResetTime > now) {
+        waitMs = Math.min(restRateLimitResetTime - now, 15 * 60 * 1000);
+      } else {
+        waitMs = Math.min(XC_REST_RATE_LIMIT_BACKOFF_MS * restConsecutiveRateErrors, 120000);
+      }
+      const err = new Error(`Rate limited (429). Suggested wait ${Math.round(waitMs / 1000)}s`);
+      err.status = 429;
+      err.waitMs = waitMs;
+      throw err;
+    }
     const message = xcRestListApiError(parsed, response.status);
     const err = new Error(message);
     err.status = response.status;
     err.body = parsed;
     throw err;
+  }
+
+  // Success path - relax rate limiter back to permissive
+  if (restConsecutiveRateErrors > 0) {
+    restConsecutiveRateErrors = 0;
+    restRateLimiter = new RateLimiter(800, 30);
+    restRateLimitResetTime = null;
   }
 
   return parsed;
@@ -1178,6 +1249,19 @@ async function xcRestFetchFullList(screenName, listType, options = {}) {
       throw error;
     }
 
+    // Proactive wait if we have a known reset time from previous rate limit response
+    const now = Date.now();
+    if (restRateLimitResetTime && restRateLimitResetTime > now) {
+      const preWait = restRateLimitResetTime - now;
+      if (preWait > 1000) {
+        if (onPage) {
+          await onPage({ page, users: [], collected, nextCursor: cursor, waitingMs: preWait, rateLimited: true });
+        }
+        await xcRestSleep(preWait);
+      }
+      restRateLimitResetTime = null; // clear after waiting
+    }
+
     let result;
     try {
       result = await xcRestFetchListPage(screenName, listType, cursor, requestOptions);
@@ -1187,7 +1271,8 @@ async function xcRestFetchFullList(screenName, listType, options = {}) {
       if (error.attempts) allAttempts.push(...error.attempts);
       if (error.status === 429 && rateLimitRetries < 3) {
         rateLimitRetries += 1;
-        const waitMs = XC_REST_RATE_LIMIT_BACKOFF_MS * rateLimitRetries;
+        // Use server-provided wait or progressive if available from the request layer
+        const waitMs = error.waitMs || (XC_REST_RATE_LIMIT_BACKOFF_MS * rateLimitRetries);
         if (onPage) {
           await onPage({
             page,
@@ -1241,7 +1326,10 @@ async function xcRestFetchFullList(screenName, listType, options = {}) {
     if (result.users.length > 0 && result.hasMore && result.hasValidCursor) {
       cursor = result.nextCursor;
       if (pageDelayMs > 0) {
-        await xcRestSleep(pageDelayMs);
+        // Light jitter makes timing less mechanical and reduces chance of triggering
+        // rate detection systems that look for perfectly regular intervals.
+        const jitter = Math.floor(Math.random() * Math.max(1, pageDelayMs * 0.35));
+        await xcRestSleep(pageDelayMs + jitter);
         if (shouldCancel()) {
           const error = new Error('Job cancelled');
           error.code = 'XC_CANCELLED';

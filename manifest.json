@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "X Cleaner",
   "short_name": "X Cleaner",
-  "version": "0.98.2",
+  "version": "0.99.2",
   "description": "Export and filter your X following & followers lists to CSV. All processing is local in your browser.",
   "author": "d2fl",
   "homepage_url": "https://d2fl.com/cleaner",

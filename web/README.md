@@ -1,6 +1,6 @@
 # X Cleaner Chrome Extension
 
-Version: 0.98
+Version: 0.99
 
 Export your X (Twitter) **Following** and **Followers** lists to CSV. Filter lists (mutuals, inactive, bots, etc.) and load CSV files for offline editing or handoff to [X Follower Remover](https://github.com/thomasfinnell/X-follower-Remover).
 
